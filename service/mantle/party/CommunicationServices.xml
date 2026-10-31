@@ -2377,7 +2377,11 @@ along with this software (see the LICENSE.md file). If not, see
             // the finance packages, and the finance parts of the asset package, whose records have no record mount of their own
             const financeEntity = (entityName) => /^mantle\.(account|ledger)\.|^mantle\.other\.(budget|tax)\./.test(entityName)
                     || ['mantle.product.asset.FixedAssetClass', 'mantle.product.asset.AssetDepreciation',
-                        'mantle.product.asset.AssetGlAppl', 'mantle.product.asset.AssetGlApplAccountOrg'].includes(entityName)
+                        'mantle.product.asset.AssetGlAppl', 'mantle.product.asset.AssetGlApplAccountOrg',
+                        // a credit or other hold of an order, a supplier's finance profile and the external access
+                        // records: no panel of their own either (F445)
+                        'mantle.order.OrderHoldReason', 'mantle.party.supplier.SupplierProfile',
+                        'mantle.party.ExternalAccessCapability', 'mantle.party.ExternalAccessContact'].includes(entityName)
             const fixedAssetType = (typeEnumId) => typeEnumId === 'AstTpFixed' || !!(typeEnumId && ec.entity
                     .find('moqui.basic.Enumeration').condition({enumId:typeEnumId, parentEnumId:'AstTpFixed'})
                     .disableAuthz().one())
@@ -2424,20 +2428,21 @@ along with this software (see the LICENSE.md file). If not, see
                     const finance = ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')
                     try { finance.record({kind:'journals', recordId:value.acctgTransId}); return true } catch (error) { return false }
                 }
-                // The finance records (IronStone Accounting P21, F430, F437): an invoice, a payment and a payment method (and
-                // their files) follow the documents' own reads, not only the organization filter; a fixed asset its book's
-                // read; every other record of the finance packages has no record mount and is not seen through one.
+                // The finance records (IronStone Accounting P21, F430, F437, F445): an invoice, a payment and a payment method
+                // (and their files) follow the documents' own reads, not only the organization filter; a fixed asset its book's
+                // read; every other record of the finance packages has no record mount and is not seen through one. These
+                // rules hold for every caller, a system administrator and a call with no user too (it sees none).
                 const account = 'component://mr-mantle/service/mantle/account/'
                 const INVOICE_KINDS = ['mantle.account.invoice.Invoice', 'mantle.account.invoice.InvoiceContent']
                 const PAYMENT_KINDS = ['mantle.account.payment.Payment', 'mantle.account.payment.PaymentContent']
-                if (ec.user.userId && INVOICE_KINDS.includes(entityName))
+                if (INVOICE_KINDS.includes(entityName))
                     return ec.resource.script(account + 'InvoiceWorkflowLib.js').readable(value.invoiceId)
-                if (ec.user.userId && PAYMENT_KINDS.includes(entityName)) {
+                if (PAYMENT_KINDS.includes(entityName)) {
                     const payments = ec.resource.script(account + 'PaymentWorkflow.js')
                     try { payments.paymentScope({paymentId:value.paymentId}); return true } catch (error) { return false }
                 }
                 const METHOD = 'mantle.account.method.PaymentMethod'
-                if (ec.user.userId && [METHOD, 'mantle.account.method.PaymentMethodContent'].includes(entityName)) {
+                if ([METHOD, 'mantle.account.method.PaymentMethodContent'].includes(entityName)) {
                     const method = entityName === METHOD ? value
                             : ec.entity.find(METHOD).condition('paymentMethodId', value.paymentMethodId).disableAuthz().one()
                     if (method == null || !method.ownerPartyId) return false
@@ -2454,17 +2459,17 @@ along with this software (see the LICENSE.md file). If not, see
                 }
                 // an asset Accounting keeps a book of (a fixed asset with book events): its book's reader (get#AssetBook); an
                 // asset with no book stays its app's record (a calendar's equipment, Products' stock)
-                if (ec.user.userId && entityName === 'mantle.product.asset.Asset' && bookedAsset(value))
+                if (entityName === 'mantle.product.asset.Asset' && bookedAsset(value))
                     return assetBookVisible(value.assetId)
                 // an agreement: of one of the user's organizations, with a party the user may see
-                if (ec.user.userId && entityName === 'mantle.party.agreement.Agreement') {
+                if (entityName === 'mantle.party.agreement.Agreement') {
                     const orgIds = userOrganizationIds()
                     const ours = orgIds == null
                             || [value.organizationPartyId, value.otherPartyId].some(partyId => orgIds.includes(partyId))
                     if (!ours) return false
                     return !value.otherPartyId || visible(PARTY, 'partyId', value.otherPartyId, depth)
                 }
-                if (ec.user.userId && financeEntity(entityName)) return false
+                if (financeEntity(entityName)) return false
                 // Catalog record mounts/drive links also enforce owner scope without an active-org filter. A catalog
                 // user's internal file/room callback retains this rule even when artifact authorization is disabled.
                 if (['mantle.product.Product', 'mantle.product.category.ProductCategory', 'mantle.product.feature.ProductFeature', 'mantle.product.feature.ProductFeatureGroup'].includes(entityName)
@@ -2535,7 +2540,7 @@ along with this software (see the LICENSE.md file). If not, see
                     if (sourceKeys.length !== 1 || !visible(value.changedEntityName,sourceKeys[0],value.pkPrimaryValue,depth+1)) return false
                     // an asset's cost and book fields: its book's reader for an asset Accounting keeps a book of, else its
                     // product's cost reader (CostPolicy), as its receipts (F437)
-                    if (value.changedEntityName === 'mantle.product.asset.Asset' && ec.user.userId
+                    if (value.changedEntityName === 'mantle.product.asset.Asset'
                             && /cost|depreciat|salvage|life|value|price/i.test(value.changedFieldName || '')) {
                         const asset = ec.entity.find('mantle.product.asset.Asset').condition('assetId', value.pkPrimaryValue)
                                 .disableAuthz().one()
@@ -3443,10 +3448,25 @@ along with this software (see the LICENSE.md file). If not, see
                     const status = ec.entity.find('moqui.basic.StatusItem').condition('statusId', statusId).useCache(true).one()
                     return status ? status.description : statusId
                 }
+                // a cost, rate, value or book field's change is shown only when its audit row passes get#RecordLinkInfo's
+                // rule for it (an asset's cost needs its book's or its product's cost read; a routing's its cost read):
+                // the rows are read with authorization off (IronStone Accounting P21, F444)
+                const guardedField = /cost|rate|amount|depreciat|salvage|life|value|price/i
+                const fieldVisible = (change) => {
+                    if (!guardedField.test(change.changedFieldName || '')) return true
+                    ec.message.pushErrors()
+                    try {
+                        return ec.service.sync().name('mantle.party.CommunicationServices.get#RecordLinkInfo')
+                                .parameters({recordEntityName: 'moqui.entity.EntityAuditLog', recordId: change.auditHistorySeqId,
+                                    checkOnly: true}).call()?.recordVisible === true && !ec.message.hasError()
+                    } catch (error) { return false }
+                    finally { ec.message.clearErrors(); ec.message.popErrors() }
+                }
                 for (const value of find.list()) {
                     const change = value.getMap()
                     const isStatus = /statusId$/i.test(change.changedFieldName || '')
                     if (clientMode && change.changedFieldName !== 'statusId') continue
+                    if (!fieldVisible(change)) continue
                     const oldDescription = isStatus ? statusDescription(change.oldValueText) : null
                     const newDescription = isStatus ? statusDescription(change.newValueText) : null
                     entries.push({kind: 'change', date: change.changedDate, entryKey: `audit:${change.auditHistorySeqId}`, authorPartyId: null,

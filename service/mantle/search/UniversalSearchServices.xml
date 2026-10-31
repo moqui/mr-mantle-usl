@@ -259,6 +259,7 @@ along with this software (see the LICENSE.md file). If not, see
             totalRelation = page.totalRelation || 'eq'
 
             let financeDropped = false
+            const invoiceMemo = {}
             for (const hit of page.hits) {
                 const document = documents[hit.documentId]
                 const body = hit.body || {}
@@ -277,10 +278,12 @@ along with this software (see the LICENSE.md file). If not, see
                     const account = 'component://mr-mantle/service/mantle/account/'
                     let readable = true
                     if (hit.documentId === 'MantleInvoice')
-                        readable = ec.resource.script(account + 'InvoiceWorkflowLib.js').readable(current.invoiceId)
+                        readable = ec.resource.script(account + 'InvoiceWorkflowLib.js').readable(current.invoiceId, invoiceMemo)
                     else {
+                        ec.message.pushErrors()
                         try { ec.resource.script(account + 'PaymentWorkflow.js').paymentScope({paymentId: current.paymentId}) }
                         catch (error) { readable = false }
+                        finally { ec.message.clearErrors(); ec.message.popErrors() }
                     }
                     if (!readable) { financeDropped = true; continue }
                 }
@@ -329,8 +332,13 @@ along with this software (see the LICENSE.md file). If not, see
             // matches; the other types' facets are the index's, over the authorized match.
             // The same for invoices and payments when a hit was dropped by its side (F439): the page is the total, and their
             // counts are the page's.
+            // a user who reads one side only: every invoice and payment count is the page's, whether or not this page dropped
+            // a hit, so the totals never count the other side's matches (F446)
+            const finance = ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js').capabilities()
+            const bothSides = finance.systemAdmin || finance.admin || finance.reportRead || (finance.arRead && finance.apRead)
+            const sidedTypes = ['MantleInvoice', 'MantlePayment'].filter((type) => types.includes(type))
             const liveTypes = (liveMailboxCounts ? ['MantleCommunicationEvent'] : [])
-                    .concat(financeDropped ? ['MantleInvoice', 'MantlePayment'] : [])
+                    .concat(financeDropped || !bothSides ? sidedTypes : [])
             if (liveTypes.length) { total = results.length; totalRelation = 'gte' }
             // facets over the whole authorized match, not the page
             const facetList = facets ?? []
