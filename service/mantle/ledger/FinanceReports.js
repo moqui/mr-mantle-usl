@@ -549,35 +549,59 @@ function blankTotal() {
         creditsNoClosing: toDecimal(0)
     }
 }
+// The days condition of a span: from a day (inclusive) to a day (exclusive), by book day.
+function spanCondition(fromDay, afterDay) {
+    const stamp = day => ec.l10n.parseTimestamp(day, "yyyy-MM-dd")
+    return lib.accountingDateCondition({
+        fromDate: fromDay ? stamp(fromDay) : null,
+        thruDate: stamp(afterDay),
+        fromDay,
+        thruDay: afterDay
+    })
+}
+// Each account's posted net (debits positive) of an organization over a days condition, with the currencies posted.
+function netTotals(org, dates, currencies) {
+    const net = {}
+    for (const row of lib
+        .find(SUMMARY, {organizationPartyId: org, isPosted: "Y"})
+        .condition(dates)
+        .selectField("glAccountId")
+        .selectField("debitCreditFlag")
+        .selectField("amountUomId")
+        .selectField("amount")
+        .list()) {
+        currencies.add(row.amountUomId)
+        net[row.glAccountId] = (net[row.glAccountId] || toDecimal(0)).add(
+            toDecimal(row.amount ?? 0).multiply(row.debitCreditFlag === "D" ? 1 : -1)
+        )
+    }
+    return net
+}
 // Each account's posted totals of an organization for a span of days: all its postings before the first day (debits
-// positive), and the span's debits and credits with and without the net income closing entries; with the currencies of
-// those postings. Period close stores these as the period's summary rows; the statement reports sum an open period here.
-function periodTotals(org, days) {
+// positive; given when the caller carries them from an earlier span), and the span's debits and credits with and without
+// the net income closing entries; with the currencies of those postings. Period close stores these as the period's
+// summary rows; the statement reports sum an open period here.
+function periodTotals(org, days, before = null) {
     const totals = {},
         currencies = new Set()
     const total = id => totals[id] || (totals[id] = blankTotal())
-    const summary = dates =>
-        lib
-            .find(SUMMARY, {organizationPartyId: org, isPosted: "Y"})
-            .condition(dates)
-            .selectField("glAccountId")
-            .selectField("debitCreditFlag")
-            .selectField("acctgTransTypeEnumId")
-            .selectField("amountUomId")
-            .selectField("amount")
-            .list()
-    for (const row of summary(lib.accountingDateCondition({thruDate: days.fromStamp, thruDay: days.fromDay}))) {
-        currencies.add(row.amountUomId)
-        const entry = total(row.glAccountId)
-        entry.before = entry.before.add(toDecimal(row.amount ?? 0).multiply(row.debitCreditFlag === "D" ? 1 : -1))
-    }
+    const earlier = before || netTotals(org, spanCondition(null, days.fromDay), currencies)
+    for (const [id, net] of Object.entries(earlier)) total(id).before = toDecimal(net)
     const span = lib.accountingDateCondition({
         fromDate: days.fromStamp,
         thruDate: days.afterStamp,
         fromDay: days.fromDay,
         thruDay: days.afterDay
     })
-    for (const row of summary(span)) {
+    for (const row of lib
+        .find(SUMMARY, {organizationPartyId: org, isPosted: "Y"})
+        .condition(span)
+        .selectField("glAccountId")
+        .selectField("debitCreditFlag")
+        .selectField("acctgTransTypeEnumId")
+        .selectField("amountUomId")
+        .selectField("amount")
+        .list()) {
         currencies.add(row.amountUomId)
         const entry = total(row.glAccountId),
             amount = toDecimal(row.amount ?? 0),
@@ -591,7 +615,8 @@ function periodTotals(org, days) {
 }
 // The fiscal periods a report names, each with the organization whose figures it holds: refused unless each is the
 // organization's own or one of an organization it rolls up to, whose periods it books in (P11); with childOrgPeriods also
-// the periods of the organizations that roll up to it with the same type and start, each for its own organization.
+// the periods of the organizations that roll up to it with the same type and start, each for its own organization, for the
+// organizations the user may read only.
 function reportPeriods(p) {
     const s = lib.organization(p, "reportRead")
     const org = s.organizationPartyId
@@ -606,9 +631,10 @@ function reportPeriods(p) {
     })
     const owners = periods.map(() => org)
     if (p.childOrgPeriods) {
+        const readable = new Set(s.organizationPartyIds || [])
         const children = Array.from(
             lib.call("mantle.ledger.LedgerServices.expand#ChildOrganizationList", {organizationPartyId: org}).orgPartyIdList || []
-        ).filter(id => id !== org)
+        ).filter(id => id !== org && readable.has(id))
         if (children.length)
             for (const period of periods.slice())
                 for (const child of lib
@@ -643,37 +669,78 @@ function summaryRow(period, org, glAccountId, account, entry) {
         closedSummary: false
     }
 }
-// One period's summary rows: a closed period's stored rows, else its posted entries summed. A closed period without stored
-// rows, and postings in another currency than the base, are named in reasons.
-function periodRows(period, org, baseCurrency, reasons) {
-    const name = period.periodName || period.timePeriodId
-    if (period.isClosed === "Y") {
-        const stored = lib.rows("mantle.ledger.report.GlAccountOrgTimePeriodDetail", {
-            organizationPartyId: org,
-            timePeriodId: period.timePeriodId
-        })
-        if (stored.length) return stored.map(row => Object.assign(lib.pick(row, SUMMARY_FIELDS), {closedSummary: true}))
-        reasons.push(name + " is closed without stored summaries; its figures are summed from its posted entries")
-    }
-    const {totals, currencies} = periodTotals(org, periodDays(period))
-    const others = currencies.filter(currency => currency !== baseCurrency)
-    if (others.length) reasons.push(name + " has postings in " + others.join(", ") + ", added without conversion")
-    const ids = Object.keys(totals).sort()
-    if (!ids.length) return []
-    const accounts = new Map(
-        Array.from(lib.find("mantle.ledger.account.GlAccount").condition("glAccountId", "in", ids).list()).map(row => [
-            row.glAccountId,
-            row
-        ])
-    )
-    return ids.map(id => summaryRow(period, org, id, accounts.get(id), totals[id]))
+// A closed period's stored summary rows, with postings in another currency than the base named in reasons; null when the
+// period has none stored.
+function storedRows(period, org, days, baseCurrency, reasons) {
+    const stored = lib.rows("mantle.ledger.report.GlAccountOrgTimePeriodDetail", {
+        organizationPartyId: org,
+        timePeriodId: period.timePeriodId
+    })
+    if (!stored.length) return null
+    const span = lib.accountingDateCondition({
+        fromDate: days.fromStamp,
+        thruDate: days.afterStamp,
+        fromDay: days.fromDay,
+        thruDay: days.afterDay
+    })
+    const others = lib
+        .find("mantle.ledger.transaction.AcctgTrans", {organizationPartyId: org, isPosted: "Y"})
+        .condition("amountUomId", "not-equals", baseCurrency)
+        .condition(span)
+        .count()
+    if (others) reasons.push((period.periodName || period.timePeriodId) + " has postings in other currencies, added without conversion")
+    return stored.map(row => Object.assign(lib.pick(row, SUMMARY_FIELDS), {closedSummary: true}))
 }
+// The periods' summary rows: a closed period's stored rows, else its posted entries summed. The postings before an open
+// period are summed once for each organization, at its earliest open period, and carried forward by the postings between
+// one period's first day and the next's. A closed period without stored rows, and postings in another currency than the
+// base, are named in reasons.
 function periodSummaries(p) {
     const {org, periods, owners} = reportPeriods(p)
     const currencyUomId = lib.preference(org).baseCurrencyUomId
     const incompleteReasons = [],
         summaryRows = []
-    periods.forEach((period, index) => summaryRows.push(...periodRows(period, owners[index], currencyUomId, incompleteReasons)))
+    const order = periods
+        .map((period, index) => ({period, owner: owners[index], days: periodDays(period)}))
+        .sort((a, b) => a.owner.localeCompare(b.owner) || a.days.fromDay.localeCompare(b.days.fromDay))
+    const carried = new Map()
+    for (const {period, owner, days} of order) {
+        const name = period.periodName || period.timePeriodId
+        if (period.isClosed === "Y") {
+            const stored = storedRows(period, owner, days, currencyUomId, incompleteReasons)
+            if (stored) {
+                summaryRows.push(...stored)
+                continue
+            }
+            incompleteReasons.push(name + " is closed without stored summaries; its figures are summed from its posted entries")
+        }
+        const currencies = new Set()
+        let before = null
+        const state = carried.get(owner)
+        if (state) {
+            before = Object.assign({}, state.before)
+            if (state.day < days.fromDay)
+                for (const [id, net] of Object.entries(netTotals(owner, spanCondition(state.day, days.fromDay), currencies)))
+                    before[id] = (before[id] || toDecimal(0)).add(net)
+        }
+        const {totals, currencies: posted} = periodTotals(owner, days, before)
+        for (const currency of posted) currencies.add(currency)
+        carried.set(owner, {
+            day: days.fromDay,
+            before: Object.fromEntries(Object.entries(totals).map(([id, entry]) => [id, entry.before]))
+        })
+        const others = [...currencies].filter(currency => currency && currency !== currencyUomId)
+        if (others.length) incompleteReasons.push(name + " has postings in " + others.join(", ") + ", added without conversion")
+        const ids = Object.keys(totals).sort()
+        if (!ids.length) continue
+        const accounts = new Map(
+            Array.from(lib.find("mantle.ledger.account.GlAccount").condition("glAccountId", "in", ids).list()).map(row => [
+                row.glAccountId,
+                row
+            ])
+        )
+        summaryRows.push(...ids.map(id => summaryRow(period, owner, id, accounts.get(id), totals[id])))
+    }
     return {
         organizationPartyId: org,
         timePeriodList: periods,
@@ -682,6 +749,19 @@ function periodSummaries(p) {
         asOf: ec.l10n.format(ec.user.nowTimestamp, "yyyy-MM-dd HH:mm:ss"),
         complete: !incompleteReasons.length,
         incompleteReasons
+    }
+}
+// The book days condition of a fiscal period the user may read in the organization (get#AccountLedgerInfo's entries).
+function periodCondition(p) {
+    const {periods} = reportPeriods(p)
+    const days = periodDays(periods[0])
+    return {
+        condition: lib.accountingDateCondition({
+            fromDate: days.fromStamp,
+            thruDate: days.afterStamp,
+            fromDay: days.fromDay,
+            thruDay: days.afterDay
+        })
     }
 }
 // The summary rows totaled by period, account class and side, as get#PeriodSeriesSummary reads them.
@@ -830,8 +910,16 @@ function partnerLedger(p) {
         }
         const closing = complete ? balance : null
         reportRows.push(
-            Object.assign({rowType: "closing", description: "Closing balance", debit: total.debits, credit: total.credits},
-                head, {balance: closing})
+            Object.assign(
+                {
+                    rowType: "closing",
+                    description: "Closing balance",
+                    debit: complete ? total.debits : null,
+                    credit: complete ? total.credits : null
+                },
+                head,
+                {balance: closing}
+            )
         )
         partyRows.push(
             Object.assign({}, head, {
@@ -858,7 +946,8 @@ function partnerLedger(p) {
 }
 
 // Posted amounts by account (design-accounting §13 PostedSummary): each account's posted debits, credits and net in a
-// span of days in one currency, with its balance before and after, by book day.
+// span of days in one currency, with its balance before and after, by book day. Without a fiscal period the through day
+// (or time) is included, as Mantle's run#PostedAmountSummary always read it.
 function postedSummary(p) {
     p = options(p)
     const s = lib.organization(p, "reportRead")
@@ -897,11 +986,13 @@ function postedSummary(p) {
             const amount = toDecimal(row.amount ?? 0).multiply(row.debitCreditFlag === "D" ? 1 : -1)
             total.beginningBalance = total.beginningBalance.add(amount)
         }
+    // through a day given without a period includes it, as Mantle's report always did; a period ends on its last day
     const span = lib.accountingDateCondition({
         fromDate: p.fromDate,
         thruDate: p.thruDate,
         fromDay: p.fromAccountingDate,
-        thruDay: p.thruAccountingDate
+        thruDay: p.thruAccountingDate,
+        inclusive: !p.timePeriodId
     })
     for (const row of sums(span)) {
         const total = account(row),
@@ -942,6 +1033,7 @@ const operations = {
     partnerLedger,
     postedSummary,
     periodAccess: p => ({organizationPartyId: reportPeriods(p).org}),
+    periodCondition,
     options
 }
 ;({

@@ -14,6 +14,9 @@ along with this software (see the LICENSE.md file). If not, see
 -->
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
     <service verb="get" noun="SalesOrderSummary">
+        <description>Sales order totals by interval from the sales search index, for the organizations named (vendorPartyIds or fromPartyIds), else every organization the user
+            works in. Refuses a user without report read (ACCOUNTING_VIEW) and an organization the user may not read
+            (F6).</description>
         <in-parameters>
             <parameter name="interval" default-value="M"/><!-- day = d, week = w, month = M, quarter = q, year = y -->
             <parameter name="intervalCount" type="Integer" default="13"/>
@@ -40,6 +43,9 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="ordersTotal" type="Map"/>
         </out-parameters>
         <actions><script><![CDATA[
+            // report read, and only organizations the user may read: those named, else every one the user works in (F6)
+            vendorPartyIds = ec.resource.script('component://mr-mantle/service/mantle/sales/SalesAnalysis.js')
+                    .execute('organizations', {organizationPartyIds: vendorPartyIds}).organizationPartyIds
             // aggregation metrics are decimals on Postgres and numbers on OpenSearch; the summaries work in numbers
             const num = (value) => value == null ? 0 : (typeof value === 'number' ? value : toDecimal(value).toNumber())
             const addNumbersInMap = (total, line) => {
@@ -172,6 +178,9 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
 
     <service verb="get" noun="SalesInvoiceSummary">
+        <description>Sales invoice totals by interval from the sales search index, for the organizations named (vendorPartyIds or fromPartyIds), else every organization the user
+            works in. Refuses a user without report read (ACCOUNTING_VIEW) and an organization the user may not read
+            (F6).</description>
         <in-parameters>
             <parameter name="interval" default-value="M"/><!-- day = d, week = w, month = M, quarter = q, year = y -->
             <parameter name="intervalCount" type="Integer" default="13"/>
@@ -199,6 +208,9 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="invoicesTotal" type="Map"/>
         </out-parameters>
         <actions><script><![CDATA[
+            // report read, and only organizations the user may read: those named, else every one the user works in (F6)
+            fromPartyIds = ec.resource.script('component://mr-mantle/service/mantle/sales/SalesAnalysis.js')
+                    .execute('organizations', {organizationPartyIds: fromPartyIds}).organizationPartyIds
             // aggregation metrics are decimals on Postgres and numbers on OpenSearch; the summaries work in numbers
             const num = (value) => value == null ? 0 : (typeof value === 'number' ? value : toDecimal(value).toNumber())
             const addNumbersInMap = (total, line) => {
@@ -349,8 +361,10 @@ along with this software (see the LICENSE.md file). If not, see
         <description>An organization's sales between two days or in one of its fiscal periods, by product, customer or
             customer class (groupBy), each row with what was ordered (its sales orders placed), issued from those orders,
             invoiced (its issued sales invoices, by book day) and returned, with quantities and values in the document's
-            currency, largest invoiced value first. Every read is the organization's own, so its top products and customer
-            classes hold no other organization's sales (F6). A read over 2,000 documents of a kind is named (complete
+            currency, largest invoiced value first. Only sales lines count (the ItemSales types), not tax, shipping or
+            adjustments; returns once requested; credit memos no return made are not counted. Without a period or days,
+            the organization's fiscal month holding today. Every read is the organization's own, so its top products and
+            customer classes hold no other organization's sales (F6). A read over 2,000 documents of a kind is named (complete
             false). Refuses a user without report read in the organization, a period of another organization and a unit
             that is not a currency.</description>
         <in-parameters>
@@ -387,6 +401,9 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
 
     <service verb="get" noun="SalesTopProduct">
+        <description>The top products of an interval's sales orders from the sales search index, for the organizations named (vendorPartyIds or fromPartyIds), else every organization the user
+            works in. Refuses a user without report read (ACCOUNTING_VIEW) and an organization the user may not read
+            (F6).</description>
         <in-parameters>
             <parameter name="interval" default-value="M"/><!-- day = d, week = w, month = M, quarter = q, year = y -->
             <parameter name="thruDate" type="Date" default="ec.user.nowTimestamp"/>
@@ -406,6 +423,9 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="topProductEnd" type="Timestamp"/>
         </out-parameters>
         <actions><script><![CDATA[
+            // report read, and only organizations the user may read: those named, else every one the user works in (F6)
+            vendorPartyIds = ec.resource.script('component://mr-mantle/service/mantle/sales/SalesAnalysis.js')
+                    .execute('organizations', {organizationPartyIds: vendorPartyIds}).organizationPartyIds
             const num = (value) => value == null ? 0 : (typeof value === 'number' ? value : toDecimal(value).toNumber())
 
             const perMap = {d:'day', w:'week', M:'month', q:'quarter', y:'year'}
@@ -439,6 +459,9 @@ along with this software (see the LICENSE.md file). If not, see
         ]]></script></actions>
     </service>
     <service verb="get" noun="InvoicesByCustomerClass">
+        <description>Sales invoice totals by customer class from the sales search index, for the organizations named (vendorPartyIds or fromPartyIds), else every organization the user
+            works in. Refuses a user without report read (ACCOUNTING_VIEW) and an organization the user may not read
+            (F6).</description>
         <in-parameters>
             <parameter name="interval" default-value="M"/><!-- day = d, week = w, month = M, quarter = q, year = y -->
             <parameter name="thruDate" type="Date" default="ec.user.nowTimestamp"/>
@@ -459,6 +482,9 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="topCustomerClassEnd" type="Timestamp"/>
         </out-parameters>
         <actions><script><![CDATA[
+            // report read, and only organizations the user may read: those named, else every one the user works in (F6)
+            fromPartyIds = ec.resource.script('component://mr-mantle/service/mantle/sales/SalesAnalysis.js')
+                    .execute('organizations', {organizationPartyIds: fromPartyIds}).organizationPartyIds
             // aggregation metrics are decimals on Postgres and numbers on OpenSearch; the summaries work in numbers
             const num = (value) => value == null ? 0 : (typeof value === 'number' ? value : toDecimal(value).toNumber())
             const addNumbersInMap = (total, line) => {

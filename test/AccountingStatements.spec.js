@@ -49,6 +49,8 @@ spec({
         ec.artifactExecution.disableAuthz()
         f = helper().fixtures("NATIVE_STMT")
         g = helper().fixtures("NATIVE_STMT_OTHER")
+        // the organization keeps no live summaries, so every open figure is summed from its entries (F16, F337)
+        svc("update#mantle.ledger.config.PartyAcctgPreference", {organizationPartyId: f.org, realTimeGlSummary: "N"})
         post(f.org, "111100000", "331100000", "1000")
         post(f.org, "121000000", "411000000", "300", f.customer)
         post(g.org, "121000000", "411000000", "999", g.customer)
@@ -220,5 +222,128 @@ feature("a reader of one organization is refused another's, its periods, and a u
         reasons.ledgerInfo.includes("ORGANIZATION_DENIED")
         reasons.sales.includes("ORGANIZATION_DENIED")
         reasons.noReportRead.includes("PERMISSION_DENIED")
+    }
+})
+
+feature("two open periods in one report: the earlier one's balances carry into the later one (F342)", {
+    when() {
+        login(f.users.read)
+        return {report: svc(ledger("run#BalanceSheet"), {organizationPartyId: f.org, timePeriodIdList: [lastMonth, month]})}
+    },
+    then({report}) {
+        num(report.netAssetTotalMap.totalBalance, lastMonth) == 0
+        num(report.netAssetTotalMap.totalBalance, month) == 1450
+    }
+})
+
+feature("the account ledger of an open month without live summaries opens from the summed balance (F337)", {
+    when() {
+        login(f.users.read)
+        return svc(ledger("get#AccountLedgerInfo"), {organizationPartyId: f.org, glAccountIdList: ["111100000"], timePeriodId: month})
+    },
+    then({glAccountOrgTimePeriodList, entryInfoList}) {
+        glAccountOrgTimePeriodList.length == 1
+        entryInfoList.some(row => row.debit != null && dec(row.debit).toNumber() == 1000)
+        dec(entryInfoList[entryInfoList.length - 1].balance).toNumber() == 1000
+    }
+})
+
+feature("sales analysis counts sales lines and requested returns only (F339)", {
+    when() {
+        login(f.users.ar)
+        const invoice = helper().draft(f, "40")
+        svc("mantle.account.InvoiceServices.store#InvoiceDraftItem", {
+            invoiceId: invoice.invoiceId,
+            itemTypeEnumId: "ItemShipping",
+            quantity: "1",
+            amount: "20",
+            description: "Shipping"
+        })
+        const draft = helper().lib.one(helper().lib.invoiceEntity, {invoiceId: invoice.invoiceId})
+        svc("mantle.account.InvoiceServices.change#InvoiceState", {
+            invoiceId: invoice.invoiceId,
+            action: "finalize",
+            lastUpdatedStamp: draft.lastUpdatedStamp
+        })
+        login("john.doe")
+        for (const [statusId, price] of [
+            ["ReturnCreated", "50"],
+            ["ReturnRequested", "30"]
+        ]) {
+            const returnId = svc("create#mantle.order.return.ReturnHeader", {
+                statusId,
+                vendorPartyId: f.org,
+                customerPartyId: f.customer,
+                currencyUomId: "USD",
+                entryDate: ec.user.nowTimestamp
+            }).returnId
+            svc("create#mantle.order.return.ReturnItem", {
+                returnId,
+                returnItemSeqId: "01",
+                statusId,
+                itemTypeEnumId: "ItemProduct",
+                returnQuantity: 1,
+                returnPrice: price
+            })
+        }
+        login(f.users.read)
+        return svc("mantle.sales.SalesReportServices.run#SalesAnalysis", {organizationPartyId: f.org, groupBy: "customer"})
+    },
+    then({analysisRows}) {
+        analysisRows.length == 1
+        analysisRows[0].invoicedValue.eq(190)
+        analysisRows[0].returnedValue.eq(30)
+    }
+})
+
+feature("the sales summaries need report read and read only the user's organizations (F338)", {
+    when() {
+        login(f.users.read)
+        const other = refused("mantle.sales.SalesReportServices.get#SalesTopProduct", {vendorPartyIds: [g.org]})
+        const own = refused("mantle.sales.SalesReportServices.get#InvoicesByCustomerClass", {fromPartyIds: [f.org]})
+        const defaulted = refused("mantle.sales.SalesReportServices.get#SalesOrderSummary", {})
+        login(f.users.ap)
+        const noRead = refused("mantle.sales.SalesReportServices.get#SalesInvoiceSummary", {fromPartyIds: [f.org]})
+        return {other, own, defaulted, noRead}
+    },
+    then({other, own, defaulted, noRead}) {
+        other.includes("ORGANIZATION_DENIED")
+        own == ""
+        defaulted == ""
+        noRead.includes("PERMISSION_DENIED")
+    }
+})
+
+feature("a parent's report with its children's periods reads only the organizations the user may read (F341)", {
+    when() {
+        login("john.doe")
+        // a child and a grandchild: the parent's reader works in its direct children, not their children
+        const h = helper().fixtures("NATIVE_STMT_GRAND")
+        post(h.org, "121000000", "411000000", "77", h.customer)
+        const rollup = (id, from, to) =>
+            svc("create#mantle.party.PartyRelationship", {
+                partyRelationshipId: id,
+                fromPartyId: from,
+                toPartyId: to,
+                fromRoleTypeId: "OrgInternal",
+                toRoleTypeId: "OrgInternal",
+                relationshipTypeEnumId: "PrtOrgRollup",
+                fromDate: 0
+            })
+        rollup("NATIVE_STMT_ROLLUP", g.org, f.org)
+        rollup("NATIVE_STMT_ROLLUP2", h.org, g.org)
+        const p = {organizationPartyId: f.org, timePeriodIdList: [month], childOrgPeriods: true}
+        const admin = svc(ledger("get#ReportBasicInfo"), p)
+        login(f.users.read)
+        const reader = svc(ledger("get#ReportBasicInfo"), p)
+        login("john.doe")
+        for (const id of ["NATIVE_STMT_ROLLUP2", "NATIVE_STMT_ROLLUP"])
+            svc("delete#mantle.party.PartyRelationship", {partyRelationshipId: id})
+        return {admin, reader, grandchild: h.org}
+    },
+    then({admin, reader, grandchild}) {
+        admin.summaryRows.some(row => row.organizationPartyId == grandchild)
+        !reader.summaryRows.some(row => row.organizationPartyId == grandchild)
+        reader.summaryRows.some(row => row.organizationPartyId == f.org)
     }
 })

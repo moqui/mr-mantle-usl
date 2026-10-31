@@ -1,9 +1,12 @@
 // Sales analysis (design-accounting §13 SalesAnalysis) of one organization over a span of days: what it sold, by product,
 // customer or customer class, as ordered (its sales orders placed), issued (shipped from those orders), invoiced (its
 // issued sales invoices, by book day) and returned (returns to it), each with its quantity and value in the document's
-// currency. Every read is the organization's own, so top products and customer classes never mix another organization's
-// sales (F6); a user without report read in the organization is refused. A read capped at its limit is named
-// (complete false), never cut silently.
+// currency. Only sales lines count (the item types under ItemSales: products, services, time and the like), not tax,
+// shipping, discounts or other adjustments; a return counts once requested (not a draft or a cancelled one); credit memos
+// that no return made are not counted. Every read is the organization's own, so top products and customer classes never
+// mix another organization's sales (F6); a user without report read in the organization is refused. Without a period or
+// days it reads the organization's fiscal month holding today. A read capped at its limit is named (complete false),
+// never cut silently.
 const policy = ec.resource.script("component://mr-mantle/service/mantle/ledger/AccountingPolicy.js")
 const reports = ec.resource.script("component://mr-mantle/service/mantle/ledger/FinanceReports.js")
 const {find, denied} = policy
@@ -11,6 +14,11 @@ const LIMIT = 2000
 const PLACED = ["OrderPlaced", "OrderProcessing", "OrderApproved", "OrderSent", "OrderCompleted", "OrderHold"]
 const ISSUED = ["InvoiceFinalized", "InvoiceSent", "InvoiceAcked", "InvoicePmtRecvd", "InvoiceWriteOff"]
 const GROUPINGS = ["product", "customer", "customerClass"]
+const NOT_RETURNED = ["ReturnCreated", "ReturnCancelled"]
+// The sales line types: ItemSales and the types under it.
+function salesTypes() {
+    return new Set(["ItemSales", ...Array.from(find("moqui.basic.Enumeration", {parentEnumId: "ItemSales"}).list()).map(row => row.enumId)])
+}
 
 const zero = () => toDecimal(0)
 const dec = value => toDecimal(value ?? 0)
@@ -76,7 +84,16 @@ function customerClasses(customerIds) {
 function analysis(p) {
     const s = policy.organization(p, "reportRead")
     const org = s.organizationPartyId
+    if (!p.timePeriodId && !p.fromDate && !p.thruDate) {
+        const month = policy.call("mantle.ledger.LedgerServices.get#OrganizationFiscalTimePeriods", {
+            organizationPartyId: org,
+            filterDate: ec.user.nowTimestamp,
+            timePeriodTypeId: "FiscalMonth"
+        }).timePeriodList
+        p = Object.assign({}, p, {timePeriodId: Array.from(month || [])[0]?.timePeriodId || null})
+    }
     p = reports.execute("options", Object.assign({}, p, {organizationPartyId: org}))
+    const sales = salesTypes()
     const groupBy = p.groupBy || "product"
     if (!GROUPINGS.includes(groupBy)) denied("GROUPING_INVALID", "Group sales by product, customer or customer class")
     if (p.currencyUomId) policy.currency(p.currencyUomId)
@@ -124,7 +141,7 @@ function analysis(p) {
 
     // returns to the organization entered in the span, not cancelled
     let returnQuery = stampRange(
-        find("mantle.order.return.ReturnHeader", {vendorPartyId: org}).condition("statusId", "not-equals", "ReturnCancelled"),
+        find("mantle.order.return.ReturnHeader", {vendorPartyId: org}).condition("statusId", "not-in", NOT_RETURNED),
         "entryDate",
         p
     )
@@ -133,7 +150,7 @@ function analysis(p) {
     const returnOf = new Map(returns.map(row => [row.returnId, row]))
     const returnItems = inChunks(returns.map(row => row.returnId), chunk =>
         Array.from(find("mantle.order.return.ReturnItem").condition("returnId", "in", chunk).orderBy("returnId,returnItemSeqId").list())
-    ).filter(row => row.statusId !== "ReturnCancelled")
+    ).filter(row => !NOT_RETURNED.includes(row.statusId) && (!row.itemTypeEnumId || sales.has(row.itemTypeEnumId)))
 
     const customers = [
         ...parts.map(row => row.customerPartyId),
@@ -186,6 +203,7 @@ function analysis(p) {
         return rows.get(key)
     }
     for (const item of orderItems) {
+        if (!sales.has(item.itemTypeEnumId)) continue
         const part = partOf.get(item.orderId + ":" + item.orderPartSeqId)
         const total = row(groupOf(item.productId, part.customerPartyId), part.currencyUomId)
         const quantity = item.quantity == null ? toDecimal(1) : dec(item.quantity)
@@ -194,6 +212,7 @@ function analysis(p) {
         total.issuedQuantity = total.issuedQuantity.add(dec(issued[item.orderId + ":" + item.orderItemSeqId]))
     }
     for (const item of invoiceItems) {
+        if (!sales.has(item.itemTypeEnumId)) continue
         const invoice = invoiceOf.get(item.invoiceId)
         const total = row(groupOf(item.productId, invoice.toPartyId), invoice.currencyUomId)
         const quantity = item.quantity == null ? toDecimal(1) : dec(item.quantity)
@@ -233,7 +252,16 @@ function analysis(p) {
             : null
     }
 }
-const operations = {analysis}
+// The organizations of the search-backed sales summaries (get#SalesOrderSummary and the others): those named, each one
+// the user may read, else every one the user works in; refuses a user without report read.
+function organizations(p) {
+    const scope = policy.scope({}, "reportRead")
+    const allowed = scope.organizationPartyIds
+    const named = Array.from(p.organizationPartyIds || []).filter(Boolean)
+    for (const id of named) if (!allowed.includes(id)) denied("ORGANIZATION_DENIED", "Accounting organization is not available")
+    return {organizationPartyIds: named.length ? named : allowed.length ? allowed : ["_NA_"]}
+}
+const operations = {analysis, organizations}
 ;({
     execute: (op, p) => {
         if (!operations[op]) throw new Error("Unknown sales report " + op)

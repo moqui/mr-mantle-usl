@@ -644,8 +644,9 @@ along with this software (see the LICENSE.md file). If not, see
     <service verb="run" noun="PostedAmountSummary">
         <description>Each account's posted debits, credits and net in one currency (the organization's base currency by
             default) between two days, by book day, with its balance before and after (design-accounting §13 PostedSummary).
-            Refuses a user without report read in the organization, a fiscal period of another organization and a unit that
-            is not a currency.</description>
+            Without a fiscal period the through date is included, as this report always read it. Refuses a user without
+            report read in the organization, a fiscal period of another organization and a unit that is not a
+            currency.</description>
         <in-parameters>
             <parameter name="organizationPartyId" required="true"/>
             <parameter name="timePeriodId"/>
@@ -670,47 +671,10 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="complete" from="report.complete"/>
         </actions>
     </service>
-    <service verb="get" noun="PostedAmountSummarySide">
-        <in-parameters>
-            <parameter name="debitCreditFlag" required="true"/>
-            <parameter name="organizationPartyId" required="true"/>
-            <parameter name="fromDate" type="Timestamp"/>
-            <parameter name="thruDate" type="Timestamp"/>
-            <parameter name="amountUomId" required="true"/>
-            <parameter name="accountResultMap" type="Map"/>
-        </in-parameters>
-        <out-parameters><parameter name="accountResultMap" type="Map" required="true"/></out-parameters>
-        <actions>
-            <if condition="accountResultMap == null"><set field="accountResultMap" from="{}"/></if>
-
-            <entity-find entity-name="mantle.ledger.report.PostedAmountSummary" list="postedAmountSummaryList">
-                <econdition field-name="debitCreditFlag"/>
-                <econdition field-name="transactionDate" operator="greater-equals" from="fromDate" ignore-if-empty="true"/>
-                <econdition field-name="transactionDate" operator="less-equals" from="thruDate" ignore-if-empty="true"/>
-                <econdition field-name="amountUomId"/><econdition field-name="organizationPartyId"/>
-                <select-field field-name="glAccountId"/><select-field field-name="accountName"/>
-                <select-field field-name="accountCode"/><select-field field-name="glAccountClassEnumId"/>
-                <select-field field-name="amount"/>
-            </entity-find>
-            <iterate list="postedAmountSummaryList" entry="postedAmountSummary">
-                <set field="accountResult" from="accountResultMap[postedAmountSummary.glAccountId]"/>
-                <if condition="!accountResult">
-                    <set field="accountResult" from="{glAccountId:postedAmountSummary.glAccountId,
-                        accountName:postedAmountSummary.accountName, accountCode:postedAmountSummary.accountCode,
-                        glAccountClassEnumId:postedAmountSummary.glAccountClassEnumId}"/>
-                    <script>accountResultMap[postedAmountSummary.glAccountId] = accountResult</script>
-                </if>
-                <if condition="debitCreditFlag == 'D'">
-                    <set field="accountResult.debitAmount" from="postedAmountSummary.amount"/>
-                    <else><set field="accountResult.creditAmount" from="postedAmountSummary.amount"/></else>
-                </if>
-            </iterate>
-        </actions>
-    </service>
-
     <service verb="get" noun="AccountLedgerInfo">
-        <description>An account's posted lines in a fiscal period with running balances. Refuses a user without report read
-            in the organization and a period of another organization.</description>
+        <description>An account's posted lines in a fiscal period by book day, with running balances from the period's
+            opening balance (its summary row: stored for a closed period, summed from posted entries for an open one).
+            Refuses a user without report read in the organization and a period of another organization.</description>
         <in-parameters>
             <parameter name="glAccountIdList" type="List" required="true"/>
             <parameter name="timePeriodId" required="true"/>
@@ -731,9 +695,12 @@ along with this software (see the LICENSE.md file). If not, see
             <service-call name="mantle.party.TimeServices.get#TimePeriodInfo" in-map="{timePeriodId:timePeriodId}"
                     out-map="context" disable-authz="true"/>
             <set field="organizationPartyId" from="organizationPartyId || timePeriod.partyId"/>
-            <!-- report read in the organization, and the period its own (F6) -->
-            <script>ec.resource.script('component://mr-mantle/service/mantle/ledger/FinanceReports.js')
-                .execute('periodAccess', {organizationPartyId, timePeriodIdList: [timePeriodId]})</script>
+            <!-- report read in the organization, and the period its own (F6); its summary rows and book days -->
+            <set field="reports" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FinanceReports.js')"/>
+            <set field="periodReport" from="reports.execute('periodSummaries', {organizationPartyId,
+                    timePeriodIdList: [timePeriodId]})"/>
+            <set field="bookDays" from="reports.execute('periodCondition', {organizationPartyId,
+                    timePeriodIdList: [timePeriodId]}).condition"/>
 
             <entity-find-one entity-name="mantle.party.PartyDetail" value-field="orgDetail">
                 <field-map field-name="partyId" from="organizationPartyId"/></entity-find-one>
@@ -741,11 +708,9 @@ along with this software (see the LICENSE.md file). If not, see
                     in-map="{organizationPartyId:organizationPartyId}"/>
             <set field="currencyUomId" from="partyAcctgPreference?.baseCurrencyUomId || 'USD'"/>
 
-            <entity-find entity-name="mantle.ledger.account.GlAccountOrgTimePeriod" list="glAccountOrgTimePeriodList">
-                <econdition field-name="glAccountId" operator="in" from="glAccountIdList"/>
-                <econdition field-name="timePeriodId"/><econdition field-name="organizationPartyId"/>
-                <order-by field-name="glAccountId"/>
-            </entity-find>
+            <set field="glAccountOrgTimePeriodList" from="Array.from(periodReport.summaryRows).filter((row) =&gt;
+                    Array.from(glAccountIdList).includes(row.glAccountId))
+                    .sort((a, b) =&gt; a.glAccountId.localeCompare(b.glAccountId))"/>
 
             <set field="entryInfoList" from="[]"/>
             <iterate list="glAccountOrgTimePeriodList" entry="glAccountOrgTimePeriod">
@@ -774,8 +739,7 @@ along with this software (see the LICENSE.md file). If not, see
                 <entity-find entity-name="mantle.ledger.transaction.AcctgTransAndEntrySummary" list="acctgTransEntryList">
                     <econdition field-name="glAccountId"/>
                     <econdition field-name="organizationPartyId"/>
-                    <econdition field-name="transactionDate" operator="greater-equals" from="fromTimestamp"/>
-                    <econdition field-name="transactionDate" operator="less-equals" from="thruTimestamp"/>
+                    <econdition-object field="bookDays"/>
                     <econdition field-name="isPosted" value="Y"/>
                     <!-- don't exclude here, evaluate when processing list to hide pairs (both in period)
                     <econdition field-name="reversedByAcctgTransId" operator="is-null" ignore="showReverses"/>
