@@ -51,6 +51,7 @@ function capabilities() {
         budgetEdit: has("BUDGET_EDIT"),
         budgetApprove: has("BUDGET_APPROVE"),
         budgetOverride: has("BUDGET_OVERRIDE"),
+        returnCreditApprove: has("RETURN_CREDIT_APPROVE"),
         fiscalClose: has("FISCAL_CLOSE"),
         fiscalReopen: has("FISCAL_REOPEN")
     }
