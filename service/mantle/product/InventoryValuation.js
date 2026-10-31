@@ -76,27 +76,70 @@ function ledgerNet(org, accounts, afterDay, byField, conditions = {}) {
 }
 // The organization's inventory through a day, by asset: its quantity then, at its cost then. The cost is the asset's
 // current cost, back to the cost before each revaluation or landed cost dated after the day (a repair reposts history,
-// so it is not undone). Up to ASSET_LIMIT assets; beyond that the stock is incomplete.
-const ASSET_LIMIT = 5000
+// so it is not undone). Today it reads the assets holding stock; for an earlier day those received by then that hold
+// stock now or moved after it. Up to ASSET_LIMIT assets (MOVED_LIMIT moved ones); beyond that the stock is incomplete,
+// and its difference with the ledger is unavailable.
+const ASSET_LIMIT = 5000,
+    MOVED_LIMIT = 20000
 function stockOf(org, afterDay, p = {}) {
     const currency = lib.preference(org).baseCurrencyUomId
-    let q = find("mantle.product.asset.AssetValuationSummary", {ownerPartyId: org, assetTypeEnumId: "AstTpInventory"}).condition(
-        "effectiveDate",
-        "less",
-        midnight(afterDay)
-    )
-    if (p.facilityId) q = q.condition("facilityId", p.facilityId)
-    if (p.productId) q = q.condition("productId", p.productId)
-    for (const field of ["assetId", "productId", "acquireCost", "acquireCostUomId", "quantityOnHandDiff"])
-        q = q.selectField(field)
-    const found = Array.from(
-        q
-            .orderBy("assetId")
-            .limit(ASSET_LIMIT + 1)
-            .list()
-    )
-    const complete = found.length <= ASSET_LIMIT
-    const assets = found.slice(0, ASSET_LIMIT).filter(r => toDecimal(r.quantityOnHandDiff ?? 0).compare(0) !== 0)
+    const before = midnight(afterDay)
+    const cf = ec.entity.conditionFactory
+    const owned = entity => {
+        let q = find(entity, {ownerPartyId: org, assetTypeEnumId: "AstTpInventory"})
+        if (p.facilityId) q = q.condition("facilityId", p.facilityId)
+        if (p.productId) q = q.condition("productId", p.productId)
+        return q
+    }
+    let complete = true,
+        assets
+    if (afterDay > today()) {
+        let q = owned("mantle.product.asset.Asset").condition("quantityOnHandTotal", "not-equals", 0)
+        for (const field of ["assetId", "productId", "acquireCost", "acquireCostUomId", "quantityOnHandTotal"])
+            q = q.selectField(field)
+        const found = Array.from(
+            q
+                .orderBy("assetId")
+                .limit(ASSET_LIMIT + 1)
+                .list()
+        )
+        complete = found.length <= ASSET_LIMIT
+        assets = found.slice(0, ASSET_LIMIT).map(r => Object.assign(map(r), {quantityOnHandDiff: r.quantityOnHandTotal}))
+    } else {
+        const moved = Array.from(
+            find("mantle.product.asset.AssetDetail")
+                .condition("effectiveDate", "greater-equals", before)
+                .selectField("assetId")
+                .distinct(true)
+                .limit(MOVED_LIMIT + 1)
+                .list()
+        ).map(r => r.assetId)
+        if (moved.length > MOVED_LIMIT) complete = false
+        const held = [cf.makeCondition("quantityOnHandTotal", "not-equals", 0)]
+        if (moved.length) held.push(cf.makeCondition("assetId", "in", moved.slice(0, MOVED_LIMIT)))
+        const candidates = Array.from(
+            owned("mantle.product.asset.Asset")
+                .condition(cf.makeCondition(held, "or"))
+                .condition(
+                    cf.makeCondition(
+                        [cf.makeCondition("receivedDate", "is-null", null), cf.makeCondition("receivedDate", "less", before)],
+                        "or"
+                    )
+                )
+                .selectField("assetId")
+                .orderBy("assetId")
+                .limit(ASSET_LIMIT + 1)
+                .list()
+        ).map(r => r.assetId)
+        if (candidates.length > ASSET_LIMIT) complete = false
+        let q = owned("mantle.product.asset.AssetValuationSummary")
+            .condition("assetId", "in", candidates.length ? candidates.slice(0, ASSET_LIMIT) : ["_NA_"])
+            .condition("effectiveDate", "less", before)
+        for (const field of ["assetId", "productId", "acquireCost", "acquireCostUomId", "quantityOnHandDiff"])
+            q = q.selectField(field)
+        assets = Array.from(q.orderBy("assetId").list())
+    }
+    assets = assets.filter(r => toDecimal(r.quantityOnHandDiff ?? 0).compare(0) !== 0)
     const earlierCost = {}
     if (afterDay <= today() && assets.length)
         for (const event of find("mantle.product.asset.AssetBookEvent")
@@ -106,7 +149,7 @@ function stockOf(org, afterDay, p = {}) {
                 assets.map(a => a.assetId)
             )
             .condition("eventTypeEnumId", "in", ["AbeInventoryRevaluation", "AbeLandedCost"])
-            .condition("eventDate", "greater-equals", midnight(afterDay))
+            .condition("eventDate", "greater-equals", before)
             .orderBy("-eventDate")
             .list())
             earlierCost[event.assetId] = event.previousUnitCost
@@ -182,7 +225,7 @@ function tieOut(org, afterDay, p = {}) {
         stockValue: stock.total,
         inventoryBalance,
         wipBalance,
-        difference: stock.total.subtract(inventoryBalance),
+        difference: stock.complete ? stock.total.subtract(inventoryBalance) : null,
         otherCurrency: stock.otherCurrency,
         complete: stock.complete,
         accounts,
@@ -267,7 +310,7 @@ function valuation(p) {
             inventoryBalance: totals.inventoryBalance,
             wipBalance: totals.wipBalance,
             difference: totals.difference,
-            agrees: totals.difference.compare(0) === 0,
+            agrees: totals.difference != null && totals.difference.compare(0) === 0,
             otherCurrency: totals.otherCurrency,
             currency
         },
@@ -728,6 +771,15 @@ function closeCheck(p) {
         const items = []
         for (const org of c.organizations) {
             const totals = tieOut(org, c.afterDay)
+            if (totals.difference == null) {
+                items.push({
+                    recordKind: "inventoryValuation",
+                    recordId: org,
+                    text: "The tie-out is not available: the organization holds more stock than one valuation reads",
+                    detail: "Value it by facility or product"
+                })
+                continue
+            }
             if (totals.difference.compare(0) === 0 && !totals.otherCurrency) continue
             const text = amount => ec.l10n.formatCurrency(amount, totals.currency)
             items.push({

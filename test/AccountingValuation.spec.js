@@ -631,3 +631,51 @@ feature(
         }
     }
 )
+
+feature("a transfer counts at its destination only what this receipt sent (F289)", {
+    when() {
+        product("P13_POOLED", null)
+        const shipmentId = call("create#mantle.shipment.Shipment", {
+            shipmentTypeEnumId: "ShpTpTransfer",
+            fromPartyId: f.org,
+            toPartyId: f.org,
+            statusId: "ShipDelivered"
+        }).shipmentId
+        const sources = [receive("P13_POOLED", 100, 2), receive("P13_POOLED", 100, 2)]
+        for (const r of sources) {
+            issue(r.assetId, "P13_POOLED", 90)
+            issue(r.assetId, "P13_POOLED", 10, {shipmentId})
+        }
+        receive("P13_POOLED", 20, 2, {shipmentId, facilityId: "ACCT_P13_WH2"})
+        return {
+            review: landed(
+                freightBill(20),
+                sources.map(r => r.assetReceiptId)
+            )
+        }
+    },
+    then({review}) {
+        review.preview.complete == true
+        review.preview.allocationRows.every(r => toDecimal(r.onHandQuantity).compare(10) === 0)
+        review.preview.allocationRows.every(r => toDecimal(r.issuedQuantity).compare(90) === 0)
+    }
+})
+
+feature("today's valuation reads the assets holding stock; an earlier day those that held stock then (F288)", {
+    when() {
+        product("P13_GONE", null)
+        const yesterday = new Date(Number(ec.user.nowTimestamp) - 86400000)
+        const r = receive("P13_GONE", 5, 2, {receivedDate: yesterday})
+        issue(r.assetId, "P13_GONE", 5)
+        const report = day =>
+            asUser(f.users.read, () =>
+                call(REPORT + "run#InventoryValuation", {organizationPartyId: f.org, productId: "P13_GONE", asOfDate: day})
+            )
+        return {today: report(null), earlier: report(ec.l10n.format(yesterday, "yyyy-MM-dd"))}
+    },
+    then({today, earlier}) {
+        today.summary.stockValue == 0 && today.summary.agrees == true && today.complete == true
+        earlier.valuationRows[0].quantity == 5 && earlier.valuationRows[0].value == 10
+        earlier.summary.agrees == true
+    }
+})

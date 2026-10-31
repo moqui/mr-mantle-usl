@@ -134,39 +134,63 @@ function sources(p) {
     }
 }
 // A receipt's asset and the assets its stock went on to: those a revaluation split it into or a move put it in
-// (AssetDetail.otherAssetId), and those a transfer shipment's issue received at another facility of the organization.
-// Each asset once (a move out and back is not followed twice), in a stable order.
-function successors(asset, org) {
-    const ids = new Set(
+// (AssetDetail.otherAssetId), and those a transfer shipment's issue received at another facility of the organization,
+// each counted for no more than that issue sent (a destination also holds what other sources sent). Each asset once (a
+// move out and back is not followed twice), with the most of its stock that can be this receipt's (cap; null for all).
+// Stock issued to a transfer that has not been received is in transit.
+const CHAIN_LIMIT = 50
+function successors(asset, org, cap) {
+    const out = []
+    const moved = new Set(
         rows("mantle.product.asset.AssetDetail", {otherAssetId: asset.assetId})
             .filter(r => toDecimal(r.quantityOnHandDiff || 0).compare(0) > 0)
             .map(r => r.assetId)
     )
-    for (const issue of rows("mantle.product.issuance.AssetIssuance", {assetId: asset.assetId}).filter(r => r.shipmentId)) {
-        const shipment = one("mantle.shipment.Shipment", {shipmentId: issue.shipmentId})
-        if (shipment?.shipmentTypeEnumId !== "ShpTpTransfer") continue
-        for (const receipt of rows("mantle.product.receipt.AssetReceipt", {shipmentId: issue.shipmentId}))
-            if (receipt.productId === asset.productId) ids.add(receipt.assetId)
+    for (const id of [...moved].sort()) out.push({assetId: id, cap})
+    let inTransit = toDecimal(0)
+    for (const issue of rows("mantle.product.issuance.AssetIssuance", {assetId: asset.assetId})
+        .filter(r => r.shipmentId)
+        .sort((a, b) => a.assetIssuanceId.localeCompare(b.assetIssuanceId))) {
+        if (one("mantle.shipment.Shipment", {shipmentId: issue.shipmentId})?.shipmentTypeEnumId !== "ShpTpTransfer") continue
+        let sent = toDecimal(issue.quantity ?? 0).subtract(toDecimal(issue.quantityCancelled ?? 0))
+        if (cap != null && sent.compare(cap) > 0) sent = cap
+        for (const receipt of rows("mantle.product.receipt.AssetReceipt", {shipmentId: issue.shipmentId})
+            .filter(r => r.productId === asset.productId)
+            .sort((a, b) => a.assetReceiptId.localeCompare(b.assetReceiptId))) {
+            if (sent.compare(0) <= 0) break
+            const received = toDecimal(receipt.quantityAccepted ?? 0)
+            const part = received.compare(sent) < 0 ? received : sent
+            out.push({assetId: receipt.assetId, cap: part})
+            sent = sent.subtract(part)
+        }
+        if (sent.compare(0) > 0) inTransit = inTransit.add(sent)
     }
-    return [...ids]
-        .filter(id => id && id !== asset.assetId)
-        .map(id => one(ASSET, {assetId: id}))
-        .filter(a => a && a.ownerPartyId === org)
-        .sort((a, b) => a.assetId.localeCompare(b.assetId))
+    const found = out
+        .filter(r => r.assetId && r.assetId !== asset.assetId)
+        .map(r => ({asset: one(ASSET, {assetId: r.assetId}), cap: r.cap}))
+        .filter(r => r.asset && r.asset.ownerPartyId === org)
+    return {found, inTransit}
 }
-function heldBy(asset, org, lock, visited = new Set()) {
-    if (visited.has(asset.assetId) || visited.size > 50) return []
-    visited.add(asset.assetId)
+// The chain of a receipt's asset: [{asset, cap}], with what is in transit and whether it was cut at CHAIN_LIMIT assets.
+function heldBy(asset, org, lock, state = {visited: new Set(), inTransit: toDecimal(0), cut: false}, cap = null) {
+    if (state.visited.has(asset.assetId)) return []
+    if (state.visited.size >= CHAIN_LIMIT) {
+        state.cut = true
+        return []
+    }
+    state.visited.add(asset.assetId)
     const current = lock ? find(ASSET, {assetId: asset.assetId}).forUpdate(true).one() : asset
-    const out = [current]
-    for (const next of successors(asset, org)) out.push(...heldBy(next, org, lock, visited))
+    const out = [{asset: current, cap}]
+    const next = successors(asset, org, cap)
+    state.inTransit = state.inTransit.add(next.inTransit)
+    for (const r of next.found) out.push(...heldBy(r.asset, org, lock, state, r.cap))
     return out
 }
-// What left a chain of assets by issue (a transfer to another facility of the organization stays held): to work, and
-// otherwise (a sale, a return to a supplier).
+// What left a chain's own assets by issue (not those a transfer reached, which other sources also fed; a transfer itself
+// stays held): to work, and otherwise (a sale, a return to a supplier).
 function issuedByKind(chain) {
     const out = {run: toDecimal(0), other: toDecimal(0)}
-    for (const asset of chain)
+    for (const {asset} of chain.filter(r => r.cap == null))
         for (const issue of rows("mantle.product.issuance.AssetIssuance", {assetId: asset.assetId})) {
             const quantity = toDecimal(issue.quantity ?? 0).subtract(toDecimal(issue.quantityCancelled ?? 0))
             if (quantity.compare(0) <= 0) continue
@@ -301,9 +325,18 @@ function calculate(p, lock = false) {
                 : toDecimal(0)
         remaining = remaining.subtract(share)
         const accepted = toDecimal(m.receipt.quantityAccepted)
-        const chain = heldBy(m.asset, org, lock)
-        const holders = chain.filter(a => toDecimal(a.quantityOnHandTotal || 0).compare(0) > 0)
-        let onHand = holders.reduce((sum, a) => sum.add(a.quantityOnHandTotal), toDecimal(0))
+        const state = {visited: new Set(), inTransit: toDecimal(0), cut: false}
+        const chain = heldBy(m.asset, org, lock, state)
+        if (state.cut) finding(m.receipt.assetReceiptId, "The receipt's stock moved through more than " + CHAIN_LIMIT + " assets")
+        if (state.inTransit.compare(0) > 0) finding(m.receipt.assetReceiptId, "Stock in transit: allocate after it is received")
+        // each holder's quantity that can be this receipt's: its stock, at most what a transfer sent it from this chain
+        const holders = chain
+            .map(r => {
+                const stock = toDecimal(r.asset.quantityOnHandTotal || 0)
+                return {asset: r.asset, quantity: r.cap != null && stock.compare(r.cap) > 0 ? toDecimal(r.cap) : stock}
+            })
+            .filter(r => r.quantity.compare(0) > 0)
+        let onHand = holders.reduce((sum, r) => sum.add(r.quantity), toDecimal(0))
         if (onHand.compare(accepted) > 0) onHand = accepted
         const issued = accepted.subtract(onHand)
         const onHandAmount = lib.lib.money(share.multiply(onHand).divide(accepted, 12, "HALF_UP"), currency)
@@ -326,12 +359,9 @@ function calculate(p, lock = false) {
         // the on-hand share goes to the assets holding the receipt's stock, by their quantity
         let left = onHandAmount,
             leftQuantity = onHand
-        for (const holder of holders) {
+        for (const {asset: holder, quantity: holds} of holders) {
             if (leftQuantity.compare(0) <= 0) break
-            const quantity =
-                toDecimal(holder.quantityOnHandTotal).compare(leftQuantity) > 0
-                    ? leftQuantity
-                    : toDecimal(holder.quantityOnHandTotal)
+            const quantity = holds.compare(leftQuantity) > 0 ? leftQuantity : holds
             const amount =
                 quantity.compare(leftQuantity) === 0
                     ? left
@@ -369,8 +399,12 @@ function calculate(p, lock = false) {
         })
         // the receipt's own asset is evidence even when it holds no stock: a sale from it changes the split
         evidence.push(lib.pick(map(m.asset), ["assetId", "quantityOnHandTotal", "acquireCost", "lastUpdatedStamp"]))
-        for (const asset of chain.slice(1))
-            evidence.push(lib.pick(map(asset), ["assetId", "quantityOnHandTotal", "acquireCost", "lastUpdatedStamp"]))
+        for (const {asset, cap} of chain.slice(1))
+            evidence.push(
+                Object.assign(lib.pick(map(asset), ["assetId", "quantityOnHandTotal", "acquireCost", "lastUpdatedStamp"]), {
+                    cap: cap == null ? null : String(cap)
+                })
+            )
         evidence.push(lib.pick(map(m.receipt), ["assetReceiptId", "quantityAccepted", "lastUpdatedStamp"]))
     })
     // each holding asset's new cost from the sum of its shares; the inventory posts quantity x unit change, and the
@@ -631,7 +665,7 @@ function repair(p) {
             "BOOK_EVENTS",
             "The product's stock has revaluation or landed cost postings (transactions " +
                 [...new Set(bookEvents.map(r => r.acctgTransId))].join(", ") +
-                "); a repair would leave them wrong"
+                "); a repair would leave them wrong, so it is unavailable for this product until those postings can be reversed"
         )
     const posted = Array.from(
         find("mantle.ledger.transaction.AcctgTrans", {organizationPartyId: org, isPosted: "Y"})
