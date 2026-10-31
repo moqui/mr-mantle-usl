@@ -391,6 +391,69 @@ check `check#BankAccess` first; those services keep running for the statement me
   account into one `PaymentDeposit` (`Payment.paymentDepositId`, under an operation key). The deposit's one bank line
   reconciles them all (`PaymentMethodTrans.paymentDepositId`), and a second line for it is refused.
 
+## Collections, credit and recurring invoices (P10)
+
+**Order holds (CX-ORDER-HOLD).** `mantle.order.OrderHoldReason` names why an order (or a part) is on OrderHold: its type
+(`OrderHoldType`: Credit, Change, Purchase, Manual, each with the permission that releases it as its enumCode), the record
+that caused it, who placed it and when, and who released it, when and why. `OrderServices.hold#Order` writes a reason and
+moves the order to OrderHold (reservations stay; a Credit reason is placed only by the credit policy, the other types need
+their type's permission); `release#OrderHold` (the type's permission and a comment) releases one reason and returns the
+order to the reason's return status (Approved) only when no other reason is open. Nothing uses OrderBeingChanged.
+
+**Credit (AC-11).** `mantle.account.billing.CustomerCreditPolicy`: an organization's policy for a customer, or its default
+(no customer), as effective-dated rows with audit-logged fields (limit in its currency, most days overdue, warn or hold).
+`mantle.account.CreditServices` (logic in `account/Credit.js`):
+- `store#Policy` (`ACCOUNTING_ADMIN` or `CREDIT_HOLD_RELEASE`) and `store#Defaults` (`ACCOUNTING_ADMIN`): the row in effect
+  ends and the next starts, unless nothing changed; `ended` ends it.
+- `evaluate#OrderCredit` (no permission; `allow-remote` false): the order's sales part against the customer's policy, else
+  the default. Exposure is the unpaid issued invoices and the open orders not yet invoiced (part totals less
+  OrderItemBilling), less unapplied payments and the payments authorized on those orders; over the limit, or an invoice
+  more days overdue than allowed, gives the policy's action, and an order in another currency is a reason. With
+  `placeHold` a Hold result places a Credit hold and sends `CreditHoldRelease` to the organization's users holding
+  `CREDIT_HOLD_RELEASE`. No policy, a purchase order or an order between internal organizations passes.
+- It runs inside `OrderServices.approve#Order` (a Hold result holds the order instead, `creditHeld`; a Warn result
+  approves with `creditWarning`; an order with an open hold reason is refused, `ORDER_HOLD_OPEN`) and as the
+  `OrderPreApproveCredit` SECA (`service/AccountingCredit.secas.xml`) on `check#OrderPreApprove`, adding its warning,
+  which stops `autoApprove#Order`; `autoApprove#Order` passes `approving`, so only then is the hold placed.
+- `release#CreditHold` (`CREDIT_HOLD_RELEASE`; a reason): a `CreditHoldDecision` with the exposure and limit it was made
+  on and until when it stands, then `release#OrderHold`; the notifications are marked read.
+- `get#CustomerCreditStatus` (`CUSTOMER_CREDIT_VIEW`): the policy in effect and its history, the exposure by part, what is
+  left, the open credit holds and the decisions.
+
+**Collections (AC-10).** `mantle.account.CollectionServices` (logic in `account/Collections.js`):
+- `record#Activity` (`RECEIVABLE_EDIT`): a contact done now (a WorkEffort call, email or to-do on the customer's record,
+  with a `CollectionActivity` row of the organization and its outcome) and an optional next action assigned to the
+  collector, which reaches their Today. The Disputed outcome marks the invoices named (`Invoice.disputedDate`,
+  `disputeNote`); Dispute resolved clears them.
+- `store#Promise` (`RECEIVABLE_EDIT`): `CollectionPromise`, an amount by a day with the invoices it covers, or its
+  cancellation. `get#CustomerCollections` (receivable read) gives the activities, next actions, promises with their
+  state (kept by the customer's payments received from its making through its day, broken when the day passes first)
+  and the disputed invoices.
+- `store#Level` (`ACCOUNTING_ADMIN`): `DunningLevel` as effective-dated rows (days overdue it starts at, days before the
+  same customer gets it again, its EmailTemplate, whether disputed invoices are left out).
+- `preview#Dunning` (`RECEIVABLE_EDIT`): a `DunningRun` as of a day with a `DunningNotice` per customer and currency at
+  the level of its most overdue invoice that is not disputed, and the invoices left out with the reason (`DISPUTED`,
+  `COVERED`, `PROMISED`, `RECENT_NOTICE`); more than 2,000 overdue invoices are named (incomplete).
+- `send#Dunning` (`RECEIVABLE_EDIT`, an operation key): each notice not yet sent in its own transaction
+  (`send#DunningNotice`: its invoices read again, the reminder through the level's template, `MANTLE_DUNNING_EMAIL` by
+  default, from `template/account/DunningNotice.html.fancy`); a failure keeps its reason and sending again sends only
+  those. `get#DunningRun` reads a run. `send_SalesInvoicePastDueEmails` stays paused.
+
+**Recurring invoices (AC-09).** `InvoiceSchedule` (a template invoice, interval, first and last day, next day, term,
+state) and `InvoiceScheduleOccurrence` (one period by day: its invoice, or why it failed). `RecurringInvoiceServices`
+(logic in `account/RecurringInvoices.js`): `store#Schedule` (the side's edit permission; a change applies to the periods
+not made), `preview#Period` (the side's view), `generate#Invoices` (the side's edit permission; one period in its own
+transaction, `generate#Occurrence`, which locks the schedule and answers a made period's invoice), `record#OccurrenceFailure`
+(with `RecurringInvoiceFailed` to the side's billers) and `run#Schedules`, the `generate_RecurringInvoices` job (nightly;
+at most 12 periods a schedule a run). Drafts only.
+
+**Aging (AC-12).** `LedgerReportServices.run#Aging` (report read or the side's view; an organization the user works in):
+each invoice open on the day (issued by then, less what was applied by then, `InvoiceWorkflowLib.totalsMany`), each
+portion of its due schedule (`PaymentTerms.schedules`) in the bucket of its days past due, by party and currency, the
+totals of each currency and, for one party, its invoices; calendar days compared in JavaScript (`ledger/Aging.js`). More
+than 5,000 open invoices give `complete` false with `incompleteReason`. `InvoiceAgingSummary` is fixed (F36): H2's day
+sign, the last bucket from 4×periodDays+1 and no party role joins.
+
 ## Period close (P11)
 
 `CloseServices` (logic in `ledger/PeriodClose.js`) closes an organization's fiscal period on Mantle's close.
@@ -498,8 +561,8 @@ first release has local sales tax and the US 1099 data.
   fields, and asks `ACCOUNTING_GL_POST` of a manual or reversal posting unless its caller passes `reviewed`.
 - `account/InvoiceWorkflowLib.js`: an invoice's scope for a read or a write, and the hold guard. `Payables.js`,
   `InvoiceMatch.js`, `InvoiceWorkflow.js`, `PaymentTerms.js`, `PaymentRuns.js`,
-  `InvoiceAttachments.js`, `PaymentWorkflow.js`, `PaymentLifecycle.js`, `PaymentSettlement.js`, `PaymentOutput.js` and
-  `BankReconciliation.js` hold the logic too involved for XML Actions; the other services are inline XML Actions.
+  `InvoiceAttachments.js`, `PaymentWorkflow.js`, `PaymentLifecycle.js`, `PaymentSettlement.js`, `PaymentOutput.js`,
+  `Credit.js`, `Collections.js`, `RecurringInvoices.js`, `ledger/Aging.js` and `BankReconciliation.js` hold the logic too involved for XML Actions; the other services are inline XML Actions.
 
 ## The posting guard flag
 
@@ -526,6 +589,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingBankReconciliation,BankFileServices
 ./moq test mr-mantle --spec AccountingPeriodClose,AccountingProjectCost
 ./moq test mr-mantle --spec AccountingTax,TaxStatementServices
+./moq test mr-mantle --spec AccountingCredit,AccountingCollections,AccountingRecurringAging
 ```
 
 The PDF specs need a Chromium for PDF (`pdf_chromium_path`; see [Run-Deploy](../../../../docs/Run-Deploy.md) and
