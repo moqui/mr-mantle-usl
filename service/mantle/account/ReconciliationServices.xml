@@ -645,7 +645,8 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="pageSize" type="Integer" default="20"/>
         </in-parameters>
         <out-parameters>
-            <parameter name="lineRows" type="List"/>
+            <parameter name="lineRows" type="List"><description>The page, with its fields under the list's name too
+                (lineRowsCount, lineRowsPageIndex and the others) for a form-list</description></parameter>
             <parameter name="organizationPartyId"/>
             <parameter name="recordCount" type="Integer"/>
             <parameter name="pageIndex" type="Integer"/>
@@ -653,12 +654,19 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="pageMaxIndex" type="Integer"/>
             <parameter name="pageRangeLow" type="Integer"/>
             <parameter name="pageRangeHigh" type="Integer"/>
+            <parameter name="lineRowsCount" type="Integer"/>
+            <parameter name="lineRowsPageIndex" type="Integer"/>
+            <parameter name="lineRowsPageSize" type="Integer"/>
+            <parameter name="lineRowsPageMaxIndex" type="Integer"/>
+            <parameter name="lineRowsPageRangeLow" type="Integer"/>
+            <parameter name="lineRowsPageRangeHigh" type="Integer"/>
         </out-parameters>
         <actions>
             <set field="module" value="component://mr-mantle/service/mantle/account/BankReconciliation.js"/>
             <set field="found" from="ec.resource.script(module).execute('bankLines', context)"/>
             <script>for (const field of ['lineRows', 'organizationPartyId', 'recordCount', 'pageIndex', 'pageSize',
-                'pageMaxIndex', 'pageRangeLow', 'pageRangeHigh']) context.put(field, found[field])</script>
+                'pageMaxIndex', 'pageRangeLow', 'pageRangeHigh', 'lineRowsCount', 'lineRowsPageIndex', 'lineRowsPageSize',
+                'lineRowsPageMaxIndex', 'lineRowsPageRangeLow', 'lineRowsPageRangeHigh']) context.put(field, found[field])</script>
         </actions>
     </service>
     <service verb="find" noun="BankLineCandidates" allow-remote="false">
@@ -833,9 +841,12 @@ along with this software (see the LICENSE.md file). If not, see
             <entity-find-one entity-name="moqui.basic.StatusItem" value-field="status" cache="true" disable-authz="true">
                 <field-map field-name="statusId" from="found.statusId"/>
             </entity-find-one>
+            <set field="calendar" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/EntityLib.js')"/>
             <set field="statementImport" from="Object.assign(found.getMap(), {rowsJson:null, warningsJson:null,
                     formatText:format?.description || found.formatEnumId, statusText:status?.description || found.statusId,
                     createdDateText:ec.l10n.format(found.createdDate, 'yyyy-MM-dd HH:mm'),
+                    statementFromDateText:found.statementFromDate ? calendar.calendarDateText(found.statementFromDate) : '',
+                    statementThruDateText:found.statementThruDate ? calendar.calendarDateText(found.statementThruDate) : '',
                     committedDateText:found.committedDate ? ec.l10n.format(found.committedDate, 'yyyy-MM-dd HH:mm') : ''})"/>
             <set field="statusTexts" from="{new:'New', duplicate:'Duplicate', rejected:'Rejected', failed:'Failed',
                     imported:'Imported'}"/>

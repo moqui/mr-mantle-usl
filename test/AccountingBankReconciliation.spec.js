@@ -14,7 +14,11 @@ function lines(bankId) {
     return ec.entity.find("mantle.account.method.PaymentMethodTrans").condition("paymentMethodId", bankId).disableAuthz().count()
 }
 function line(bankId, fitId) {
-    return ec.entity.find("mantle.account.method.PaymentMethodTrans").condition({paymentMethodId: bankId, fitId}).disableAuthz().one()
+    return ec.entity
+        .find("mantle.account.method.PaymentMethodTrans")
+        .condition({paymentMethodId: bankId, fitId})
+        .disableAuthz()
+        .one()
 }
 function payment(paymentId) {
     return ec.entity.find("mantle.account.payment.Payment").condition("paymentId", paymentId).disableAuthz().one()
@@ -27,7 +31,10 @@ function receipt(amount, extra = {}) {
 function bankLine(fitId, amount, extra = {}) {
     native(
         "create#PaymentMethodTrans",
-        Object.assign({paymentMethodId: f.bankId, fitId, postedDate: f.timestamp, transAmount: amount, transType: "PMTT_CREDIT"}, extra)
+        Object.assign(
+            {paymentMethodId: f.bankId, fitId, postedDate: f.timestamp, transAmount: amount, transType: "PMTT_CREDIT"},
+            extra
+        )
     )
     return fitId
 }
@@ -188,8 +195,12 @@ feature("a rule applies only an exact unambiguous match; an ambiguous rule sugge
         const test = native("test#Rule", {organizationPartyId: f.org, bankMatchRuleId: rule.bankMatchRuleId})
         const noParty = rejected("store#Rule", {organizationPartyId: f.org, matchText: "x", autoApply: "Y"})
         const applied = native("apply#Rules", {organizationPartyId: f.org, paymentMethodId: f.bankId})
-        const lineRows = native("find#BankLines", {paymentMethodId: f.bankId, lineState: "open", withSuggestions: true, pageSize: 100})
-            .lineRows
+        const lineRows = native("find#BankLines", {
+            paymentMethodId: f.bankId,
+            lineState: "open",
+            withSuggestions: true,
+            pageSize: 100
+        }).lineRows
         native("store#Rule", {organizationPartyId: f.org, bankMatchRuleId: rule.bankMatchRuleId, ended: "Y"})
         return {
             exactPayment,
@@ -409,45 +420,53 @@ feature("a deposit's one bank line reconciles its receipts once", {
         undone.join() == "PmtrNot,PmtrNot"
     }
 })
-feature("bank reconciliation needs BANK_RECONCILE and a deposit needs payment edit; the same requests pass for those who hold them", {
-    when() {
-        const request = {paymentMethodId: f.bankId, formatEnumId: "SifCsv", statementText: csv([`${f.day},Access fee,-1.00,A1`])}
-        const as = (user, action) => {
-            login(user)
-            // artifact authorization off: the services' own permission checks decide
-            ec.artifactExecution.disableAuthz()
-            try {
-                return action()
-            } finally {
-                login("john.doe")
-                ec.artifactExecution.disableAuthz()
+feature(
+    "bank reconciliation needs BANK_RECONCILE and a deposit needs payment edit; the same requests pass for those who hold them",
+    {
+        when() {
+            const request = {
+                paymentMethodId: f.bankId,
+                formatEnumId: "SifCsv",
+                statementText: csv([`${f.day},Access fee,-1.00,A1`])
             }
+            const as = (user, action) => {
+                login(user)
+                // artifact authorization off: the services' own permission checks decide
+                ec.artifactExecution.disableAuthz()
+                try {
+                    return action()
+                } finally {
+                    login("john.doe")
+                    ec.artifactExecution.disableAuthz()
+                }
+            }
+            const deposit = id => ({paymentMethodId: f.bankId, paymentIdList: [id], operationKey: "p9-access-" + id})
+            const first = receipt("11"),
+                second = receipt("12")
+            return {
+                reader: as(f.users.reader, () => rejected("review#StatementImport", request)),
+                readerLines: as(f.users.reader, () => native("find#BankLines", {paymentMethodId: f.bankId}).recordCount),
+                banker: as(f.users.banker, () => native("review#StatementImport", request).newCount),
+                payer: as(f.users.payer, () => rejected("review#StatementImport", request)),
+                readerDeposit: as(f.users.reader, () =>
+                    rejected("mantle.account.PaymentServices.create#DepositSlip", deposit(first))
+                ),
+                payerDeposit: as(
+                    f.users.payer,
+                    () => native("mantle.account.PaymentServices.create#DepositSlip", deposit(second)).paymentCount
+                )
+            }
+        },
+        then({reader, readerLines, banker, payer, readerDeposit, payerDeposit}) {
+            reader.includes("PERMISSION_DENIED")
+            readerLines > 0
+            banker == 1
+            payer.includes("PERMISSION_DENIED")
+            readerDeposit.includes("PERMISSION_DENIED")
+            payerDeposit == 1
         }
-        const deposit = id => ({paymentMethodId: f.bankId, paymentIdList: [id], operationKey: "p9-access-" + id})
-        const first = receipt("11"),
-            second = receipt("12")
-        return {
-            reader: as(f.users.reader, () => rejected("review#StatementImport", request)),
-            readerLines: as(f.users.reader, () => native("find#BankLines", {paymentMethodId: f.bankId}).recordCount),
-            banker: as(f.users.banker, () => native("review#StatementImport", request).newCount),
-            payer: as(f.users.payer, () => rejected("review#StatementImport", request)),
-            readerDeposit: as(f.users.reader, () =>
-                rejected("mantle.account.PaymentServices.create#DepositSlip", deposit(first))
-            ),
-            payerDeposit: as(f.users.payer, () =>
-                native("mantle.account.PaymentServices.create#DepositSlip", deposit(second)).paymentCount
-            )
-        }
-    },
-    then({reader, readerLines, banker, payer, readerDeposit, payerDeposit}) {
-        reader.includes("PERMISSION_DENIED")
-        readerLines > 0
-        banker == 1
-        payer.includes("PERMISSION_DENIED")
-        readerDeposit.includes("PERMISSION_DENIED")
-        payerDeposit == 1
     }
-})
+)
 feature("a financial account's movements need payment edit authority in its organization", {
     when() {
         const finAccountId = call("mantle.account.FinancialAccountServices.create#FinancialAccount", {

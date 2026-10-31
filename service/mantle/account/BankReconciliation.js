@@ -54,7 +54,13 @@ function postedBetween(query, fromDay, thruDay) {
 // A deterministic key of a source row: the same row of the same file always gets the same key, so a file imported again
 // adds nothing; occurrence tells identical rows of one file apart.
 function rowKey(prefix, parts) {
-    return prefix + lib.hash(parts).replace(/[^A-Za-z0-9]/g, "").slice(0, 32)
+    return (
+        prefix +
+        lib
+            .hash(parts)
+            .replace(/[^A-Za-z0-9]/g, "")
+            .slice(0, 32)
+    )
 }
 function occurrence(seen, parts) {
     const text = JSON.stringify(parts)
@@ -403,7 +409,11 @@ function csvRecords(text, delimiter = ",") {
     return records.filter(r => r.some(value => String(value).trim() !== ""))
 }
 function csvMapping(header, mapping) {
-    const names = header.map(name => String(name || "").trim().toLowerCase())
+    const names = header.map(name =>
+        String(name || "")
+            .trim()
+            .toLowerCase()
+    )
     const column = (value, guesses) => {
         const text = String(value || "").trim()
         if (/^\d+$/.test(text)) return parseInt(text, 10) - 1
@@ -454,7 +464,14 @@ function csvAmount(text) {
     return amount
 }
 function parseCsv(text, method, mapping = {}) {
-    const result = {rows: [], fileErrors: [], warnings: [], balance: {}, currencyUomId: method?.currencyUomId || null, columns: []}
+    const result = {
+        rows: [],
+        fileErrors: [],
+        warnings: [],
+        balance: {},
+        currencyUomId: method?.currencyUomId || null,
+        columns: []
+    }
     const records = csvRecords(text, mapping.delimiter || ",")
     if (!records.length) {
         result.fileErrors.push("The CSV file has no rows")
@@ -487,7 +504,10 @@ function parseCsv(text, method, mapping = {}) {
                 credit = csvAmount(cell(record, columns.credit))
             if (debit === undefined || credit === undefined) amount = undefined
             else if (debit == null && credit == null) amount = null
-            else amount = (credit || toDecimal(0)).subtract(debit ? (debit.compare(0) < 0 ? debit.multiply(-1) : debit) : toDecimal(0))
+            else
+                amount = (credit || toDecimal(0)).subtract(
+                    debit ? (debit.compare(0) < 0 ? debit.multiply(-1) : debit) : toDecimal(0)
+                )
         }
         if (!posted) row.error = "The date " + (dateText || "(empty)") + " is not a date of the form " + format
         else if (amount === undefined) row.error = "The amount is not a number"
@@ -532,14 +552,27 @@ function statement(p) {
         if (row.postedDate != null) row.postedDate = String(lib.ms(row.postedDate))
         row.postedDateText = row.postedDate ? dayText(row.postedDate) : ""
     }
-    const days = result.rows.map(row => row.postedDateText).filter(Boolean).sort()
+    const days = result.rows
+        .map(row => row.postedDateText)
+        .filter(Boolean)
+        .sort()
     result.statementFromDate = days[0] || null
     result.statementThruDate = days[days.length - 1] || null
     if (result.balance.balanceDate != null) result.balance.balanceDate = String(lib.ms(result.balance.balanceDate))
     return result
 }
 // The fields of a bank line from a statement row.
-const lineFields = ["fitId", "transType", "transCode", "postedDate", "transAmount", "transName", "transMemo", "checkNumber", "refNumber"]
+const lineFields = [
+    "fitId",
+    "transType",
+    "transCode",
+    "postedDate",
+    "transAmount",
+    "transName",
+    "transMemo",
+    "checkNumber",
+    "refNumber"
+]
 function lineOf(p) {
     const line = {paymentMethodId: p.paymentMethodId, statementImportId: p.statementImportId || null}
     for (const field of lineFields) if (p.row[field] != null && p.row[field] !== "") line[field] = p.row[field]
@@ -555,7 +588,10 @@ const unmatched = query => {
         .condition("acctgTransId", "is-null", null)
         .condition("paymentDepositId", "is-null", null)
         .condition(
-            cf.makeCondition([cf.makeCondition("noReconcile", "is-null", null), cf.makeCondition("noReconcile", "not-equals", "Y")], "or")
+            cf.makeCondition(
+                [cf.makeCondition("noReconcile", "is-null", null), cf.makeCondition("noReconcile", "not-equals", "Y")],
+                "or"
+            )
         )
 }
 // What a bank line is matched with: matched (a payment, a deposit or a ledger entry), excluded (no reconcile) or open.
@@ -665,7 +701,10 @@ function candidates(line, method, options = {}) {
             .condition("amount", absolute)
             .condition(
                 cf.makeCondition(
-                    [cf.makeCondition("reconcileStatusId", "is-null", null), cf.makeCondition("reconcileStatusId", "equals", "AterNot")],
+                    [
+                        cf.makeCondition("reconcileStatusId", "is-null", null),
+                        cf.makeCondition("reconcileStatusId", "equals", "AterNot")
+                    ],
                     "or"
                 )
             )
@@ -749,7 +788,9 @@ function openLines(organizationPartyId, paymentMethodId, limit) {
     const methodIds = paymentMethodId
         ? [paymentMethodId]
         : Array.from(
-              find("mantle.account.method.PaymentMethod", {ownerPartyId: organizationPartyId}).selectField("paymentMethodId").list()
+              find("mantle.account.method.PaymentMethod", {ownerPartyId: organizationPartyId})
+                  .selectField("paymentMethodId")
+                  .list()
           ).map(row => row.paymentMethodId)
     if (!methodIds.length) return []
     return Array.from(
@@ -950,10 +991,10 @@ function bankLines(p) {
                   .selectField("paymentMethodId")
                   .list()
           ).map(row => row.paymentMethodId)
-    if (!methodIds.length) return Object.assign(lib.page(find(TRANS).condition("paymentMethodId", "_NA_"), p, "lines", 0), {lineRows: []})
+    if (!methodIds.length) return lib.page(find(TRANS).condition("paymentMethodId", "_NA_"), p, "lineRows", 0)
     // a find is used once: one for the count, one for the page
     const recordCount = linesQuery(p, methodIds).count()
-    const page = lib.page(linesQuery(p, methodIds), p, "lines", recordCount)
+    const page = lib.page(linesQuery(p, methodIds), p, "lineRows", recordCount)
     const lines = page.rows
     const cleared = {}
     if (lines.length) {
@@ -963,7 +1004,10 @@ function bankLines(p) {
                 cf.makeCondition(
                     lines.map(line =>
                         cf.makeCondition(
-                            [cf.makeCondition("paymentMethodId", "equals", line.paymentMethodId), cf.makeCondition("fitId", "equals", line.fitId)],
+                            [
+                                cf.makeCondition("paymentMethodId", "equals", line.paymentMethodId),
+                                cf.makeCondition("fitId", "equals", line.fitId)
+                            ],
                             "and"
                         )
                     ),
@@ -991,7 +1035,8 @@ function bankLines(p) {
     const lineRows = lines.map(line => {
         const extra = {
             bankReconciliationId: cleared[line.paymentMethodId + "|" + line.fitId] || null,
-            bankLabel: labels[line.paymentMethodId] || line.paymentMethodId
+            bankLabel: labels[line.paymentMethodId] || line.paymentMethodId,
+            currencyUomId: methodOf(line.paymentMethodId)?.currencyUomId || null
         }
         if (p.withSuggestions && lineState(line) === "open") {
             const method = methodOf(line.paymentMethodId)
@@ -1027,7 +1072,11 @@ function figures(p) {
         for (let i = 0; i < lines.length; i += 200) {
             const slice = lines.slice(i, i + 200)
             for (const line of find(TRANS, {paymentMethodId: rec.paymentMethodId})
-                .condition("fitId", "in", slice.map(row => row.fitId))
+                .condition(
+                    "fitId",
+                    "in",
+                    slice.map(row => row.fitId)
+                )
                 .selectField("fitId,transAmount")
                 .list()) {
                 const amount = toDecimal(line.transAmount ?? 0)
@@ -1042,7 +1091,11 @@ function figures(p) {
     const clearedIds = new Set(lines.map(row => row.fitId))
     let periodCount = 0,
         unclearedCount = 0
-    for (const line of postedBetween(find(TRANS, {paymentMethodId: rec.paymentMethodId}), rec.statementFromDate, rec.statementThruDate)
+    for (const line of postedBetween(
+        find(TRANS, {paymentMethodId: rec.paymentMethodId}),
+        rec.statementFromDate,
+        rec.statementThruDate
+    )
         .selectField("fitId")
         .list()) {
         periodCount++
