@@ -3,6 +3,8 @@ const routes = ec.resource.script('component://mr-mantle/script/PassRoutes.js')
 const schema = ec.resource.script(
     'component://mr-mantle/service/mantle/forum/ForumSchema.js',
 )
+/* Operations a bearer link's token authorizes without a signed-in session; their services check the token. */
+const TOKEN_WRITES = ['startInvoicePayment', 'submitSupplierBill']
 const fail = (kind, message) => {
     const e = new Error(message)
     e.moquiErrorKind = kind
@@ -47,10 +49,24 @@ const fail = (kind, message) => {
                     if (!was) ec.artifactExecution.enableAuthz()
                 }
             }
+            // A write a bearer link's token authorizes (a payment, a supplier's bill) comes from the registered
+            // deployment that served the link's page, with no session of its own.
+            const tokenWrite =
+                registeredClient &&
+                routes.some(
+                    ([verb, pattern, op]) =>
+                        TOKEN_WRITES.includes(op) &&
+                        verb === method &&
+                        pattern.split('/').length === path.length &&
+                        pattern
+                            .split('/')
+                            .every((part, i) => part.startsWith('{') || part === path[i]),
+                )
             if (
                 !['GET', 'HEAD'].includes(method) &&
                 !(path[0] === 'account' && registeredClient) &&
                 !(path.join('/') === 'opt-out' && method === 'POST') &&
+                !tokenWrite &&
                 !bearer.startsWith('Bearer ') &&
                 request.getHeader('x-csrf-token') !== ec.web.sessionToken
             )
@@ -279,7 +295,7 @@ const fail = (kind, message) => {
                                 .join(',')
                                 .slice(0, 120),
                     )
-                if (op === 'stageAttachment')
+                if (schema[op].fields.includes('file'))
                     input.file = ec.web.multiPartParameters.file
                 const result = ec.service
                     .sync()

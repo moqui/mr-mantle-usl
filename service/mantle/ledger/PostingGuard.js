@@ -111,6 +111,15 @@ function automatic(tx) {
         !!(tx.assetReceiptId || tx.assetIssuanceId || tx.physicalInventoryId || tx.finAccountTransId) && !tx.reverseOfAcctgTransId
     )
 }
+// No user, or a public account (no group but ALL_USERS): a customer paying through a public page, a gateway's answer or a
+// job. It works in no organization, so a source document's own posting (never a manual one or a reversal) is the calling
+// service's to authorize, as an anonymous order's payment is.
+function outsideActor() {
+    if (!ec.user.userId) return true
+    return !rows("moqui.security.UserGroupMember", {userId: ec.user.userId}).some(
+        row => row.userGroupId !== "ALL_USERS" && active(row)
+    )
+}
 // The source document fields of a posting; a posting with none, or a reversal, is a manual one.
 const sourceFields = [
     "invoiceId",
@@ -253,8 +262,9 @@ function validate(p, lock = false) {
         )
             fail("CURRENCY_MISMATCH", "Posting requires the organization's base currency until currency conversion is enabled")
         const domain = ec.resource.script("component://mr-mantle/service/mantle/product/ProductAccess.js")
+        const sourcePosting = !tx.reverseOfAcctgTransId && sourceFields.some(field => tx[field])
         const orgs =
-            domain.systemAdmin() || domain.has("ACCOUNTING_ADMIN")
+            domain.systemAdmin() || domain.has("ACCOUNTING_ADMIN") || (sourcePosting && outsideActor())
                 ? null
                 : lib.call("mantle.party.PartyServices.get#PartyOrganizationInfo").userOrgIds || []
         if (orgs && !orgs.includes(tx.organizationPartyId)) fail("ORGANIZATION", "Posting organization is not available")

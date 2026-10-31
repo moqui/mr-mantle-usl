@@ -1374,6 +1374,9 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="paymentId" required="true"/>
             <parameter name="paymentGatewayConfigId" required="true"/>
             <parameter name="cardSecurityCode"/>
+            <parameter name="returnUrl"><description>For a hosted gateway: where its page sends the payer back, an address
+                Mantle builds (never one from a request). Such a gateway answers pending, with its page in the response's
+                redirectUrl, and its details service later answers the outcome.</description></parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="paymentGatewayResponseId"/>
@@ -1547,6 +1550,7 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="cardSecurityCode"/>
             <parameter name="operationKey"><description>A retry with the same key answers the first gateway response
                 without calling the gateway again</description></parameter>
+            <parameter name="returnUrl"><description>Passed to a hosted gateway (authorize#Payment).</description></parameter>
             <parameter name="payment" type="EntityValue"/>
         </in-parameters>
         <out-parameters>
@@ -1615,7 +1619,7 @@ along with this software (see the LICENSE.md file). If not, see
 
             <!-- call the configured service -->
             <service-call name="${paymentGatewayConfig.authorizeServiceName}" out-map="authOut"
-                    in-map="{paymentId:payment.paymentId, cardSecurityCode:cardSecurityCode,
+                    in-map="{paymentId:payment.paymentId, cardSecurityCode:cardSecurityCode, returnUrl:returnUrl,
                         paymentGatewayConfigId:paymentGatewayConfig.paymentGatewayConfigId}"/>
 
             <set field="paymentGatewayResponseId" from="authOut.paymentGatewayResponseId"/>

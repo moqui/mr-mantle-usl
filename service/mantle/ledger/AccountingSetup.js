@@ -29,6 +29,7 @@ const preferenceFields = [
     "inventoryRevaluationEnabled",
     "receiptInvoiceSelfBilledOnly",
     "taxGatewayConfigId",
+    "invoicePayGatewayConfigId",
     "invoiceDocumentTemplate",
     "paymentDocumentTemplate",
     "documentLocale",

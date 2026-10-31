@@ -162,6 +162,7 @@ function requireNewReference(organizationPartyId, supplierPartyId, reference, ex
     if (earlier) denied("BILL_DUPLICATE", "Bill " + reference + " from this supplier is already recorded as " + earlier.invoiceId)
 }
 function attach(invoiceId, p) {
+    if (p.stagedLocation) return attachStaged(invoiceId, p)
     if (!p.contentFile) return null
     return call("mantle.account.InvoiceServices.create#InvoiceContent", {
         invoiceId,
@@ -171,6 +172,27 @@ function attach(invoiceId, p) {
         userId: ec.user.userId
     }).invoiceContentId
 }
+// A scanned file staged by a public page (submit#SupplierBill), copied to the invoice's content as save#InvoiceContentFile
+// places an upload.
+function attachStaged(invoiceId, p) {
+    const out = call("create#mantle.account.invoice.InvoiceContent", {
+        invoiceId,
+        description: p.fileDescription || "Supplier bill",
+        contentDate: ec.user.nowTimestamp,
+        userId: ec.user.userId
+    })
+    const filename = String(p.stagedFilename || "bill").replace(/[^a-zA-Z0-9._ -]/g, "_").slice(0, 100)
+    const root = ec.user.getPreference("mantle.content.large.root") || "dbresource://mantle/content"
+    const contentLocation = root + "/invoice/" + invoiceId + "/content_" + out.invoiceContentId + "/" + filename
+    const stream = ec.resource.getLocationReference(p.stagedLocation).openStream()
+    try {
+        ec.resource.getLocationReference(contentLocation).putStream(stream)
+    } finally {
+        stream.close()
+    }
+    call("update#mantle.account.invoice.InvoiceContent", {invoiceContentId: out.invoiceContentId, contentLocation})
+    return out.invoiceContentId
+}
 // import#Bill: a supplier's bill, keyed by organization, supplier and the supplier's reference, or for a receipt
 // (shipmentId) by the receipt's bill; a repeat is refused and the earlier bill named. The supplier's bill for a receipt
 // already billed as a draft (self-billed) is attached to that draft, which takes the supplier's reference; once the draft
@@ -179,6 +201,16 @@ function importBill(p) {
     lib.requirePermission("PAYABLE_IMPORT")
     const organizationPartyId = lib.organization(p.organizationPartyId, null, true)
     supplier(p.supplierPartyId)
+    return billCore(p, organizationPartyId)
+}
+// A supplier's own bill from a public page (submit#SupplierBill): the caller checked the supplier's capability over the
+// order (check#AccessCapability) in place of PAYABLE_IMPORT, and the organization and supplier come from it.
+function portalBill(p) {
+    find("mantle.party.Party", {partyId: p.organizationPartyId}).forUpdate(true).one()
+    return billCore(p, p.organizationPartyId)
+}
+// The intake both share: the key, the receipt's self-billed draft, the order check and the incoming draft bill.
+function billCore(p, organizationPartyId) {
     const reference = String(p.referenceNumber || "").trim()
     const request = {
         organizationPartyId,
@@ -508,7 +540,7 @@ function clearNotices(p) {
     return {cleared}
 }
 
-const operations = {payables, importBill, invoiceFromSource, holds, supplierSummary, notify, clearNotices}
+const operations = {payables, importBill, portalBill, invoiceFromSource, holds, supplierSummary, notify, clearNotices}
 ;({
     execute: (op, parameters) => {
         if (!operations[op]) denied("OPERATION_UNKNOWN", "Unknown payables operation " + op)
