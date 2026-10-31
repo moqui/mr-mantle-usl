@@ -39,6 +39,7 @@ function capabilities() {
         arEdit: has("RECEIVABLE_EDIT"),
         apEdit: has("PAYABLE_EDIT"),
         paymentEdit: has("PAYMENT_EDIT"),
+        runApprove: has("PAYMENT_RUN_APPROVE"),
         match: has("INVOICE_MATCH"),
         taxEdit: has("TAX_STATEMENT_EDIT"),
         approve: has("INVOICE_APPROVE"),

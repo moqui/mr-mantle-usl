@@ -13,6 +13,7 @@ const T = "mantle.ledger.transaction.AcctgTrans",
 // The item types of a settlement adjustment: a credit memo line posted to the account the user chose.
 const adjustmentTypes = ["ItemPromptDiscount", "ItemWriteOff"]
 const day = /^\d{4}-\d{2}-\d{2}$/
+const terms = () => ec.resource.script("component://mr-mantle/service/mantle/account/PaymentTerms.js")
 
 function dateInput(value, canonicalDay = null) {
     if (!value) denied("EFFECTIVE_DATE_REQUIRED", "Choose an effective accounting date")
@@ -219,8 +220,17 @@ function adjustmentRow(scope, date, byKey, row, index) {
         denied("ADJUSTMENT_REASON_REQUIRED", "Choose a discount or write-off and enter a reason")
     const target = byKey[key("invoice", row.invoiceId)],
         amount = lib.amount(row.amount, scope.currencyUomId)
-    if (!row.glAccountId) denied("ADJUSTMENT_ACCOUNT_REQUIRED", "Choose an explicit adjustment account")
-    const account = policy.account(scope.organizationPartyId, row.glAccountId, date.timestamp)
+    let glAccountId = row.glAccountId
+    // A prompt-payment discount the invoice's due schedule offers on the date posts to the discount account; any other
+    // discount or write-off names its account.
+    if (!glAccountId && row.itemTypeEnumId === "ItemPromptDiscount") {
+        const offered = terms().schedule(one(I, {invoiceId: row.invoiceId}), date.timestamp).discountAvailable
+        if (offered.isZero() || amount.compare(offered) > 0)
+            denied("DISCOUNT_NOT_AVAILABLE", "The invoice's terms offer no discount of this amount on the accounting date")
+        glAccountId = terms().discountAccount(scope.organizationPartyId, scope.direction === "receivable")
+    }
+    if (!glAccountId) denied("ADJUSTMENT_ACCOUNT_REQUIRED", "Choose an explicit adjustment account")
+    const account = policy.account(scope.organizationPartyId, glAccountId, date.timestamp)
     return {
         rowSeq: String(index + 1),
         invoiceId: row.invoiceId,
@@ -229,7 +239,7 @@ function adjustmentRow(scope, date, byKey, row, index) {
         itemTypeDescription: one("moqui.basic.Enumeration", {enumId: row.itemTypeEnumId})?.description,
         amount: String(amount),
         currencyUomId: scope.currencyUomId,
-        glAccountId: row.glAccountId,
+        glAccountId,
         accountCode: account.row.accountCode,
         accountName: account.row.accountName,
         reason: String(row.reason).trim()

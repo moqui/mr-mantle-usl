@@ -4558,4 +4558,40 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="payableCapabilities" from="read.payableCapabilities"/>
         </actions>
     </service>
+
+    <!-- ========== Payment terms: the due schedule (PaymentTerms.js) ========== -->
+    <service verb="store" noun="InvoiceDueSchedule" allow-remote="false">
+        <description>Write an issued invoice's due schedule from its term's lines in effect on the invoice date, once: the
+            InvoiceIssuedDueSchedule SECA calls it when an invoice is finalized or a bill approved. Nothing for a credit
+            memo, an invoice without a date or total, or one that has its schedule; a later term change never changes
+            it.</description>
+        <in-parameters><parameter name="invoiceId" required="true"/></in-parameters>
+        <out-parameters><parameter name="written" type="Boolean"/></out-parameters>
+        <actions>
+            <script>ec.resource.script('component://mr-mantle/service/mantle/account/PaymentTerms.js')
+                .execute('writeSchedule', {invoiceId:invoiceId})</script>
+        </actions>
+    </service>
+    <service verb="get" noun="InvoiceDueSchedule" allow-remote="false">
+        <description>An invoice's due schedule: each portion's due date and amount and its discount, open or not on the day
+            given (today by default), and the discount still available then, less prompt-payment discounts already
+            credited and at most the unpaid total. An invoice issued before its term had lines, or not yet issued, shows the
+            schedule its term gives without storing it. Needs a read of the invoice (its side's view permission or
+            ACCOUNTING_VIEW).</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="onDate" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="scheduleRows" type="List"/>
+            <parameter name="scheduleStored" type="Boolean"/>
+            <parameter name="discountAvailable" type="BigDecimal"/>
+            <parameter name="discountDateText"/>
+        </out-parameters>
+        <actions>
+            <script>ec.resource.script('component://mr-mantle/service/mantle/account/PaymentTerms.js')
+                .execute('dueSchedule', context)</script>
+        </actions>
+    </service>
 </services>

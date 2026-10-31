@@ -1,0 +1,268 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<!-- Supplier payment runs (PaymentRun, PaymentRunItem; the logic in account/PaymentRuns.js): select an organization's due
+    approved bills, approve the run, pay each supplier with one payment through create#Payment and the apply services,
+    and write the run's bank file through NachaServices and PositivePayServices. -->
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="define" noun="RunParameters" type="interface">
+        <in-parameters>
+            <parameter name="paymentRunId" required="true"/>
+            <parameter name="organizationPartyId"/>
+        </in-parameters>
+    </service>
+
+    <service verb="create" noun="Run" allow-remote="false">
+        <description>Start a payment run from one of the organization's bank accounts, paying by ACH or check on a pay date,
+            and select its bills (select#Bills). Refuses another organization's or an ended bank account, another instrument,
+            a pay date before today and a currency other than the organization's. Needs PAYABLE_EDIT in the
+            organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="paymentMethodId" required="true"/>
+            <parameter name="paymentInstrumentEnumId" default-value="PiAch"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="dueThroughDate" type="Date" required="true"/>
+            <parameter name="payDate" type="Date" required="true"/>
+            <parameter name="description"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="paymentRunId"/>
+            <parameter name="itemCount" type="Integer"/>
+            <parameter name="selectedCount" type="Integer"/>
+            <parameter name="excludedCount" type="Integer"/>
+            <parameter name="selectedTotal" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('create', context)</script>
+        </actions>
+    </service>
+    <service verb="select" noun="Bills" allow-remote="false">
+        <description>Select the run's bills again: the organization's approved bills open in its currency, due through its
+            date or with a discount open on its pay date (from each bill's due schedule), each with its open amount, discount
+            and amount to pay. A held bill, one in another open run and, for ACH, one whose supplier has no bank account are
+            left out with the reason; a bill the user left out stays out. An approved run goes back to proposed. Refuses an
+            executed or cancelled run. Needs PAYABLE_EDIT.</description>
+        <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
+        <out-parameters>
+            <parameter name="itemCount" type="Integer"/>
+            <parameter name="selectedCount" type="Integer"/>
+            <parameter name="excludedCount" type="Integer"/>
+            <parameter name="selectedTotal" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('select', context)</script>
+        </actions>
+    </service>
+    <service verb="store" noun="RunItem" allow-remote="false">
+        <description>Put a bill of the run in (selectedIndicator Y) or leave it out with a comment. Refuses putting in a
+            held bill, one in another open run or one without the supplier's bank account for ACH. An approved run goes back
+            to proposed. Needs PAYABLE_EDIT.</description>
+        <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
+        <in-parameters>
+            <parameter name="paymentRunItemSeqId" required="true"/>
+            <parameter name="selectedIndicator" required="true"/>
+            <parameter name="excludeComment"/>
+        </in-parameters>
+        <out-parameters><parameter name="changed" type="Boolean"/></out-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('storeItem', context)</script>
+        </actions>
+    </service>
+    <service verb="request" noun="RunApproval" allow-remote="false">
+        <description>Send a proposed run with bills for approval: the PaymentRunApproval notification goes to the
+            organization's users who may approve runs (PAYMENT_RUN_APPROVE). Needs PAYABLE_EDIT.</description>
+        <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
+        <out-parameters><parameter name="notificationMessageId"/></out-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('requestApproval', context)</script>
+        </actions>
+    </service>
+    <service verb="approve" noun="Run" allow-remote="false">
+        <description>Approve a proposed run as it is: its total and the version of its selection (bank, pay date,
+            instrument, each bill's amounts and supplier account), which execution checks; its PaymentRunApproval
+            notifications are marked read. Refuses a stale lastUpdatedStamp, an empty run, a held bill in it and the run's
+            creator unless the organization allows self-approval. Needs PAYMENT_RUN_APPROVE.</description>
+        <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
+        <in-parameters><parameter name="lastUpdatedStamp" type="Timestamp" required="true"/></in-parameters>
+        <out-parameters>
+            <parameter name="statusId"/>
+            <parameter name="approvedTotal" type="BigDecimal"/>
+            <parameter name="isSelfApproved"/>
+        </out-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('approve', context)</script>
+        </actions>
+    </service>
+    <service verb="void" noun="RunApproval" allow-remote="false">
+        <description>A supplier's bank details changed (the PaymentRunBankChangeVoid SECA on update#BankAccount, keyed on the
+            supplier because Mantle moves a changed outside party's bank account to a new payment method): each open run
+            paying the supplier takes the supplier's current bank account, and an approved one goes back to proposed with
+            the reason, to be approved again (D26).</description>
+        <in-parameters>
+            <parameter name="paymentMethodId"/>
+            <parameter name="supplierPartyId"/>
+        </in-parameters>
+        <out-parameters><parameter name="voidedRunIds" type="List"/></out-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('voidRunApproval', context)</script>
+        </actions>
+    </service>
+    <service verb="cancel" noun="Run" allow-remote="false">
+        <description>Cancel a proposed or approved run that was not executed. Needs PAYABLE_EDIT.</description>
+        <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
+        <in-parameters><parameter name="changeReason"/></in-parameters>
+        <out-parameters><parameter name="statusId"/></out-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('cancel', context)</script>
+        </actions>
+    </service>
+    <service verb="execute" noun="Run" allow-remote="false">
+        <description>Execute an approved run once under its operation key: each supplier is paid in its own transaction
+            with one payment (pay#RunSupplier), its bills' holds, status, balances, discounts and bank account read again
+            under lock; a supplier that fails has the reason on its bills and the others keep their payments. Then the bank
+            file is written (generate#RunFile) and the run is executed. A retry with the same key goes on where it stopped
+            and answers the result; another key is refused. Refuses a run that is not approved, a stale lastUpdatedStamp
+            and a selection that changed after approval. Needs PAYMENT_EDIT.</description>
+        <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
+        <in-parameters>
+            <parameter name="operationKey" required="true"/>
+            <parameter name="lastUpdatedStamp" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="statusId"/>
+            <parameter name="paymentIdList" type="List"/>
+            <parameter name="paidCount" type="Integer"/>
+            <parameter name="sentCount" type="Integer"/>
+            <parameter name="failedCount" type="Integer"/>
+            <parameter name="paymentMethodFileId"/>
+            <parameter name="alreadyExecuted" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('execute', context)</script>
+        </actions>
+    </service>
+    <service verb="claim" noun="RunExecution" allow-remote="false">
+        <description>Claim an approved run for execution under an operation key (execute#Run calls it in its own
+            transaction). Needs PAYMENT_EDIT.</description>
+        <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
+        <in-parameters>
+            <parameter name="operationKey" required="true"/>
+            <parameter name="lastUpdatedStamp" type="Timestamp"/>
+        </in-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('claim', context)</script>
+        </actions>
+    </service>
+    <service verb="pay" noun="RunSupplier" allow-remote="false">
+        <description>Pay one supplier's bills of an executing run with one payment (execute#Run calls it in a new
+            transaction for each supplier). Needs PAYMENT_EDIT.</description>
+        <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
+        <in-parameters><parameter name="supplierPartyId" required="true"/></in-parameters>
+        <out-parameters><parameter name="paymentId"/></out-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('paySupplier', context)</script>
+        </actions>
+    </service>
+    <service verb="apply" noun="RunPayment" allow-remote="false">
+        <description>Apply a delivered ACH payment of the run to its bills, each bill's discount first. Needs
+            PAYMENT_EDIT.</description>
+        <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
+        <in-parameters><parameter name="paymentId" required="true"/></in-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('applyPayment', context)</script>
+        </actions>
+    </service>
+    <service verb="generate" noun="RunFile" allow-remote="false">
+        <description>The executed run's bank file: the one written before, else a new one of the run's payments only, NACHA
+            (generate#NachaFile) for ACH, which delivers them, or Positive Pay (generate#PositivePayFile) for checks when the
+            bank account has a format; then the ACH payments delivered are applied. Asking again gives the same file. Needs
+            PAYMENT_EDIT.</description>
+        <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
+        <out-parameters>
+            <parameter name="paymentMethodFileId"/>
+            <parameter name="fileTypeEnumId"/>
+            <parameter name="fileText"/>
+            <parameter name="fileName"/>
+        </out-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('generateFile', context)</script>
+        </actions>
+    </service>
+    <service verb="write" noun="RunFile" allow-remote="false">
+        <description>Write the executed run's bank file once (generate#RunFile calls it in its own transaction). Needs
+            PAYMENT_EDIT.</description>
+        <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('writeFile', context)</script>
+        </actions>
+    </service>
+    <service verb="get" noun="RunFile" allow-remote="false">
+        <description>The run's bank file as written, to download again. Needs PAYMENT_EDIT.</description>
+        <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
+        <out-parameters>
+            <parameter name="paymentMethodFileId"/>
+            <parameter name="fileTypeEnumId"/>
+            <parameter name="fileText"/>
+            <parameter name="fileName"/>
+        </out-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('runFile', context)</script>
+        </actions>
+    </service>
+    <service verb="import" noun="RunReturn" allow-remote="false">
+        <description>Import the bank's NACHA return file for an executed ACH run's bank account (import#NachaReturn): a
+            returned payment is declined, which reverses its posting and unapplies it, and the run's discount credits on its
+            bills are cancelled, so each bill is open again; its bills show Returned with the bank's reason. Refuses an
+            unreadable file. Needs PAYMENT_EDIT.</description>
+        <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
+        <in-parameters><parameter name="nachaString" required="true" allow-html="any"/></in-parameters>
+        <out-parameters><parameter name="returnedPaymentIds" type="List"/></out-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('importReturn', context)</script>
+        </actions>
+    </service>
+    <service verb="get" noun="Run" allow-remote="false">
+        <description>A run for its screen: its header with display text, totals and counts, masked bank accounts (never a
+            full number), its bills with supplier names, due and discount dates, amounts, why each is left out and each
+            result, and what the user may do. Needs PAYABLE_VIEW, PAYMENT_VIEW or ACCOUNTING_VIEW in the
+            organization.</description>
+        <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
+        <out-parameters>
+            <parameter name="run" type="Map"/>
+            <parameter name="runItems" type="List"/>
+            <parameter name="capabilities" type="Map"/>
+        </out-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('getRun', context)</script>
+        </actions>
+    </service>
+</services>
