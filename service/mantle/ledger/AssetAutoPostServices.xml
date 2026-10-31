@@ -685,6 +685,17 @@ along with this software (see the LICENSE.md file). If not, see
                 <!-- call the post service -->
                 <service-call name="mantle.ledger.LedgerServices.post#AcctgTrans" in-map="{acctgTransId:acctgTransId}"/>
             </else></if>
+            <!-- a depreciation that did not post (to the error journal, or diverted by the posting guard) changes no book: no
+                depreciation row, no accumulated amount, and its unposted transaction is removed, so a later run does not
+                leave error-journal transactions that could post without a row (impl-accounting F38, F260) -->
+            <entity-find-one entity-name="mantle.ledger.transaction.AcctgTrans" value-field="postedTrans">
+                <field-map field-name="acctgTransId"/></entity-find-one>
+            <if condition="postedTrans?.isPosted != 'Y'">
+                <log level="error" message="Depreciation of Asset ${assetId} for ${timePeriodId} did not post; not recorded"/>
+                <service-call name="mantle.ledger.LedgerServices.delete#AcctgTrans" in-map="{acctgTransId:acctgTransId}"/>
+                <set field="acctgTransId" from="null"/>
+                <return/>
+            </if>
 
             <!-- update Asset.depreciation and Asset.yearBeginDepreciation -->
             <set field="asset.depreciation" from="toDecimal(asset.depreciation ?? 0).add(monthlyDepreciation)"/>
