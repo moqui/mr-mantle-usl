@@ -53,15 +53,17 @@ along with this software (see the LICENSE.md file). If not, see
         <description>What an issued invoice is due and when, written once when it is issued (finalized, or approved for a
             bill) from its term's lines in effect on the invoice date: each portion's due date and amount, and the discount
             and the last day it may be taken. A later change of the term never changes it. Aging, the workbenches, payment
-            runs and apply#Settlement read it (InvoiceServices.get#InvoiceDueSchedule).</description>
+            runs and apply#Settlement read it (InvoiceServices.get#InvoiceDueSchedule). Its rows are not audit-logged: they are
+            written once at issue and removed only when the invoice goes back for changes (Resume Changes), both recorded
+            in the invoice's own status audit log.</description>
         <field name="invoiceId" type="id" is-pk="true"/>
         <field name="scheduleSeqId" type="id" is-pk="true"/>
-        <field name="dueDate" type="date" enable-audit-log="true"><description>A calendar day: the invoice's book day and the
+        <field name="dueDate" type="date"><description>A calendar day: the invoice's book day and the
             portion's days.</description></field>
-        <field name="amount" type="currency-amount" enable-audit-log="true"/>
-        <field name="discountDate" type="date" enable-audit-log="true">
+        <field name="amount" type="currency-amount"/>
+        <field name="discountDate" type="date">
             <description>The last calendar day the discount may be taken.</description></field>
-        <field name="discountAmount" type="currency-amount" enable-audit-log="true"/>
+        <field name="discountAmount" type="currency-amount"/>
         <field name="settlementTermId" type="id"/>
         <field name="settlementTermLineId" type="id"/>
         <relationship type="one" related="mantle.account.invoice.Invoice"/>
