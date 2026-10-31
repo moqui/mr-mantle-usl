@@ -234,8 +234,280 @@ function report(op, p) {
     }
     return Object.assign(result, {comparisonRows: comparison.reportRows})
 }
+// The invoice reconciliation of a fiscal period (design §13 InvoiceReconciliation): for receivables or payables, the
+// period's documents whose open amount differs from their receivable or payable postings, the payments whose applied
+// amount differs from theirs, unposted and unbalanced transactions, receivable or payable postings without an invoice,
+// and applications of the period to invoices dated after it; with the aging's open total against the ledger balance at
+// the period's end. The organization's own records only, and a period of the organization.
+const RECEIVABLE_STATUSES = ["InvoiceFinalized", "InvoiceSent", "InvoiceAcked", "InvoicePmtRecvd", "InvoiceWriteOff"]
+const PAYABLE_STATUSES = ["InvoiceApproved", "InvoicePmtSent", "InvoiceBilledThrough"]
+function invoiceReconciliation(p) {
+    const s = lib.organization(p, "reportRead")
+    if (!p.timePeriodId) throw new Error("PERIOD_REQUIRED: Choose a fiscal period")
+    const period = lib.record({kind: "periods", recordId: p.timePeriodId, organizationPartyId: s.organizationPartyId})
+    if (period.partyId !== s.organizationPartyId) lib.denied("PERIOD_UNAVAILABLE", "Choose a fiscal period of this organization")
+    const org = s.organizationPartyId
+    const payable = p.invoiceType === "payable"
+    const accountClass = payable ? "ACCOUNTS_PAYABLE" : "ACCOUNTS_RECEIVABLE"
+    const sign = payable ? -1 : 1
+    const fromDay = lib.calendarDateText(period.fromDate)
+    const afterDay = lib.calendarDateText(Date.parse(lib.calendarDateText(period.thruDate)) + 86400000)
+    const fromStamp = ec.l10n.parseTimestamp(fromDay, "yyyy-MM-dd"),
+        afterStamp = ec.l10n.parseTimestamp(afterDay, "yyyy-MM-dd")
+    const inPeriod = lib.accountingDateCondition({fromDate: fromStamp, thruDate: afterStamp, fromDay, thruDay: afterDay})
+    const toEnd = lib.accountingDateCondition({thruDate: afterStamp, thruDay: afterDay})
+    const cf = ec.entity.conditionFactory
+    const invoiceInPeriod = cf.makeCondition(
+        [
+            cf.makeCondition(
+                [
+                    cf.makeCondition("accountingDate", "is-not-null", null),
+                    cf.makeCondition("accountingDate", "greater-equals", fromDay),
+                    cf.makeCondition("accountingDate", "less", afterDay)
+                ],
+                "and"
+            ),
+            cf.makeCondition(
+                [
+                    cf.makeCondition("accountingDate", "is-null", null),
+                    cf.makeCondition("invoiceDate", "greater-equals", fromStamp),
+                    cf.makeCondition("invoiceDate", "less", afterStamp)
+                ],
+                "and"
+            )
+        ],
+        "or"
+    )
+    const currency = lib.preference(org).baseCurrencyUomId
+    const reportRows = []
+    const add = (check, checkText, sourceKind, sourceId, description, documentAmount, glAmount) =>
+        reportRows.push({
+            check,
+            checkText,
+            sourceKind,
+            sourceId,
+            description: description || "",
+            documentAmount,
+            glAmount,
+            difference: documentAmount != null && glAmount != null ? toDecimal(documentAmount).subtract(glAmount) : null
+        })
+    // the net on the receivable or payable accounts of the postings of some documents, through the period's end
+    const glNet = (field, ids) => {
+        const out = {}
+        if (!ids.length) return out
+        for (const row of lib
+            .find("mantle.ledger.transaction.AcctgTransAndEntryGlaSummary", {organizationPartyId: org, isPosted: "Y"})
+            .condition(field, "in", ids)
+            .condition("glAccountClassEnumId", accountClass)
+            .condition(toEnd)
+            .selectField(field)
+            .selectField("debitCreditFlag")
+            .selectField("amount")
+            .list())
+            out[row[field]] = (out[row[field]] || toDecimal(0)).add(
+                toDecimal(row.amount ?? 0).multiply(row.debitCreditFlag === "D" ? sign : -sign)
+            )
+        return out
+    }
+    const appliedThroughEnd = (field, ids) => {
+        const out = {}
+        if (!ids.length) return out
+        for (const row of lib
+            .find("mantle.account.payment.PaymentApplication")
+            .condition(field, "in", ids)
+            .condition("appliedDate", "less", afterStamp)
+            .list())
+            out[row[field]] = (out[row[field]] || toDecimal(0)).add(toDecimal(row.amountApplied ?? 0))
+        return out
+    }
+    // documents of the period, at most listLimit of each kind: a longer list is reported incomplete, never as no
+    // differences
+    const limit = Math.max(0, Number(p.listLimit ?? 500))
+    const incompleteChecks = []
+    const bounded = (check, list) => {
+        if (list.length <= limit) return list
+        incompleteChecks.push(check)
+        return list.slice(0, limit)
+    }
+    const invoices = bounded(
+        "invoiceVsGl",
+        Array.from(
+            lib
+                .find("mantle.account.invoice.Invoice", {[payable ? "toPartyId" : "fromPartyId"]: org})
+                .condition("statusId", "in", payable ? PAYABLE_STATUSES : RECEIVABLE_STATUSES)
+                .condition(invoiceInPeriod)
+                .orderBy("invoiceDate,invoiceId")
+                .limit(limit + 1)
+                .list()
+        )
+    )
+    const invoiceIds = invoices.map(row => row.invoiceId)
+    const invoiceGl = glNet("invoiceId", invoiceIds),
+        invoiceApplied = appliedThroughEnd("invoiceId", invoiceIds)
+    for (const invoice of invoices) {
+        const open = toDecimal(invoice.invoiceTotal ?? 0).subtract(invoiceApplied[invoice.invoiceId] || toDecimal(0))
+        const gl = invoiceGl[invoice.invoiceId] || toDecimal(0)
+        if (!open.eq(gl))
+            add(
+                "invoiceVsGl",
+                "Open amount differs from the ledger",
+                payable ? "bills" : "invoices",
+                invoice.invoiceId,
+                invoice.description || invoice.referenceNumber,
+                open,
+                gl
+            )
+    }
+    const payments = bounded(
+        "paymentVsGl",
+        Array.from(
+            lib
+                .find("mantle.account.payment.Payment", {[payable ? "fromPartyId" : "toPartyId"]: org})
+                .condition("statusId", "in", ["PmntDelivered", "PmntConfirmed"])
+                .condition("effectiveDate", "greater-equals", fromStamp)
+                .condition("effectiveDate", "less", afterStamp)
+                .orderBy("effectiveDate,paymentId")
+                .limit(limit + 1)
+                .list()
+        )
+    )
+    const paymentIds = payments.map(row => row.paymentId)
+    const paymentGl = glNet("paymentId", paymentIds),
+        paymentApplied = appliedThroughEnd("paymentId", paymentIds)
+    for (const payment of payments) {
+        const applied = paymentApplied[payment.paymentId] || toDecimal(0)
+        const gl = (paymentGl[payment.paymentId] || toDecimal(0)).negate()
+        if (!applied.eq(gl))
+            add(
+                "paymentVsGl",
+                "Applied amount differs from the ledger",
+                "payments",
+                payment.paymentId,
+                payment.paymentRefNum || payment.comments,
+                applied,
+                gl
+            )
+    }
+    // transactions of the period
+    const unpostedTransactions = bounded(
+        "notPosted",
+        Array.from(
+            lib
+                .find("mantle.ledger.transaction.AcctgTrans", {organizationPartyId: org})
+                .condition(
+                    cf.makeCondition(
+                        [cf.makeCondition("isPosted", "is-null", null), cf.makeCondition("isPosted", "equals", "N")],
+                        "or"
+                    )
+                )
+                .condition(inPeriod)
+                .orderBy("acctgTransId")
+                .limit(limit + 1)
+                .list()
+        )
+    )
+    for (const tx of unpostedTransactions)
+        add(
+            "notPosted",
+            "Transaction not posted",
+            "journals",
+            tx.acctgTransId,
+            tx.description || tx.acctgTransTypeEnumId,
+            null,
+            null
+        )
+    const net = {}
+    for (const row of lib
+        .find("mantle.ledger.transaction.AcctgTransAndEntrySummary", {organizationPartyId: org, isPosted: "Y"})
+        .condition(inPeriod)
+        .selectField("acctgTransId")
+        .selectField("debitCreditFlag")
+        .selectField("amount")
+        .list())
+        net[row.acctgTransId] = (net[row.acctgTransId] || toDecimal(0)).add(
+            toDecimal(row.amount ?? 0).multiply(row.debitCreditFlag === "D" ? 1 : -1)
+        )
+    for (const id of Object.keys(net).sort())
+        if (!net[id].isZero()) add("unbalanced", "Debits and credits differ", "journals", id, null, null, net[id])
+    const noInvoice = {}
+    for (const row of lib
+        .find("mantle.ledger.transaction.AcctgTransAndEntryGlaSummary", {organizationPartyId: org, isPosted: "Y"})
+        .condition("glAccountClassEnumId", accountClass)
+        .condition("invoiceId", "is-null", null)
+        .condition("reverseOfAcctgTransId", "is-null", null)
+        .condition("reversedByAcctgTransId", "is-null", null)
+        .condition(inPeriod)
+        .selectField("acctgTransId")
+        .selectField("debitCreditFlag")
+        .selectField("amount")
+        .list())
+        noInvoice[row.acctgTransId] = (noInvoice[row.acctgTransId] || toDecimal(0)).add(
+            toDecimal(row.amount ?? 0).multiply(row.debitCreditFlag === "D" ? sign : -sign)
+        )
+    for (const id of Object.keys(noInvoice).sort())
+        add(
+            "noInvoice",
+            (payable ? "Payable" : "Receivable") + " posting without an invoice",
+            "journals",
+            id,
+            null,
+            null,
+            noInvoice[id]
+        )
+    for (const row of lib
+        .find("mantle.account.payment.PaymentApplicationAndInvoice", {[payable ? "toPartyId" : "fromPartyId"]: org})
+        .condition("appliedDate", "greater-equals", fromStamp)
+        .condition("appliedDate", "less", afterStamp)
+        .condition("invoiceDate", "greater-equals", afterStamp)
+        .list())
+        add(
+            "applicationAfterPeriod",
+            "Applied in the period to a later invoice",
+            payable ? "bills" : "invoices",
+            row.invoiceId,
+            "Payment " + row.paymentId,
+            row.amountApplied,
+            null
+        )
+    // the aging's open total against the ledger at the period's end, summed in the queries
+    const side = payable ? "toPartyId" : "fromPartyId"
+    const statuses = payable ? PAYABLE_STATUSES : RECEIVABLE_STATUSES
+    const issued = lib
+        .find("mantle.account.invoice.InvoiceTotalSum", {[side]: org})
+        .condition("statusId", "in", statuses)
+        .condition("invoiceDate", "less", afterStamp)
+        .selectField("invoiceTotalSum")
+        .one()
+    const applied = lib
+        .find("mantle.account.payment.InvoiceAppliedSum", {[side]: org})
+        .condition("statusId", "in", statuses)
+        .condition("invoiceDate", "less", afterStamp)
+        .condition("appliedDate", "less", afterStamp)
+        .selectField("amountAppliedSum")
+        .one()
+    const agingOpen = toDecimal(issued?.invoiceTotalSum ?? 0).subtract(toDecimal(applied?.amountAppliedSum ?? 0))
+    let ledgerBalance = toDecimal(0)
+    for (const row of lib
+        .find("mantle.ledger.transaction.AcctgTransAndEntryGlaSummary", {organizationPartyId: org, isPosted: "Y"})
+        .condition("glAccountClassEnumId", accountClass)
+        .condition(toEnd)
+        .selectField("debitCreditFlag")
+        .selectField("amount")
+        .list())
+        ledgerBalance = ledgerBalance.add(toDecimal(row.amount ?? 0).multiply(row.debitCreditFlag === "D" ? sign : -sign))
+    return {
+        reportRows,
+        summary: {agingOpen, ledgerBalance, difference: agingOpen.subtract(ledgerBalance), currencyUomId: currency},
+        complete: !incompleteChecks.length,
+        incompleteChecks,
+        period: Object.assign(lib.display(period), {fromDay, thruDay: lib.calendarDateText(period.thruDate)}),
+        organizationPartyId: org,
+        asOf: ec.l10n.format(ec.user.nowTimestamp, "yyyy-MM-dd HH:mm:ss")
+    }
+}
 ;({
     execute: (op, p) => {
+        if (op === "invoiceReconciliation") return invoiceReconciliation(p)
         if (!["trial", "ledger"].includes(op)) throw new Error("Unknown finance report")
         return report(op, p)
     }

@@ -131,4 +131,108 @@ along with this software (see the LICENSE.md file). If not, see
                         approvedByUserId:ec.user.userId}"/>
         </actions>
     </service>
+    <service verb="define" noun="CloseCheck" type="interface">
+        <description>A row of the period close checklist (a PeriodCloseCheck enumeration names its service): the period's
+            items of its kind for the organization and the organizations that roll up to it. Each item names the record
+            that resolves it: recordKind (invoices, bills, payments, journals, banks, periods, assets, workEfforts,
+            timeEntries or a kind the source documents), recordId, text and detail.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="timePeriodId" required="true"/>
+            <parameter name="checkEnumId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="count" type="Integer"/>
+            <parameter name="items" type="List"/>
+        </out-parameters>
+    </service>
+    <service verb="check" noun="StandardClose" allow-remote="false">
+        <description>Mantle's checklist rows (CloseServices.define#CloseCheck): unposted transactions, the error journal,
+            unbalanced transactions, unposted documents, bank lines not on a finished statement, missing rates, bills on
+            hold, stock movements that posted nothing, open WIP and unposted project time. Refuses a user who may not read
+            the organization's periods.</description>
+        <implements service="mantle.ledger.CloseServices.define#CloseCheck"/>
+        <actions>
+            <set field="checked" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/PeriodClose.js')
+                    .execute('standardCheck', context)"/>
+            <set field="count" from="checked.count"/>
+            <set field="items" from="checked.items"/>
+        </actions>
+    </service>
+    <service verb="get" noun="Checklist" allow-remote="false">
+        <description>What keeps an organization's fiscal period from closing: its dates and order (ended, previous period
+            and child periods closed), then each PeriodCloseCheck row in order with its count and up to 20 named items. A
+            row that blocks has items and optionIndicator Y; a row whose check fails is unavailable, which blocks too. Also
+            whether the user may close or reopen it, and its close runs. Refuses a user who may not read the
+            organization's periods, and a period of another organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="timePeriodId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="period" type="Map"/>
+            <parameter name="checkRows" type="List"/>
+            <parameter name="blockerCount" type="Integer"/>
+            <parameter name="canClose" type="Boolean"/>
+            <parameter name="canReopen" type="Boolean"/>
+            <parameter name="closeRuns" type="List"/>
+        </out-parameters>
+        <actions>
+            <set field="checked" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/PeriodClose.js')
+                    .execute('checklist', context)"/>
+            <set field="period" from="checked.period"/>
+            <set field="checkRows" from="checked.checkRows"/>
+            <set field="blockerCount" from="checked.blockerCount"/>
+            <set field="canClose" from="checked.canClose"/>
+            <set field="canReopen" from="checked.canReopen"/>
+            <set field="closeRuns" from="checked.closeRuns"/>
+        </actions>
+    </service>
+    <service verb="close" noun="Period" allow-remote="false" transaction-timeout="1800">
+        <description>Close an organization's fiscal period (FISCAL_CLOSE) in one transaction: under the period's lock the
+            checklist again, refused (CLOSE_BLOCKED) naming each blocked or unavailable row; then Mantle's
+            close#FinancialTimePeriod, the period's GL summary rows computed from its postings and stored (creating any
+            that are missing), for a fiscal year the closing entries to the organization's net income account, and an
+            AccountingCloseRun with the checklist it passed. Refuses a period already closed and a period of another
+            organization. A retry with the same operation key answers the first close.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="timePeriodId" required="true"/>
+            <parameter name="changeReason"/>
+            <parameter name="netIncomeGlAccountId"/>
+            <parameter name="operationKey"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="closeRunId"/>
+            <parameter name="closingAcctgTransIdList" type="List"/>
+            <parameter name="summaryAccountCount" type="Integer"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="closed" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/PeriodClose.js')
+                    .execute('close', context)"/>
+            <set field="closeRunId" from="closed.closeRunId"/>
+            <set field="closingAcctgTransIdList" from="closed.closingAcctgTransIdList"/>
+            <set field="summaryAccountCount" from="closed.summaryAccountCount"/>
+            <set field="alreadyApplied" from="!!closed.alreadyApplied"/>
+        </actions>
+    </service>
+    <service verb="reopen" noun="Period" allow-remote="false">
+        <description>Reopen a closed fiscal period with a reason (FISCAL_REOPEN), through Mantle's
+            reopen#FinancialTimePeriod, which refuses while the next or the parent period is closed. The period's close
+            run is kept and marked reopened, with who reopened it, when and why (audit-logged).</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="timePeriodId" required="true"/>
+            <parameter name="changeReason"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="closeRunId"/>
+        </out-parameters>
+        <actions>
+            <set field="reopened" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/PeriodClose.js')
+                    .execute('reopen', context)"/>
+            <set field="closeRunId" from="reopened.closeRunId"/>
+        </actions>
+    </service>
 </services>

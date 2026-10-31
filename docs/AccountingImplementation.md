@@ -299,6 +299,60 @@ check `check#BankAccess` first; those services keep running for the statement me
   account into one `PaymentDeposit` (`Payment.paymentDepositId`, under an operation key). The deposit's one bank line
   reconciles them all (`PaymentMethodTrans.paymentDepositId`), and a second line for it is refused.
 
+## Period close (P11)
+
+`CloseServices` (logic in `ledger/PeriodClose.js`) closes an organization's fiscal period on Mantle's close.
+
+- **Checklist.** `get#Checklist` gives the period's dates and order (ended, previous and child periods closed), then
+  each `PeriodCloseCheck` enumeration in order: its service (enumCode, implementing `define#CloseCheck`) finds the
+  period's items for the organization and the organizations that roll up to it, each naming the record that resolves
+  it (`recordKind`, `recordId`, `text`, `detail`), and optionIndicator Y makes its items block. Mantle's rows
+  (`check#StandardClose`): unposted transactions, the error journal (with each failure code), unbalanced transactions,
+  unposted invoices, bills and payments, bank lines not on a finished statement, missing rates (all blocking), bills
+  on hold, stock movements that posted nothing, open WIP on completed kit and repack work, and unposted project time.
+  Each check runs in its own transaction; one that fails is unavailable and blocks. Another source adds a row with an
+  enumeration and its own service.
+- **Close.** `close#Period` (FISCAL_CLOSE; operation key) runs the checklist again under the period's lock and refuses
+  `CLOSE_BLOCKED` naming each blocked row; then the run as CrnClosing, `close#FinancialTimePeriod` (now joining the
+  caller's transaction and counting only the organization's and its rollup children's unposted transactions), the
+  period's `GlAccountOrgTimePeriod` rows of the organization and of each organization that rolls up to it, computed from
+  the posted entries and stored (every account with a posting before or in the period), for a fiscal year each one's
+  `create#PeriodCloseAcctgTrans` to its own net income account (every closing entry posted, or the close rolls back) and
+  the rows again, the later periods' existing rows carried forward, and the run closed with the checklist it passed.
+  Closing entries are booked on the year's last day. With the posting guard on only that close's own closing entries
+  pass the year's closed-period check (`post#AcctgTrans` `closingTimePeriodId`, checked against the closing run), never
+  a lock, and FISCAL_CLOSE is asked of them; journal drafts, templates, instances and reversals refuse closing types
+  (`CLOSING_ENTRY`), and `post#ReverseAcctgTrans` refuses to reverse a closing entry.
+- **Reopen.** `reopen#Period` (FISCAL_REOPEN; a reason) calls `reopen#FinancialTimePeriod`, which refuses while the next
+  or the parent period is closed, and marks the close run reopened with who, when and why.
+- **Invoice reconciliation.** `LedgerReportServices.run#InvoiceReconciliation` (report read; the organization's own
+  period): documents whose open amount differs from their receivable or payable postings, payments whose applied amount
+  differs, unposted and unbalanced transactions, receivable or payable postings without an invoice, applications of the
+  period to later invoices, and the aging's open total (summed in the query) against the ledger balance at the period's
+  end. Each list is checked up to `listLimit` (500) documents or transactions; a longer one is reported in
+  `incompleteChecks` with `complete` false.
+
+## Period runs and project cost (P11)
+
+- **Contract.** A `PeriodRunKind` enumeration names its calculation service (enumCode, `PeriodRunServices.define#RunCalculation`:
+  one result per source with its amount and accounts, or a failure) and its posting service (optionValue,
+  `define#RunPosting`). `preview#Run` (ACCOUNTING_GL_POST; an open period of the organization) stores an
+  `AccountingPeriodRun` with its `AccountingPeriodRunResult` rows and a version, superseding the kind's earlier preview
+  of the period; a calculation that fails is a failed run. `get#Run` reads one; `post#Run` (operation key) calculates
+  again, refuses a changed version (`RUN_CHANGED`) and lets the kind post, then marks the run posted, partly posted or
+  failed; a kind posts each result in its own transaction, so `post#Run` locks only the run. Logic in
+  `ledger/PeriodRuns.js`.
+- **Project cost.** `OtherAutoPostServices.post#WorkEffortCost` (logic in `ledger/ProjectCosts.js`), with
+  `PartyAcctgPreference.projectCostPostingEnabled` (off by default; `store#Preferences` sets it): the time of a
+  project's work at the entry's cost rate (its vendor rate, else its RateAmount), debiting `GatProjectLaborCost` and
+  crediting `GatLaborClearing`, with the project on the `AttWorkEffortCost` transaction. Each time entry's
+  `PostingOperation` (`wec:` and its id) lists its transaction lines; what should be posted (the cost while the week is
+  approved) less what was posted posts on today's book day (or a run's). `approve#Timesheet`, `reopen#Timesheet`,
+  `store#TimeEntry` and `delete#TimeEntry` (which reverses the entry's cost first) call it. The default clearing
+  account is the employee wage expense payroll's earnings post to (631100000), so the reclass moves approved project
+  time out of wage expense. Production work (no project) and an outside vendor's time are not posted. A failed posting goes to the
+  error journal, and its entries wait until it posts. The project cost period run (`PrkProjectCost`,
+  `calculate#` and `post#WorkEffortCostRun`) posts what is missing for a period.
 ## Tax (P14)
 
 `mantle.other.TaxServices` with `other/SalesTax.js` (the calculation) and `other/TaxStatements.js` (statements). The
@@ -377,6 +431,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingPaymentGateway,AccountingPaymentRefunds,AccountingInternalTransfers
 ./moq test mr-mantle --spec AccountingPayables,AccountingMatching
 ./moq test mr-mantle --spec AccountingBankReconciliation,BankFileServices
+./moq test mr-mantle --spec AccountingPeriodClose,AccountingProjectCost
 ./moq test mr-mantle --spec AccountingTax,TaxStatementServices
 ```
 

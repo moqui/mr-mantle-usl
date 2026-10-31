@@ -6,6 +6,8 @@ const {find, one, rows, map, ms, active, preference, hash} = lib
 const A = "mantle.account.payment.PaymentApplication"
 // A source's cash or document posting, and the postings of an application, by AcctgTrans type.
 const cashTypes = ["AttPayment", "AttDisbursement", "AttReceipt", "AttIncomingPayment", "AttOutgoingPayment"]
+// A period's closing entries (create#PeriodCloseAcctgTrans).
+const closingTypes = ["AttPeriodClosing", "AttNetIncomeClosing"]
 const applicationTypes = [
     "AttOutgoingPaymentAp",
     "AttIncomingPaymentAp",
@@ -104,11 +106,18 @@ function scopes(tx, lines) {
         scopes.add("tax")
     return [...scopes]
 }
-// A physical source's posting (an asset receipt or issuance, a physical inventory, a financial account transaction) that
-// fails the guard goes to the error journal, unposted, instead of failing its source's write.
+// A physical source's posting (an asset receipt or issuance, a physical inventory, a financial account transaction) or a
+// project's cost on its timesheet's approval (post#WorkEffortCost) that fails the guard goes to the error journal,
+// unposted, instead of failing its source's write.
 function automatic(tx) {
     return (
-        !!(tx.assetReceiptId || tx.assetIssuanceId || tx.physicalInventoryId || tx.finAccountTransId) && !tx.reverseOfAcctgTransId
+        !!(
+            tx.assetReceiptId ||
+            tx.assetIssuanceId ||
+            tx.physicalInventoryId ||
+            tx.finAccountTransId ||
+            tx.acctgTransTypeEnumId === "AttWorkEffortCost"
+        ) && !tx.reverseOfAcctgTransId
     )
 }
 // The source document fields of a posting; a posting with none, or a reversal, is a manual one.
@@ -178,6 +187,21 @@ function calendarDay(tx, sources, sourceDatesEnabled) {
         [sources.invoiceId, "invoiceDate"]
     ].find(([source, dateField]) => source?.accountingDate && ms(tx.transactionDate) === ms(source[dateField]))
     return originalSource ? lib.calendarDateText(originalSource[0].accountingDate) : null
+}
+// Whether a transaction is a closing entry of the close in progress: a closing type, on the last day of the fiscal year
+// the caller names, of the posting organization or one it rolls up to, while this user's AccountingCloseRun of that year
+// is closing; that run exists only inside close#Period's own transaction until it commits as closed.
+function closingInProgress(tx, closingTimePeriodId) {
+    if (!closingTimePeriodId || !closingTypes.includes(tx.acctgTransTypeEnumId)) return false
+    const period = one("mantle.party.time.TimePeriod", {timePeriodId: closingTimePeriodId})
+    if (!period || period.timePeriodTypeId !== "FiscalYear") return false
+    if (!lib.organizationChain(tx.organizationPartyId, tx.transactionDate).includes(period.partyId)) return false
+    if (!tx.accountingDate || lib.calendarDateText(tx.accountingDate) !== lib.calendarDateText(period.thruDate)) return false
+    return !!find("mantle.ledger.transaction.AccountingCloseRun", {
+        timePeriodId: closingTimePeriodId,
+        statusId: "CrnClosing",
+        closedByUserId: ec.user.userId
+    }).one()
 }
 function validate(p, lock = false) {
     const tx = (lock ? find(T, {acctgTransId: p.acctgTransId}).forUpdate(true) : find(T, {acctgTransId: p.acctgTransId})).one()
@@ -293,6 +317,10 @@ function validate(p, lock = false) {
     const lockOut = postingLocks(tx, applicable, lock, sourceDay, enabled)
     const locks = lockOut.locks
     findings.push(...lockOut.findings)
+    // The closing entries close#Period posts go into the fiscal year it is closing: only those pass its closed-period
+    // finding, never a lock's; check asks FISCAL_CLOSE of them.
+    if (closingInProgress(tx, p.closingTimePeriodId))
+        for (let i = findings.length - 1; i >= 0; i--) if (findings[i].code === "PERIOD_CLOSED") findings.splice(i, 1)
     const evidence = {
         sources: sourceEvidence,
         tx: map(tx),
@@ -432,6 +460,8 @@ function check(p) {
         const manual = !!out.tx.reverseOfAcctgTransId || !sourceFields.some(field => out.tx[field])
         if (manual && !p.reviewed && !lib.lib.access.has("ACCOUNTING_GL_POST"))
             throw new Error("REVIEW_REQUIRED: Use a reviewed posting operation")
+        if (closingTypes.includes(out.tx.acctgTransTypeEnumId) && !lib.lib.access.has("FISCAL_CLOSE"))
+            throw new Error("PERMISSION_DENIED: Closing entries need period close authority (FISCAL_CLOSE)")
         if (out.captureAccountingDate)
             lib.call("update#" + T, {acctgTransId: p.acctgTransId, accountingDate: out.captureAccountingDate})
     }
