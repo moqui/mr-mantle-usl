@@ -1286,7 +1286,12 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="nextMonthPeriodId" from="nextMonthOut.nextTimePeriodId"/>
         </actions>
     </service>
-    <service verb="close" noun="FinancialTimePeriod" transaction-timeout="1800" transaction="force-new">
+    <service verb="close" noun="FinancialTimePeriod" transaction-timeout="1800">
+        <description>Close a fiscal period: refuses one already closed, not yet ended, after an open previous period or
+            over open child periods (unless asked to close them), or with unposted transactions of its organization or the
+            organizations that roll up to it; then marks it closed and recalculates its summary rows. It joins its
+            caller's transaction, so CloseServices.close#Period closes, posts the closing entries and stores the summary
+            at once.</description>
         <in-parameters>
             <parameter name="timePeriodId" required="true"/>
             <parameter name="closePrevious" type="Boolean" default="false"/>
@@ -1333,8 +1338,12 @@ along with this software (see the LICENSE.md file). If not, see
                     </if>
                 </if>
             </iterate>
-            <!-- make sure there are no unposted transactions within the time period -->
+            <!-- make sure there are no unposted transactions within the time period, of the period's organization and the
+                organizations that roll up to it (which post under its periods); another organization's do not count -->
+            <service-call name="mantle.ledger.LedgerServices.expand#ChildOrganizationList" out-map="closeOrgOut"
+                    in-map="{organizationPartyId:timePeriod.partyId}"/>
             <entity-find-count entity-name="mantle.ledger.transaction.AcctgTrans" count-field="unpostedTransCount">
+                <econdition field-name="organizationPartyId" operator="in" from="closeOrgOut.orgPartyIdList"/>
                 <econdition field-name="isPosted" operator="not-equals" value="Y" or-null="true"/>
                 <econditions combine="or">
                     <econditions>
@@ -1494,7 +1503,8 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
     <service verb="reopen" noun="FinancialTimePeriod">
-        <description>Service for period re-open (with special permission); don't allow reopening a period if the following period is closed</description>
+        <description>Service for period re-open (with special permission); don't allow reopening a period if the following period
+            or its parent period is closed</description>
         <in-parameters>
             <parameter name="timePeriodId" required="true"/>
         </in-parameters>
@@ -1515,6 +1525,16 @@ along with this software (see the LICENSE.md file). If not, see
                     <message error="true">Not reopening period ${ec.resource.expand('TimePeriodNameTemplate','',timePeriod)}, next period ${ec.resource.expand('TimePeriodNameTemplate','',nextPeriod)} is closed.</message>
                 </if>
             </iterate>
+            <!-- nor a period whose parent (its quarter or year) is closed: reopen the parent first -->
+            <if condition="timePeriod.parentPeriodId">
+                <entity-find-one entity-name="mantle.party.time.TimePeriod" value-field="parentPeriod">
+                    <field-map field-name="timePeriodId" from="timePeriod.parentPeriodId"/>
+                </entity-find-one>
+                <if condition="parentPeriod?.isClosed == 'Y'">
+                    <message error="true">Not reopening period ${ec.resource.expand('TimePeriodNameTemplate','',timePeriod)
+                        }, its parent period ${ec.resource.expand('TimePeriodNameTemplate','',parentPeriod)} is closed.</message>
+                </if>
+            </if>
             <!-- check errors before continuing -->
             <check-errors/>
             <!-- reopen the TimePeriod -->
@@ -1523,11 +1543,17 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
     <service verb="create" noun="PeriodCloseAcctgTrans">
+        <description>The closing transactions of a period: each temporary account class's ending balances moved to the
+            organization's own net income account (its GatProfitLoss default, else a NET_INCOME class account assigned to
+            it or an organization it rolls up to), booked on the period's last day. Refuses when the organization has
+            no net income account.</description>
         <in-parameters>
             <parameter name="timePeriodId" required="true"/>
             <parameter name="postTransactions" type="Boolean" default="true"/>
             <parameter name="glJournalId"/>
             <parameter name="netIncomeGlAccountId"/>
+            <parameter name="reviewed" type="Boolean" default="false"><description>The caller is Mantle's period close
+                (CloseServices.close#Period), which checked its permission</description></parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="acctgTransIdByClassId" type="Map"/>
@@ -1543,15 +1569,24 @@ along with this software (see the LICENSE.md file). If not, see
             <if condition="timePeriod.isClosed != 'Y'">
                 <message>Fiscal period ${timePeriodId} is not yet closed, Period Closing transactions may be posted after a period is closed and posting period close transactions before a period is closed may result in non-zero balances, requiring another closing transaction</message>
             </if>
+            <!-- the organization's own net income account, never the first of the whole chart -->
             <if condition="!netIncomeGlAccountId">
-                <entity-find entity-name="mantle.ledger.account.GlAccount" list="niGlAccountList">
+                <service-call name="mantle.ledger.LedgerServices.get#DefaultGlAccountByType" out-map="niTypeOut"
+                        in-map="{organizationPartyId:organizationPartyId, glAccountTypeEnumId:'GatProfitLoss'}"/>
+                <set field="netIncomeGlAccountId" from="niTypeOut.glAccountId"/>
+            </if>
+            <if condition="!netIncomeGlAccountId">
+                <service-call name="mantle.ledger.LedgerServices.expand#ParentOrganizationList" out-map="niOrgOut"
+                        in-map="{organizationPartyId:organizationPartyId}"/>
+                <entity-find entity-name="mantle.ledger.account.GlAccountAndOrganization" list="niGlAccountList">
+                    <econdition field-name="organizationPartyId" operator="in" from="niOrgOut.orgPartyIdList"/>
                     <econdition field-name="glAccountClassEnumId" value="NET_INCOME"/>
                     <order-by field-name="accountCode"/>
                 </entity-find>
                 <set field="netIncomeGlAccountId" from="niGlAccountList?.length ? niGlAccountList[0].glAccountId : null"/>
             </if>
             <if condition="!netIncomeGlAccountId">
-                <return error="true" message="No Net Income account specified or found by class"/>
+                <return error="true" message="NET_INCOME_ACCOUNT_MISSING: The organization has no net income account"/>
             </if>
             <set field="acctgTransIdByClassId" from="{}"/>
             <set field="tempAccountClasses" from="['REVENUE', 'COST_OF_SALES', 'EXPENSE', 'INCOME', 'NON_OP_EXPENSE']"/>
@@ -1587,6 +1622,9 @@ along with this software (see the LICENSE.md file). If not, see
                 <set field="txDesc" value="${classEnum.description} Closing for Period ${timePeriodId}"/>
                 <service-call name="mantle.ledger.LedgerServices.create#AcctgTrans" out-map="createOut" in-map="{acctgTransTypeEnumId:'AttNetIncomeClosing', organizationPartyId:organizationPartyId,                             transactionDate:transactionDate, description:txDesc, glJournalId:glJournalId}"/>
                 <set field="acctgTransId" from="createOut.acctgTransId"/>
+                <!-- booked on the period's last day, whatever the user's zone -->
+                <service-call name="update#mantle.ledger.transaction.AcctgTrans"
+                        in-map="{acctgTransId:acctgTransId, accountingDate:timePeriod.thruDate}"/>
                 <script>acctgTransIdByClassId[tempAccountClass] = acctgTransId</script>
                 <!-- entry for each GlAccount with a balance -->
                 <set field="balanceTotal" from="toDecimal(0)"/>
@@ -1608,7 +1646,8 @@ along with this software (see the LICENSE.md file). If not, see
                 <message>Created transaction ${acctgTransId} ${ec.l10n.format(transactionDate, null)} for ${classEnum.description}, total balance ${ec.l10n.format(balanceTotal, '#,##0.00')}</message>
                 <log message="Created transaction ${acctgTransId} ${ec.l10n.format(transactionDate, null)} for ${classEnum.description}, total balance ${ec.l10n.format(balanceTotal, '#,##0.00')}"/>
                 <if condition="postTransactions">
-                    <service-call name="mantle.ledger.LedgerServices.post#AcctgTrans" in-map="{acctgTransId:acctgTransId}"/>
+                    <service-call name="mantle.ledger.LedgerServices.post#AcctgTrans"
+                            in-map="{acctgTransId:acctgTransId, reviewed:reviewed}"/>
                 </if>
             </iterate>
             <!-- recalc this period -->

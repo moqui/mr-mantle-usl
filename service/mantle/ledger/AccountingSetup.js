@@ -28,6 +28,7 @@ const preferenceFields = [
     "invoiceApprovalRequired",
     "inventoryRevaluationEnabled",
     "receiptInvoiceSelfBilledOnly",
+    "projectCostPostingEnabled",
     "invoiceDocumentTemplate",
     "paymentDocumentTemplate",
     "documentLocale",
