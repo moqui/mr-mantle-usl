@@ -5,6 +5,9 @@
 const lib = ec.resource.script("component://mr-mantle/service/mantle/account/InvoiceWorkflowLib.js")
 const {find, one, rows, call, denied, has} = lib
 const POLICY = "mantle.account.billing.CustomerCreditPolicy"
+const DECISION = "mantle.account.billing.CreditHoldDecision"
+const I = lib.invoiceEntity
+const aging = () => ec.resource.script("component://mr-mantle/service/mantle/ledger/Aging.js")
 const HOLD = "mantle.order.OrderHoldReason"
 const OPEN_INVOICE_STATUSES = ["InvoiceFinalized", "InvoiceSent", "InvoiceAcked"]
 const OPEN_ORDER_STATUSES = ["OrderPlaced", "OrderProcessing", "OrderApproved", "OrderHold", "OrderSent"]
@@ -31,80 +34,61 @@ function policyFor(organizationPartyId, customerPartyId, date = ec.user.nowTimes
     return fallback.length ? Object.assign(lib.map(fallback[0]), {source: "organization"}) : null
 }
 
-// What the customer owes and has committed to in one currency, each part summed in its query.
-function exposure(organizationPartyId, customerPartyId, currencyUomId) {
-    const summary = find("mantle.account.invoice.CollectionOverdueSummary", {
-        fromPartyId: organizationPartyId,
-        toPartyId: customerPartyId,
-        currencyUomId
-    })
-        .condition("statusId", "in", OPEN_INVOICE_STATUSES)
-        .condition("unpaidTotal", "greater", toDecimal(0))
-    const unpaid = summary.selectField("overdueTotal").one()
-    const overdue = find("mantle.account.invoice.CollectionOverdueSummary", {
-        fromPartyId: organizationPartyId,
-        toPartyId: customerPartyId,
-        currencyUomId
-    })
-        .condition("statusId", "in", OPEN_INVOICE_STATUSES)
-        .condition("unpaidTotal", "greater", toDecimal(0))
-        .condition("dueDate", "less", startOf(today()))
-        .selectField("overdueTotal")
-        .selectField("oldestDueDate")
-        .one()
-    const parts = Array.from(
-        find("mantle.order.OrderHeaderAndPart", {vendorPartyId: organizationPartyId, customerPartyId, currencyUomId})
-            .condition("partStatusId", "in", OPEN_ORDER_STATUSES)
-            .selectField("orderId")
-            .selectField("orderPartSeqId")
-            .selectField("partTotal")
-            .limit(501)
+// What the customer owes and has committed to in one currency, each part summed in its query: unpaid issued invoices,
+// open order parts less what was billed of them, less unapplied payments and the payments authorized on its orders.
+// With overdue, the oldest invoice portion past due (P8's due schedule less what was applied, as the aging reads it); a
+// customer with more unpaid invoices than that check reads is incomplete, which a policy treats as over, never as a pass.
+const OVERDUE_LIMIT = 1000
+function exposure(organizationPartyId, customerPartyId, currencyUomId, overdue = false) {
+    const sum = (entity, conditions, field, extra = query => query) =>
+        toDecimal(extra(find(entity, conditions)).selectField(field).one()?.[field] ?? 0)
+    const unpaid = sum(
+        "mantle.account.invoice.CollectionOverdueSummary",
+        {fromPartyId: organizationPartyId, toPartyId: customerPartyId, currencyUomId},
+        "overdueTotal",
+        query => query.condition("statusId", "in", OPEN_INVOICE_STATUSES).condition("unpaidTotal", "greater", toDecimal(0))
+    )
+    const parts = {vendorPartyId: organizationPartyId, customerPartyId, currencyUomId}
+    const openParts = query => query.condition("partStatusId", "in", OPEN_ORDER_STATUSES)
+    const ordered = sum("mantle.order.CreditOpenOrderSum", parts, "partTotalSum", openParts)
+    const billed = sum("mantle.order.CreditOrderBillingSum", parts, "billedSum", openParts)
+    const payments = {fromPartyId: customerPartyId, toPartyId: organizationPartyId, amountUomId: currencyUomId}
+    const unapplied = sum("mantle.account.payment.CreditPaymentSum", payments, "unappliedSum", query =>
+        query.condition("statusId", "in", ["PmntDelivered", "PmntConfirmed"]).condition("unappliedTotal", "greater", toDecimal(0))
+    )
+    const authorized = sum("mantle.account.payment.CreditPaymentSum", payments, "amountSum", query =>
+        query.condition("statusId", "PmntAuthorized").condition("orderId", "is-not-null", null)
+    )
+    const round = value => ec.l10n.roundCurrency(value, currencyUomId)
+    const uninvoiced = ordered.subtract(billed).compare(0) > 0 ? ordered.subtract(billed) : toDecimal(0)
+    const out = {
+        currencyUomId,
+        unpaidInvoices: round(unpaid),
+        openOrders: round(uninvoiced),
+        unappliedPayments: round(unapplied),
+        authorizedPayments: round(authorized),
+        exposure: round(unpaid.add(uninvoiced).subtract(unapplied).subtract(authorized)),
+        overdueInvoices: round(toDecimal(0)),
+        oldestDueDate: null,
+        overdueDays: 0,
+        incomplete: false
+    }
+    if (!overdue) return out
+    const invoices = Array.from(
+        find(I, {fromPartyId: organizationPartyId, toPartyId: customerPartyId, currencyUomId})
+            .condition("statusId", "in", OPEN_INVOICE_STATUSES)
+            .condition("unpaidTotal", "greater", toDecimal(0))
+            .orderBy("invoiceDate")
+            .limit(OVERDUE_LIMIT + 1)
             .list()
     )
-    const incomplete = parts.length > 500
-    const orderIds = [...new Set(parts.slice(0, 500).map(row => row.orderId))]
-    let openOrders = toDecimal(0)
-    for (const part of parts.slice(0, 500)) openOrders = openOrders.add(part.partTotal ?? 0)
-    let billed = toDecimal(0),
-        authorized = toDecimal(0)
-    if (orderIds.length) {
-        for (const billing of find("mantle.order.OrderItemBilling").condition("orderId", "in", orderIds).list())
-            billed = billed.add(toDecimal(billing.quantity ?? 1).multiply(billing.amount ?? 0))
-        for (const payment of find("mantle.account.payment.Payment", {statusId: "PmntAuthorized"})
-            .condition("orderId", "in", orderIds)
-            .list())
-            authorized = authorized.add(payment.amount ?? 0)
-    }
-    const uninvoiced = openOrders.subtract(billed).compare(0) > 0 ? openOrders.subtract(billed) : toDecimal(0)
-    const unapplied = find("mantle.account.payment.Payment", {
-        fromPartyId: customerPartyId,
-        toPartyId: organizationPartyId,
-        amountUomId: currencyUomId
-    })
-        .condition("statusId", "in", ["PmntDelivered", "PmntConfirmed"])
-        .condition("unappliedTotal", "greater", toDecimal(0))
-        .list()
-    const unappliedTotal = Array.from(unapplied).reduce((sum, row) => sum.add(row.unappliedTotal ?? 0), toDecimal(0))
-    const round = value => ec.l10n.roundCurrency(value, currencyUomId)
-    const total = round(
-        toDecimal(unpaid?.overdueTotal ?? 0)
-            .add(uninvoiced)
-            .subtract(unappliedTotal)
-            .subtract(authorized)
-    )
-    const oldestDay = overdue?.oldestDueDate ? lib.entityLib.bookDay(null, overdue.oldestDueDate) : null
-    return {
-        currencyUomId,
-        unpaidInvoices: round(toDecimal(unpaid?.overdueTotal ?? 0)),
-        overdueInvoices: round(toDecimal(overdue?.overdueTotal ?? 0)),
-        openOrders: round(uninvoiced),
-        unappliedPayments: round(unappliedTotal),
-        authorizedPayments: round(authorized),
-        exposure: total,
-        oldestDueDate: oldestDay,
-        overdueDays: oldestDay ? dayNumber(today()) - dayNumber(oldestDay) : 0,
-        incomplete
-    }
+    out.incomplete = invoices.length > OVERDUE_LIMIT
+    const late = aging().pastDue(invoices.slice(0, OVERDUE_LIMIT), today())
+    const rows = Object.values(late)
+    out.overdueInvoices = round(rows.reduce((total, row) => total.add(row.amount), toDecimal(0)))
+    out.oldestDueDate = rows.map(row => row.oldestDueDay).sort()[0] || null
+    out.overdueDays = out.oldestDueDate ? dayNumber(today()) - dayNumber(out.oldestDueDate) : 0
+    return out
 }
 
 // The finding of a policy over an exposure: pass, or the policy's action with each reason.
@@ -120,6 +104,11 @@ function judge(policy, numbers, orderCurrency, customerName) {
         reasons.push({
             code: "CREDIT_LIMIT_EXCEEDED",
             message: "exposure " + money(numbers.exposure, currency) + " is over the limit " + money(policy.creditLimit, currency)
+        })
+    if (numbers.incomplete)
+        reasons.push({
+            code: "CREDIT_INCOMPLETE",
+            message: "the customer has more unpaid invoices than the credit check reads"
         })
     if (policy.overdueDaysLimit != null && numbers.overdueDays > Number(policy.overdueDaysLimit))
         reasons.push({
@@ -141,31 +130,52 @@ function judge(policy, numbers, orderCurrency, customerName) {
     }
 }
 
-// The credit check of an order: its sales part (an internal organization selling to an outside customer) against the
-// customer's policy. With placeHold, a Hold result puts the order on a Credit hold and notifies the organization's
-// credit managers (CreditHoldRelease).
+// The credit check of an order: each sales part (an internal organization selling to an outside customer), or the part
+// given, against its customer's policy. A part released by a credit decision that has not expired passes. With
+// placeHold a Hold result holds the part (the whole order when it has one part) and notifies the organization's credit
+// managers (CreditHoldRelease). The answer is the part found worst, with every part held.
 function evaluate(p) {
-    const pass = {resultEnumId: "pass", reasons: [], warning: null, held: false}
+    const pass = {resultEnumId: "pass", reasons: [], warning: null, held: false, heldPartSeqIds: []}
     const header = one("mantle.order.OrderHeader", {orderId: p.orderId})
     if (!header) return pass
-    const parts = rows("mantle.order.OrderPart", {orderId: p.orderId}).filter(
-        part => !p.orderPartSeqId || part.orderPartSeqId === p.orderPartSeqId
-    )
+    const allParts = rows("mantle.order.OrderPart", {orderId: p.orderId})
+    const vendors = [...new Set(allParts.map(row => row.vendorPartyId).filter(Boolean))]
+    // most organizations have no credit policy: one indexed count and the check is done
+    if (!vendors.length || !find(POLICY).condition("organizationPartyId", "in", vendors).count()) return pass
     const internal = partyId => !!partyId && !!one("mantle.party.PartyRole", {partyId, roleTypeId: "OrgInternal"})
-    const part = parts.find(row => internal(row.vendorPartyId) && row.customerPartyId && !internal(row.customerPartyId))
-    if (!part) return pass
+    const salesParts = allParts.filter(
+        part =>
+            (!p.orderPartSeqId || part.orderPartSeqId === p.orderPartSeqId) &&
+            internal(part.vendorPartyId) &&
+            part.customerPartyId &&
+            !internal(part.customerPartyId)
+    )
+    const rank = {pass: 0, warn: 1, hold: 2}
+    let worst = null
+    const heldPartSeqIds = []
+    for (const part of salesParts) {
+        const out = evaluatePart(p, header, part, allParts.length > 1)
+        if (!out) continue
+        if (out.held) heldPartSeqIds.push(part.orderPartSeqId)
+        if (!worst || rank[out.resultEnumId] > rank[worst.resultEnumId]) worst = out
+    }
+    if (!worst) return pass
+    return Object.assign(worst, {held: heldPartSeqIds.length > 0, heldPartSeqIds})
+}
+// A release decision for the order (or the part) that stands now.
+function standingRelease(orderId, orderPartSeqId) {
+    return rows(DECISION, {orderId, decisionEnumId: "CrdRelease"}).find(
+        row =>
+            (!row.orderPartSeqId || row.orderPartSeqId === orderPartSeqId) &&
+            (row.expireDate == null || lib.ms(row.expireDate) > lib.ms(ec.user.nowTimestamp))
+    )
+}
+function evaluatePart(p, header, part, multiPart) {
     const organizationPartyId = part.vendorPartyId,
         customerPartyId = part.customerPartyId
     const policy = policyFor(organizationPartyId, customerPartyId)
-    if (!policy) return pass
-    const currencyUomId = policy.currencyUomId || header.currencyUomId
-    const numbers = exposure(organizationPartyId, customerPartyId, currencyUomId)
-    // an order not yet counted as open (an approval of an order in another state) adds its own total
-    if (!OPEN_ORDER_STATUSES.includes(part.statusId) && header.currencyUomId === currencyUomId)
-        numbers.exposure = numbers.exposure.add(part.partTotal ?? header.grandTotal ?? 0)
-    const names = lib.partyNames([customerPartyId])
-    const finding = judge(policy, numbers, header.currencyUomId, names[customerPartyId] || customerPartyId)
-    const out = Object.assign({}, finding, {
+    if (!policy) return null
+    const base = {
         held: false,
         orderHoldReasonId: null,
         organizationPartyId,
@@ -173,14 +183,29 @@ function evaluate(p) {
         customerCreditPolicyId: policy.customerCreditPolicyId,
         creditLimit: policy.creditLimit,
         overdueDaysLimit: policy.overdueDaysLimit,
-        currencyUomId,
-        exposure: numbers.exposure,
-        overdueDays: numbers.overdueDays
-    })
+        currencyUomId: policy.currencyUomId || header.currencyUomId
+    }
+    const decision = standingRelease(p.orderId, part.orderPartSeqId)
+    if (decision)
+        return Object.assign(base, {
+            resultEnumId: "pass",
+            reasons: [{code: "CREDIT_RELEASED", message: "released by the credit decision " + decision.creditHoldDecisionId}],
+            warning: null,
+            exposure: null,
+            overdueDays: null
+        })
+    const currencyUomId = base.currencyUomId
+    const numbers = exposure(organizationPartyId, customerPartyId, currencyUomId, policy.overdueDaysLimit != null)
+    // a part not yet counted as open (an approval of an order in another state) adds its own total
+    if (!OPEN_ORDER_STATUSES.includes(part.statusId) && header.currencyUomId === currencyUomId)
+        numbers.exposure = numbers.exposure.add(part.partTotal ?? header.grandTotal ?? 0)
+    const names = lib.partyNames([customerPartyId])
+    const finding = judge(policy, numbers, header.currencyUomId, names[customerPartyId] || customerPartyId)
+    const out = Object.assign(base, finding, {exposure: numbers.exposure, overdueDays: numbers.overdueDays})
     if (finding.resultEnumId !== "hold" || !p.placeHold) return out
     const placed = call("mantle.order.OrderServices.hold#Order", {
         orderId: p.orderId,
-        orderPartSeqId: parts.length > 1 ? part.orderPartSeqId : null,
+        orderPartSeqId: multiPart ? part.orderPartSeqId : null,
         holdTypeEnumId: "OhtCredit",
         holdComment: finding.warning.slice(0, 255)
     })
@@ -195,6 +220,7 @@ function evaluate(p) {
             recordId: p.orderId,
             message: {
                 orderId: p.orderId,
+                orderPartSeqId: multiPart ? part.orderPartSeqId : null,
                 organizationPartyId,
                 customerPartyId,
                 customerName: names[customerPartyId] || customerPartyId,
@@ -206,23 +232,33 @@ function evaluate(p) {
     return out
 }
 
-// The sales part of a held order and its open credit hold, for a credit manager of its organization.
+// An order's open credit hold (the part's when one is named) and its sales part, for a credit manager of its organization.
 function heldOrder(p, permission) {
-    const reasons = rows(HOLD, {orderId: p.orderId, holdTypeEnumId: "OhtCredit"}).filter(row => !row.releasedDate)
+    const reasons = rows(HOLD, {orderId: p.orderId, holdTypeEnumId: "OhtCredit"})
+        .filter(row => !row.releasedDate)
+        .filter(row => !p.orderPartSeqId || row.orderPartSeqId === p.orderPartSeqId)
+    const reason = reasons[0] || null
     const parts = rows("mantle.order.OrderPart", {orderId: p.orderId})
-    const part = parts.find(row => one("mantle.party.PartyRole", {partyId: row.vendorPartyId, roleTypeId: "OrgInternal"}))
+    const part =
+        parts.find(row => reason?.orderPartSeqId && row.orderPartSeqId === reason.orderPartSeqId) ||
+        parts.find(row => one("mantle.party.PartyRole", {partyId: row.vendorPartyId, roleTypeId: "OrgInternal"}))
     if (!part) denied("ORDER_UNAVAILABLE", "The order is not available")
     lib.organization(part.vendorPartyId, permission)
-    return {part, reason: reasons[0] || null, organizationPartyId: part.vendorPartyId, customerPartyId: part.customerPartyId}
+    return {part, reason, organizationPartyId: part.vendorPartyId, customerPartyId: part.customerPartyId}
 }
 
-// Release a credit hold with a reason: the decision is recorded with the exposure it was made on, the hold released
-// (release#OrderHold, which approves the order when no other reason is open) and its notifications marked read.
+// Release a credit hold with a reason: the decision is recorded with the exposure it was made on and until when it
+// stands (the credit check passes the order, or its part, while it does), the hold released (release#OrderHold, which
+// returns the order to where it was when no other reason is open) and its notifications marked read. An order back in
+// Placed then goes through Mantle's automatic approval (autoApprove#Order), which approves it when its payments cover it
+// and its checks pass; otherwise it waits for an approver.
 function release(p) {
     const reasonText = String(p.reason || "").trim()
     if (!reasonText) denied("REASON_REQUIRED", "Give the reason for releasing the hold")
     const scope = heldOrder(p, "CREDIT_HOLD_RELEASE")
     if (!scope.reason) denied("HOLD_UNAVAILABLE", "The order has no open credit hold")
+    if (p.expireDate && lib.ms(p.expireDate) <= lib.ms(ec.user.nowTimestamp))
+        denied("EXPIRE_DATE_PAST", "The decision must stand until a later day")
     const header = one("mantle.order.OrderHeader", {orderId: p.orderId})
     const policy = policyFor(scope.organizationPartyId, scope.customerPartyId)
     const currencyUomId = policy?.currencyUomId || header.currencyUomId
@@ -252,7 +288,17 @@ function release(p) {
         recordEntityName: "mantle.order.OrderHeader",
         recordId: p.orderId
     })
-    return {creditHoldDecisionId: decision.creditHoldDecisionId, statusId: released.statusId, stillHeld: released.stillHeld}
+    if (!released.stillHeld && one("mantle.order.OrderHeader", {orderId: p.orderId})?.statusId === "OrderPlaced")
+        call("mantle.order.OrderServices.autoApprove#Order", {orderId: p.orderId})
+    const after = one("mantle.order.OrderHeader", {orderId: p.orderId})
+    const partAfter = scope.reason.orderPartSeqId
+        ? one("mantle.order.OrderPart", {orderId: p.orderId, orderPartSeqId: scope.reason.orderPartSeqId})
+        : null
+    return {
+        creditHoldDecisionId: decision.creditHoldDecisionId,
+        statusId: (partAfter || after).statusId,
+        stillHeld: released.stillHeld
+    }
 }
 
 // A customer's credit for a reader: the policy in effect and its history, the exposure in its currency (the
@@ -266,13 +312,13 @@ function status(p) {
     const policy = policyFor(organizationPartyId, customerPartyId)
     const preference = lib.policy.preference(organizationPartyId)
     const currencyUomId = policy?.currencyUomId || preference.baseCurrencyUomId || null
-    const numbers = currencyUomId ? exposure(organizationPartyId, customerPartyId, currencyUomId) : null
+    const numbers = currencyUomId ? exposure(organizationPartyId, customerPartyId, currencyUomId, true) : null
     const history = Array.from(find(POLICY, {organizationPartyId, customerPartyId}).orderBy("-fromDate").limit(20).list()).map(
         row => lib.display(row)
     )
     const holdRows = []
     const heldParts = Array.from(
-        find("mantle.order.OrderHeaderAndPart", {vendorPartyId: organizationPartyId, customerPartyId, statusId: "OrderHold"})
+        find("mantle.order.OrderHeaderAndPart", {vendorPartyId: organizationPartyId, customerPartyId, partStatusId: "OrderHold"})
             .selectField("orderId")
             .selectField("grandTotal")
             .selectField("currencyUomId")

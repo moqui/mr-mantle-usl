@@ -31,12 +31,12 @@ th { border-bottom: 1px solid #20252b; }
 <table>
     <thead><tr>
         <th>${ec.l10n.localize('Invoice')}</th><th>${ec.l10n.localize('Reference')}</th><th>${ec.l10n.localize('Due')}</th>
-        <th class="amount">${ec.l10n.localize('Days overdue')}</th><th class="amount">${ec.l10n.localize('Unpaid')}</th>
+        <th class="amount">${ec.l10n.localize('Days overdue')}</th><th class="amount">${ec.l10n.localize('Past due')}</th>
     </tr></thead>
     <tbody>
     <#list notice.invoiceRows as invoice>
         <tr><td>${invoice.invoiceId}</td><td>${invoice.referenceNumber ?? ''}</td><td>${invoice.dueDateText}</td>
-            <td class="amount">${invoice.daysOverdue}</td><td class="amount">${money(invoice.unpaidTotal)}</td></tr>
+            <td class="amount">${invoice.daysOverdue}</td><td class="amount">${money(invoice.overdueAmount)}</td></tr>
     </#list>
     <tr class="total"><td colspan="4">${ec.l10n.localize('Total past due')}</td>
         <td class="amount">${money(notice.overdueAmount)}</td></tr>

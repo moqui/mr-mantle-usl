@@ -98,18 +98,23 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
     <service verb="generate" noun="Occurrence" allow-remote="false">
-        <description>Make one period's draft: the schedule locked, a period already made answering its invoice, then a new
-            draft invoice from the template's lines (not its calculated tax lines) dated on the period's day, and the
-            schedule's next day. Refuses a day that is not the schedule's, a day after its end and a cancelled or empty
+        <description>Make one period's draft: the schedule locked and its state read again (an ended schedule refused, a
+            paused one skipped for the job), a period already made answering its invoice, then a new draft invoice dated on
+            the period's day with every template line but its calculated tax lines (each with its number, parent,
+            adjustment flag, tax authority and day; no reference number), and the schedule's next day. Refuses a day that is not
+            the schedule's, a day after its end and a cancelled or empty
             template. Checks no permission: generate#Invoices and run#Schedules call it.</description>
         <in-parameters>
             <parameter name="invoiceScheduleId" required="true"/>
             <parameter name="occurrenceDate"/>
+            <parameter name="requireActive" type="Boolean" default="false"><description>The job's: a schedule paused or
+                ended since it was read makes nothing (skipped).</description></parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="invoiceId"/>
             <parameter name="occurrenceDate"/>
             <parameter name="alreadyGenerated" type="Boolean"/>
+            <parameter name="skipped" type="Boolean"/>
         </out-parameters>
         <actions>
             <set field="module" value="component://mr-mantle/service/mantle/account/RecurringInvoices.js"/>
@@ -119,7 +124,8 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
     <service verb="record" noun="OccurrenceFailure" allow-remote="false">
         <description>Record why a period was not made, on its occurrence (attempts counted), and send RecurringInvoiceFailed
-            to the organization's users who bill that side. A period since made is left as it is.</description>
+            to the organization's users who bill that side once for the period, not again on each failed retry. A period since
+            made is left as it is.</description>
         <in-parameters>
             <parameter name="invoiceScheduleId" required="true"/>
             <parameter name="occurrenceDate" required="true"/>

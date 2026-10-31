@@ -239,6 +239,9 @@ along with this software (see the LICENSE.md file). If not, see
             <moqui.basic.StatusItem statusId="DntFailed" statusTypeId="DunningNotice" sequenceNum="3" description="Failed"/>
             <moqui.basic.StatusItem statusId="DntExcluded" statusTypeId="DunningNotice" sequenceNum="4"
                     description="Left out"/>
+            <!-- marked before its email is sent, in a transaction of its own, so a retry never sends it again; a notice
+                left sending is checked by hand -->
+            <moqui.basic.StatusItem statusId="DntSending" statusTypeId="DunningNotice" sequenceNum="5" description="Sending"/>
             <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="DntPending" toStatusId="DntSent"
                     transitionName="Send"/>
             <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="DntPending" toStatusId="DntFailed"
@@ -248,6 +251,16 @@ along with this software (see the LICENSE.md file). If not, see
             <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="DntFailed" toStatusId="DntSent"
                     transitionName="Send"/>
             <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="DntFailed" toStatusId="DntExcluded"
+                    transitionName="Leave out"/>
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="DntPending" toStatusId="DntSending"
+                    transitionName="Send"/>
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="DntFailed" toStatusId="DntSending"
+                    transitionName="Send"/>
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="DntSending" toStatusId="DntSent"
+                    transitionName="Sent"/>
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="DntSending" toStatusId="DntFailed"
+                    transitionName="Fail"/>
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="DntSending" toStatusId="DntExcluded"
                     transitionName="Leave out"/>
         </seed-data>
     </entity>
@@ -278,6 +291,47 @@ along with this software (see the LICENSE.md file). If not, see
         <alias entity-alias="INV" name="invoiceDate"/>
         <alias entity-alias="INV" name="currencyUomId"/>
         <alias entity-alias="PAPP" name="appliedDate"/>
+    </view-entity>
+
+    <!-- The credit exposure's parts, summed in the query (CreditServices): open order parts, what was billed of them,
+        and payments -->
+    <view-entity entity-name="CreditOpenOrderSum" package="mantle.order">
+        <member-entity entity-alias="OPRT" entity-name="mantle.order.OrderPart"/>
+        <member-entity entity-alias="ORHD" entity-name="mantle.order.OrderHeader" join-from-alias="OPRT">
+            <key-map field-name="orderId"/></member-entity>
+        <alias entity-alias="OPRT" name="vendorPartyId"/>
+        <alias entity-alias="OPRT" name="customerPartyId"/>
+        <alias entity-alias="OPRT" name="partStatusId" field="statusId"/>
+        <alias entity-alias="ORHD" name="currencyUomId"/>
+        <alias entity-alias="OPRT" name="partTotalSum" field="partTotal" function="sum"/>
+    </view-entity>
+    <view-entity entity-name="CreditOrderBillingSum" package="mantle.order">
+        <member-entity entity-alias="OIB" entity-name="mantle.order.OrderItemBilling"/>
+        <member-entity entity-alias="OITM" entity-name="mantle.order.OrderItem" join-from-alias="OIB">
+            <key-map field-name="orderId"/><key-map field-name="orderItemSeqId"/></member-entity>
+        <member-entity entity-alias="OPRT" entity-name="mantle.order.OrderPart" join-from-alias="OITM">
+            <key-map field-name="orderId"/><key-map field-name="orderPartSeqId"/></member-entity>
+        <member-entity entity-alias="ORHD" entity-name="mantle.order.OrderHeader" join-from-alias="OPRT">
+            <key-map field-name="orderId"/></member-entity>
+        <alias entity-alias="OPRT" name="vendorPartyId"/>
+        <alias entity-alias="OPRT" name="customerPartyId"/>
+        <alias entity-alias="OPRT" name="partStatusId" field="statusId"/>
+        <alias entity-alias="ORHD" name="currencyUomId"/>
+        <alias name="billedSum" function="sum" type="number-decimal"><complex-alias operator="*">
+            <complex-alias-field entity-alias="OIB" field="quantity" default-value="1"/>
+            <complex-alias-field entity-alias="OIB" field="amount" default-value="0"/>
+        </complex-alias></alias>
+    </view-entity>
+    <view-entity entity-name="CreditPaymentSum" package="mantle.account.payment">
+        <member-entity entity-alias="PMT" entity-name="mantle.account.payment.Payment"/>
+        <alias entity-alias="PMT" name="fromPartyId"/>
+        <alias entity-alias="PMT" name="toPartyId"/>
+        <alias entity-alias="PMT" name="amountUomId"/>
+        <alias entity-alias="PMT" name="statusId"/>
+        <alias entity-alias="PMT" name="orderId"/>
+        <alias entity-alias="PMT" name="unappliedTotal"/>
+        <alias entity-alias="PMT" name="amountSum" field="amount" function="sum"/>
+        <alias entity-alias="PMT" name="unappliedSum" field="unappliedTotal" function="sum"/>
     </view-entity>
 
     <!-- ========== Recurring invoices ========== -->

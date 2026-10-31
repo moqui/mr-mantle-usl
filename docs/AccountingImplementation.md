@@ -397,27 +397,34 @@ check `check#BankAccess` first; those services keep running for the statement me
 **Order holds (CX-ORDER-HOLD).** `mantle.order.OrderHoldReason` names why an order (or a part) is on OrderHold: its type
 (`OrderHoldType`: Credit, Change, Purchase, Manual, each with the permission that releases it as its enumCode), the record
 that caused it, who placed it and when, and who released it, when and why. `OrderServices.hold#Order` writes a reason and
-moves the order to OrderHold (reservations stay; a Credit reason is placed only by the credit policy, the other types need
-their type's permission); `release#OrderHold` (the type's permission and a comment) releases one reason and returns the
-order to the reason's return status (Approved) only when no other reason is open. Nothing uses OrderBeingChanged.
+moves the order (or the part named; a part when the order has several) to OrderHold (reservations stay; a Credit reason is
+placed only by the credit policy, the other types need their type's permission); `release#OrderHold` (the type's
+permission and a comment) releases one reason and returns the order or its part to the status it had when held only when
+no other reason is open on it, so an order held before its approval is placed again and its approval runs its checks.
+Neither checks the organization: their callers do. Nothing uses OrderBeingChanged.
 
 **Credit (AC-11).** `mantle.account.billing.CustomerCreditPolicy`: an organization's policy for a customer, or its default
 (no customer), as effective-dated rows with audit-logged fields (limit in its currency, most days overdue, warn or hold).
 `mantle.account.CreditServices` (logic in `account/Credit.js`):
-- `store#Policy` (`ACCOUNTING_ADMIN` or `CREDIT_HOLD_RELEASE`) and `store#Defaults` (`ACCOUNTING_ADMIN`): the row in effect
+- `store#Policy` (`ACCOUNTING_ADMIN` or `CREDIT_HOLD_RELEASE`) and `store#Defaults` (`ACCOUNTING_ADMIN`; the policy's currency is the organization's base
+  currency unless given): the row in effect
   ends and the next starts, unless nothing changed; `ended` ends it.
 - `evaluate#OrderCredit` (no permission; `allow-remote` false): the order's sales part against the customer's policy, else
-  the default. Exposure is the unpaid issued invoices and the open orders not yet invoiced (part totals less
-  OrderItemBilling), less unapplied payments and the payments authorized on those orders; over the limit, or an invoice
-  more days overdue than allowed, gives the policy's action, and an order in another currency is a reason. With
+  the default, part by part. Exposure is the unpaid issued invoices and the open orders not yet invoiced (part totals less
+  OrderItemBilling), less unapplied payments and the payments authorized on those orders, each summed in a query
+  (`CreditOpenOrderSum`, `CreditOrderBillingSum`, `CreditPaymentSum`); over the limit, or an invoice portion more days past
+  due than allowed (its due schedule less what was applied, `ledger/Aging.js` `pastDue`), gives the policy's action; an
+  order in another currency and an overdue check that could not read every unpaid invoice are reasons. A part released by
+  a credit decision that has not expired passes; an organization without any policy is answered by one count. With
   `placeHold` a Hold result places a Credit hold and sends `CreditHoldRelease` to the organization's users holding
   `CREDIT_HOLD_RELEASE`. No policy, a purchase order or an order between internal organizations passes.
 - It runs inside `OrderServices.approve#Order` (a Hold result holds the order instead, `creditHeld`; a Warn result
   approves with `creditWarning`; an order with an open hold reason is refused, `ORDER_HOLD_OPEN`) and as the
   `OrderPreApproveCredit` SECA (`service/AccountingCredit.secas.xml`) on `check#OrderPreApprove`, adding its warning,
   which stops `autoApprove#Order`; `autoApprove#Order` passes `approving`, so only then is the hold placed.
-- `release#CreditHold` (`CREDIT_HOLD_RELEASE`; a reason): a `CreditHoldDecision` with the exposure and limit it was made
-  on and until when it stands, then `release#OrderHold`; the notifications are marked read.
+- `release#CreditHold` (`CREDIT_HOLD_RELEASE`; a reason; a part for an order held by part): a `CreditHoldDecision` with
+  the exposure and limit it was made on and until when it stands (a past expiry refused), then `release#OrderHold`; the
+  notifications are marked read, and an order back in Placed goes through `autoApprove#Order`.
 - `get#CustomerCreditStatus` (`CUSTOMER_CREDIT_VIEW`): the policy in effect and its history, the exposure by part, what is
   left, the open credit holds and the decisions.
 
@@ -433,10 +440,13 @@ order to the reason's return status (Approved) only when no other reason is open
 - `store#Level` (`ACCOUNTING_ADMIN`): `DunningLevel` as effective-dated rows (days overdue it starts at, days before the
   same customer gets it again, its EmailTemplate, whether disputed invoices are left out).
 - `preview#Dunning` (`RECEIVABLE_EDIT`): a `DunningRun` as of a day with a `DunningNotice` per customer and currency at
-  the level of its most overdue invoice that is not disputed, and the invoices left out with the reason (`DISPUTED`,
+  the level of its most overdue invoice that is not disputed (each invoice's past-due portions of its due schedule, as the
+  aging reads them; a notice of the same key, organization, customer, currency, level and invoices, sent within the
+  cadence is left out), and the invoices left out with the reason (`DISPUTED`,
   `COVERED`, `PROMISED`, `RECENT_NOTICE`); more than 2,000 overdue invoices are named (incomplete).
-- `send#Dunning` (`RECEIVABLE_EDIT`, an operation key): each notice not yet sent in its own transaction
-  (`send#DunningNotice`: its invoices read again, the reminder through the level's template, `MANTLE_DUNNING_EMAIL` by
+- `send#Dunning` (`RECEIVABLE_EDIT`, an operation key): each notice not yet sent marked sending (`DntSending`) in a
+  transaction of its own, then sent in its own transaction (`send#DunningNotice`: its invoices read again, those disputed
+  since left out unless the level includes them, the reminder through the level's template, `MANTLE_DUNNING_EMAIL` by
   default, from `template/account/DunningNotice.html.fancy`); a failure keeps its reason and sending again sends only
   those. `get#DunningRun` reads a run. `send_SalesInvoicePastDueEmails` stays paused.
 
@@ -444,8 +454,10 @@ order to the reason's return status (Approved) only when no other reason is open
 state) and `InvoiceScheduleOccurrence` (one period by day: its invoice, or why it failed). `RecurringInvoiceServices`
 (logic in `account/RecurringInvoices.js`): `store#Schedule` (the side's edit permission; a change applies to the periods
 not made), `preview#Period` (the side's view), `generate#Invoices` (the side's edit permission; one period in its own
-transaction, `generate#Occurrence`, which locks the schedule and answers a made period's invoice), `record#OccurrenceFailure`
-(with `RecurringInvoiceFailed` to the side's billers) and `run#Schedules`, the `generate_RecurringInvoices` job (nightly;
+transaction, `generate#Occurrence`, which locks the schedule, reads its state again and answers a made period's invoice; a draft has
+every template line but its calculated tax, each with its number, parent, adjustment flag, tax authority and day, and
+no reference number), `record#OccurrenceFailure`
+(with one `RecurringInvoiceFailed` notice for the period to the side's billers) and `run#Schedules`, the `generate_RecurringInvoices` job (nightly;
 at most 12 periods a schedule a run). Drafts only.
 
 **Aging (AC-12).** `LedgerReportServices.run#Aging` (report read or the side's view; an organization the user works in):

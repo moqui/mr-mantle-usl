@@ -351,17 +351,25 @@ function storeLevel(p) {
     return {dunningLevelId: created.dunningLevelId}
 }
 
-// The overdue invoices of a customer group as reminder lines.
-function invoiceRow(invoice, asOf) {
-    const due = dayOf(invoice.dueDate)
-    return {
-        invoiceId: invoice.invoiceId,
-        referenceNumber: invoice.referenceNumber || "",
-        dueDateText: due,
-        daysOverdue: dayNumber(asOf) - dayNumber(due),
-        unpaidTotal: toDecimal(invoice.unpaidTotal ?? 0),
-        disputed: !!invoice.disputedDate
-    }
+// The overdue part of invoices on a day as reminder lines: each invoice's portions of its due schedule past due, less what
+// was applied (LedgerReportServices' aging, Aging.pastDue), with its oldest such due day; an invoice with nothing past
+// due is left out.
+function invoiceRows(invoices, asOf) {
+    const late = ec.resource.script("component://mr-mantle/service/mantle/ledger/Aging.js").pastDue(invoices, asOf)
+    return invoices
+        .filter(invoice => late[invoice.invoiceId])
+        .map(invoice => {
+            const due = late[invoice.invoiceId]
+            return {
+                invoiceId: invoice.invoiceId,
+                referenceNumber: invoice.referenceNumber || "",
+                dueDateText: due.oldestDueDay,
+                daysOverdue: due.daysOverdue,
+                overdueAmount: due.amount,
+                unpaidTotal: due.unpaidTotal,
+                disputed: !!invoice.disputedDate
+            }
+        })
 }
 // Preview a reminder run as of a day (default today): for each customer and currency with overdue invoices, the level of
 // its most overdue invoice that is not disputed, and a notice of its overdue invoices; left out, with the reason: disputed
@@ -376,8 +384,8 @@ function previewDunning(p) {
         find(I, {fromPartyId: organizationPartyId})
             .condition("statusId", "in", OPEN_STATUSES)
             .condition("unpaidTotal", "greater", toDecimal(0))
-            .condition("dueDate", "less", startOf(asOf))
-            .orderBy("toPartyId,currencyUomId,dueDate,invoiceId")
+            .condition("invoiceDate", "less-equals", endOf(asOf))
+            .orderBy("toPartyId,currencyUomId,invoiceDate,invoiceId")
             .limit(RUN_LIMIT + 1)
             .list()
     )
@@ -415,7 +423,8 @@ function previewDunning(p) {
         : []
     for (const [key, list] of groups) {
         const [customerPartyId, currencyUomId] = key.split("|")
-        const lines = list.map(invoice => invoiceRow(invoice, asOf))
+        const lines = invoiceRows(list, asOf)
+        if (!lines.length) continue
         const base = {customerPartyId, currencyUomId}
         const undisputed = lines.filter(line => !line.disputed)
         const days = undisputed.length ? Math.max(...undisputed.map(line => line.daysOverdue)) : 0
@@ -431,14 +440,14 @@ function previewDunning(p) {
                     dunningLevelId: level?.dunningLevelId || null,
                     levelSequenceNum: level?.sequenceNum ?? null,
                     invoiceIds: set.map(line => line.invoiceId).join(","),
-                    overdueAmount: set.reduce((sum, line) => sum.add(line.unpaidTotal), toDecimal(0)),
-                    oldestDueDate: set[0]?.dueDateText || null
+                    overdueAmount: set.reduce((sum, line) => sum.add(line.overdueAmount), toDecimal(0)),
+                    oldestDueDate: set.map(line => line.dueDateText).sort()[0] || null
                 })
             )
         }
         if (disputedLeftOut.length) excludedRow("DISPUTED", disputedLeftOut)
         if (!level || !included.length) continue
-        const overdueAmount = included.reduce((sum, line) => sum.add(line.unpaidTotal), toDecimal(0))
+        const overdueAmount = included.reduce((sum, line) => sum.add(line.overdueAmount), toDecimal(0))
         const cover = Array.from(
             find("mantle.account.payment.Payment", {
                 fromPartyId: customerPartyId,
@@ -460,9 +469,8 @@ function previewDunning(p) {
         const invoiceIds = included.map(line => line.invoiceId).sort()
         const noticeKey = lib.hash({organizationPartyId, customerPartyId, currencyUomId, level: level.sequenceNum, invoiceIds})
         const since = startOf(addDays(asOf, -Number(level.cadenceDays || 1) + 1))
-        const recent = find(NOTICE, {customerPartyId, currencyUomId, statusId: "DntSent", levelSequenceNum: level.sequenceNum})
-            .condition("sentDate", "greater-equals", since)
-            .count()
+        // the same reminder (its key: this organization, customer, currency, level and invoices) sent within the cadence
+        const recent = find(NOTICE, {noticeKey, statusId: "DntSent"}).condition("sentDate", "greater-equals", since).count()
         if (recent > 0) {
             excludedRow("RECENT_NOTICE", included)
             continue
@@ -483,7 +491,7 @@ function previewDunning(p) {
                 levelSequenceNum: level.sequenceNum,
                 invoiceIds: invoiceIds.join(","),
                 overdueAmount: ec.l10n.roundCurrency(overdueAmount, currencyUomId),
-                oldestDueDate: included[0].dueDateText,
+                oldestDueDate: included.map(line => line.dueDateText).sort()[0],
                 noticeKey,
                 toAddresses: [...new Set(addresses)].join(",").slice(0, 255) || null
             })
@@ -517,6 +525,17 @@ function sendDunning(p) {
     )
     const results = []
     for (const notice of waiting) {
+        // marked sending in a transaction of its own before its email, so a retry never sends it twice
+        try {
+            lib.probe("update#" + NOTICE, {
+                dunningRunId: notice.dunningRunId,
+                noticeSeqId: notice.noticeSeqId,
+                statusId: "DntSending"
+            })
+        } catch (error) {
+            ec.logger.error("Dunning notice " + notice.noticeSeqId + " not marked sending: " + error.message)
+            continue
+        }
         try {
             const out = lib.probe("mantle.account.CollectionServices.send#DunningNotice", {
                 dunningRunId: notice.dunningRunId,
@@ -530,21 +549,23 @@ function sendDunning(p) {
             })
         } catch (error) {
             ec.logger.error("Dunning run " + notice.dunningRunId + " notice " + notice.noticeSeqId + ": " + error.message)
+            // its email may have gone: it stays sending, with the error, to be checked by hand, and is not sent again
             lib.probe("update#" + NOTICE, {
                 dunningRunId: notice.dunningRunId,
                 noticeSeqId: notice.noticeSeqId,
-                statusId: "DntFailed",
-                errorMessage: String(error.message).slice(0, 255)
+                errorMessage: ("SEND_UNKNOWN: " + String(error.message)).slice(0, 255)
             })
             results.push({
                 noticeSeqId: notice.noticeSeqId,
                 customerPartyId: notice.customerPartyId,
-                statusId: "DntFailed",
-                reasonCode: "SEND_FAILED"
+                statusId: "DntSending",
+                reasonCode: "SEND_UNKNOWN"
             })
         }
     }
-    const left = find(NOTICE, {dunningRunId: first.dunningRunId}).condition("statusId", "in", ["DntPending", "DntFailed"]).count()
+    const left = find(NOTICE, {dunningRunId: first.dunningRunId})
+        .condition("statusId", "in", ["DntPending", "DntFailed", "DntSending"])
+        .count()
     call("update#" + RUN, {
         dunningRunId: first.dunningRunId,
         statusId: left ? "DrnPartial" : "DrnSent",
@@ -563,18 +584,23 @@ function sendDunning(p) {
 // out), then the reminder email to its recipients through its level's template.
 function sendNotice(p) {
     const notice = find(NOTICE, {dunningRunId: p.dunningRunId, noticeSeqId: p.noticeSeqId}).forUpdate(true).one()
-    if (!notice || !["DntPending", "DntFailed"].includes(notice.statusId)) return {statusId: notice?.statusId || null}
+    if (!notice || notice.statusId !== "DntSending") return {statusId: notice?.statusId || null}
     const run = one(RUN, {dunningRunId: p.dunningRunId})
     const asOf = dayText(run.asOfDate)
     const update = values =>
         call("update#" + NOTICE, Object.assign({dunningRunId: p.dunningRunId, noticeSeqId: p.noticeSeqId}, values))
     const ids = idList(notice.invoiceIds)
-    const invoices = Array.from(find(I).condition("invoiceId", "in", ids).orderBy("dueDate,invoiceId").list()).filter(
+    const level = one(LEVEL, {dunningLevelId: notice.dunningLevelId})
+    const open = Array.from(find(I).condition("invoiceId", "in", ids).orderBy("invoiceDate,invoiceId").list()).filter(
         row => OPEN_STATUSES.includes(row.statusId) && toDecimal(row.unpaidTotal ?? 0).compare(0) > 0
     )
-    if (!invoices.length) {
-        update({statusId: "DntExcluded", excludedReason: "PAID"})
-        return {statusId: "DntExcluded", reasonCode: "PAID"}
+    // an invoice disputed since the preview is left out, unless the level includes disputed invoices
+    const invoices = level?.excludeDisputed === "N" ? open : open.filter(row => !row.disputedDate)
+    const lines = invoiceRows(invoices, asOf)
+    if (!lines.length) {
+        const reasonCode = open.some(row => row.disputedDate) ? "DISPUTED" : "PAID"
+        update({statusId: "DntExcluded", excludedReason: reasonCode})
+        return {statusId: "DntExcluded", reasonCode}
     }
     const fail = (reasonCode, message) => {
         update({statusId: "DntFailed", errorMessage: reasonCode + ": " + message})
@@ -584,12 +610,10 @@ function sendNotice(p) {
     if (!addresses.length) return fail("RECIPIENT_REQUIRED", "The customer has no billing email address")
     const invalid = addresses.filter(address => !/^[^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+$/.test(address))
     if (invalid.length) return fail("RECIPIENT_INVALID", "Invalid recipient address")
-    const level = one(LEVEL, {dunningLevelId: notice.dunningLevelId})
     const organization = one("mantle.party.PartyDetail", {partyId: run.organizationPartyId})
     const organizationName = organization?.organizationName || run.organizationPartyId
     const names = lib.partyNames([notice.customerPartyId])
-    const lines = invoices.map(invoice => invoiceRow(invoice, asOf))
-    const overdueAmount = lines.reduce((sum, line) => sum.add(line.unpaidTotal), toDecimal(0))
+    const overdueAmount = lines.reduce((sum, line) => sum.add(line.overdueAmount), toDecimal(0))
     const body = ec.resource.template("component://mr-mantle/template/account/DunningNotice.html.fancy", {
         notice: {
             customerName: names[notice.customerPartyId] || notice.customerPartyId,

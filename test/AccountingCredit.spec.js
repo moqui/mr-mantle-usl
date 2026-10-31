@@ -69,6 +69,34 @@ function order(customerPartyId, paid = false) {
     return made.orderId
 }
 const status = orderId => one("mantle.order.OrderHeader", {orderId}).statusId
+const partStatus = (orderId, orderPartSeqId) => one("mantle.order.OrderPart", {orderId, orderPartSeqId}).statusId
+// A placed order of two parts, five of DEMO_1_2 at 10 each, to the two customers given.
+function twoParts(firstCustomer, secondCustomer) {
+    login("john.doe")
+    const made = svc("mantle.order.OrderServices.create#Order", {
+        vendorPartyId: f.org,
+        customerPartyId: firstCustomer,
+        currencyUomId: "USD",
+        facilityId: facility
+    })
+    const second = svc("mantle.order.OrderServices.create#OrderPart", {
+        orderId: made.orderId,
+        vendorPartyId: f.org,
+        customerPartyId: secondCustomer,
+        facilityId: facility
+    })
+    for (const orderPartSeqId of [made.orderPartSeqId, second.orderPartSeqId])
+        svc("mantle.order.OrderServices.add#OrderProductQuantity", {
+            orderId: made.orderId,
+            orderPartSeqId,
+            productId: "DEMO_1_2",
+            quantity: 5,
+            unitAmount: 10,
+            itemTypeEnumId: "ItemProduct"
+        })
+    svc("mantle.order.OrderServices.place#Order", {orderId: made.orderId, requireInventory: false})
+    return made.orderId
+}
 const openReasons = orderId => rows("mantle.order.OrderHoldReason", {orderId}).filter(row => !row.releasedDate)
 function policy(customerPartyId, values) {
     login(credit)
@@ -199,7 +227,7 @@ feature("an order over the limit is held on a manual approval, keeps its reserva
     }
 })
 
-feature("a credit manager releases the hold with a reason; the order is approved and the decision recorded", {
+feature("a credit manager releases the hold with a reason; the order is placed again and approval passes its decision", {
     when() {
         login(f.users.ar)
         const denied = refused("mantle.account.CreditServices.release#CreditHold", {orderId: heldOrderId, reason: "Paid soon"})
@@ -210,17 +238,24 @@ feature("a credit manager releases the hold with a reason; the order is approved
             reason: "Known customer, paying this week"
         })
         const decision = one("mantle.account.billing.CreditHoldDecision", {creditHoldDecisionId: released.creditHoldDecisionId})
+        const afterRelease = status(heldOrderId)
+        login(approver)
+        const approved = svc("mantle.order.OrderServices.approve#Order", {orderId: heldOrderId})
         const unread = rows("moqui.security.user.NotificationMessage", {topic: "CreditHoldRelease", recordId: heldOrderId})
             .flatMap(row =>
                 rows("moqui.security.user.NotificationMessageUser", {notificationMessageId: row.notificationMessageId})
             )
             .filter(row => !row.viewedDate)
-        return {denied, noReason, released, decision, status: status(heldOrderId), unread}
+        return {denied, noReason, released, decision, afterRelease, approved, status: status(heldOrderId), unread}
     },
-    then({denied, noReason, released, decision, status, unread}) {
+    then({denied, noReason, released, decision, afterRelease, approved, status, unread}) {
         denied.includes("PERMISSION_DENIED")
         noReason.includes("REASON_REQUIRED")
-        released.statusId == "OrderApproved"
+        // held before it was approved: back to Placed, so its approval runs its checks, and the decision passes credit
+        released.statusId == "OrderPlaced"
+        afterRelease == "OrderPlaced"
+        approved.creditHeld == false
+        approved.creditWarning == null
         status == "OrderApproved"
         decision.decisionEnumId == "CrdRelease"
         decision.decidedByUserId == credit
@@ -298,6 +333,100 @@ feature("a second hold reason keeps the order held until it is released too", {
         noManual.includes("PERMISSION_DENIED")
         noManualRelease.includes("PERMISSION_DENIED")
         released.stillHeld == false
-        status == "OrderApproved"
+        status == "OrderPlaced"
+    }
+})
+
+feature("a release decision stands until it expires; then approval holds the order again", {
+    when() {
+        const orderId = order(f.customer)
+        login(approver)
+        const held = svc("mantle.order.OrderServices.approve#Order", {orderId})
+        login(credit)
+        const pastRefused = refused("mantle.account.CreditServices.release#CreditHold", {
+            orderId,
+            reason: "Too late",
+            expireDate: new Date(Number(ec.user.nowTimestamp) - 86400000)
+        })
+        const released = svc("mantle.account.CreditServices.release#CreditHold", {
+            orderId,
+            reason: "For this week",
+            expireDate: new Date(Number(ec.user.nowTimestamp) + 7 * 86400000)
+        })
+        const standing = svc("mantle.account.CreditServices.evaluate#OrderCredit", {orderId})
+        login("john.doe")
+        svc("update#mantle.account.billing.CreditHoldDecision", {
+            creditHoldDecisionId: released.creditHoldDecisionId,
+            expireDate: new Date(Number(ec.user.nowTimestamp) - 60000)
+        })
+        login(approver)
+        const again = svc("mantle.order.OrderServices.approve#Order", {orderId})
+        return {held, pastRefused, released, standing, again, status: status(orderId)}
+    },
+    then({held, pastRefused, released, standing, again, status}) {
+        held.creditHeld == true
+        pastRefused.includes("EXPIRE_DATE_PAST")
+        released.statusId == "OrderPlaced"
+        standing.resultEnumId == "pass"
+        standing.reasons.some(row => row.code == "CREDIT_RELEASED")
+        again.creditHeld == true
+        status == "OrderHold"
+    }
+})
+
+feature("an order of two parts holds the part over its limit, approves the other, and releases only the held part", {
+    when() {
+        const plain = prefix + "_PARTS"
+        login("john.doe")
+        svc("create#mantle.party.Party", {partyId: plain, partyTypeEnumId: "PtyOrganization"})
+        svc("create#mantle.party.PartyRole", {partyId: plain, roleTypeId: "Customer"})
+        // part 01 to a customer without a policy, part 02 to the one over its limit
+        const orderId = twoParts(plain, f.customer)
+        const reservations = rows("mantle.product.issuance.AssetReservation", {orderId}).length
+        login(approver)
+        const approved = svc("mantle.order.OrderServices.approve#Order", {orderId})
+        const after = {p1: partStatus(orderId, "01"), p2: partStatus(orderId, "02")}
+        login(credit)
+        const released = svc("mantle.account.CreditServices.release#CreditHold", {
+            orderId,
+            orderPartSeqId: "02",
+            reason: "Part released"
+        })
+        const afterRelease = {p1: partStatus(orderId, "01"), p2: partStatus(orderId, "02")}
+        // a completed part 01 is never touched by approving part 02
+        login("john.doe")
+        const other = twoParts(plain, f.customer)
+        login(approver)
+        svc("mantle.order.OrderServices.approve#Order", {orderId: other, orderPartSeqId: "01"})
+        login("john.doe")
+        svc("mantle.order.OrderServices.update#OrderStatus", {orderId: other, orderPartSeqId: "01", statusId: "OrderCompleted"})
+        login(approver)
+        const second = svc("mantle.order.OrderServices.approve#Order", {orderId: other, orderPartSeqId: "02"})
+        return {
+            approved,
+            after,
+            released,
+            afterRelease,
+            reservations,
+            reservationsAfter: rows("mantle.product.issuance.AssetReservation", {orderId}).length,
+            reasons: rows("mantle.order.OrderHoldReason", {orderId}),
+            second,
+            other: {p1: partStatus(other, "01"), p2: partStatus(other, "02")}
+        }
+    },
+    then({approved, after, released, afterRelease, reservations, reservationsAfter, reasons, second, other}) {
+        approved.creditHeld == true
+        approved.heldPartSeqIds.join() == "02"
+        after.p1 == "OrderApproved"
+        after.p2 == "OrderHold"
+        reasons.length == 1
+        reasons[0].orderPartSeqId == "02"
+        reservationsAfter == reservations
+        released.statusId == "OrderPlaced"
+        afterRelease.p1 == "OrderApproved"
+        afterRelease.p2 == "OrderPlaced"
+        second.creditHeld == true
+        other.p1 == "OrderCompleted"
+        other.p2 == "OrderHold"
     }
 })

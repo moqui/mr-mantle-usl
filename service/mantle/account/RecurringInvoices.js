@@ -191,18 +191,35 @@ function addDays(day, days) {
     const value = new Date(Date.UTC(year, month - 1, date + days))
     return value.getUTCFullYear() + "-" + pad(value.getUTCMonth() + 1) + "-" + pad(value.getUTCDate())
 }
-// The template's lines a period copies: not its calculated tax lines, which the draft gets again when it is issued.
+// The template's lines a period copies: every line but its calculated tax lines (which the draft gets again when it is
+// issued) and the lines under one left out, each keeping its line number so a child keeps its parent.
 function templateLines(invoiceId) {
-    return rows("mantle.account.invoice.InvoiceItem", {invoiceId})
-        .filter(line => line.taxCalculated !== "Y" && !line.parentItemSeqId)
-        .sort((a, b) => String(a.invoiceItemSeqId).localeCompare(String(b.invoiceItemSeqId)))
+    const all = rows("mantle.account.invoice.InvoiceItem", {invoiceId}).sort((a, b) =>
+        String(a.invoiceItemSeqId).localeCompare(String(b.invoiceItemSeqId))
+    )
+    const skipped = new Set(all.filter(line => line.taxCalculated === "Y").map(line => line.invoiceItemSeqId))
+    let grew = true
+    while (grew) {
+        grew = false
+        for (const line of all)
+            if (!skipped.has(line.invoiceItemSeqId) && line.parentItemSeqId && skipped.has(line.parentItemSeqId)) {
+                skipped.add(line.invoiceItemSeqId)
+                grew = true
+            }
+    }
+    return all.filter(line => !skipped.has(line.invoiceItemSeqId))
 }
+// The fields of a template line a draft copies: all but the template's identity, its stamps and what it was billed from.
+const LINE_SKIP = new Set(["invoiceId", "lastUpdatedStamp", "taxCalculated"])
 
 // Make one period's draft. The schedule is locked first; a period already made answers its invoice. Called in a
 // transaction of its own by generate#Invoices and the job; it checks no permission.
 function occurrence(p) {
     const schedule = find(S, {invoiceScheduleId: p.invoiceScheduleId}).forUpdate(true).one()
     if (!schedule) denied("SCHEDULE_UNAVAILABLE", "The schedule is not available")
+    // the state read again under the lock: the job makes only an active schedule's periods, and nothing is made once ended
+    if (schedule.statusId === "IschEnded") denied("SCHEDULE_ENDED", "The schedule has ended")
+    if (p.requireActive && schedule.statusId !== "IschActive") return {skipped: true}
     const day = dayText(p.occurrenceDate) || dayText(schedule.nextDate)
     const existing = one(O, {invoiceScheduleId: schedule.invoiceScheduleId, occurrenceDate: day})
     if (existing?.invoiceId) return {invoiceId: existing.invoiceId, occurrenceDate: day, alreadyGenerated: true}
@@ -221,22 +238,19 @@ function occurrence(p) {
         currencyUomId: template.currencyUomId,
         invoiceDate,
         settlementTermId: schedule.settlementTermId || null,
-        description: schedule.description || template.description || null,
-        referenceNumber: template.referenceNumber || null
+        description: schedule.description || template.description || null
     })
+    // each line as the template has it (its number, parent, adjustment flag, tax authority and day), in the draft
     for (const line of lines)
-        call("mantle.account.InvoiceServices.create#InvoiceItem", {
-            invoiceId: made.invoiceId,
-            itemTypeEnumId: line.itemTypeEnumId,
-            productId: line.productId || null,
-            description: line.description || null,
-            quantity: line.quantity ?? null,
-            quantityUomId: line.quantityUomId || null,
-            amount: line.amount ?? null,
-            taxableFlag: line.taxableFlag || null,
-            overrideGlAccountId: line.overrideGlAccountId || null,
-            costCenterId: line.costCenterId || null
-        })
+        call(
+            "create#mantle.account.invoice.InvoiceItem",
+            Object.assign(
+                Object.fromEntries(
+                    Object.entries(lib.map(line)).filter(([field, value]) => !LINE_SKIP.has(field) && value != null)
+                ),
+                {invoiceId: made.invoiceId}
+            )
+        )
     const values = {
         invoiceScheduleId: schedule.invoiceScheduleId,
         occurrenceDate: day,
@@ -263,6 +277,8 @@ function recordFailure(p) {
     const schedule = one(S, {invoiceScheduleId: p.invoiceScheduleId})
     const existing = one(O, {invoiceScheduleId: p.invoiceScheduleId, occurrenceDate: p.occurrenceDate})
     if (existing?.invoiceId) return {}
+    // one notice for a period's failure, not one each night it fails again
+    const notifyNow = existing?.statusId !== "IsoFailed"
     call((existing ? "update#" : "create#") + O, {
         invoiceScheduleId: p.invoiceScheduleId,
         occurrenceDate: p.occurrenceDate,
@@ -271,7 +287,7 @@ function recordFailure(p) {
         attemptCount: Number(existing?.attemptCount || 0) + 1,
         lastAttemptDate: ec.user.nowTimestamp
     })
-    if (!schedule) return {}
+    if (!schedule || !notifyNow) return {}
     const receivable =
         one(lib.invoiceEntity, {invoiceId: schedule.templateInvoiceId})?.fromPartyId === schedule.organizationPartyId
     ec.resource.script("component://mr-mantle/service/mantle/account/Payables.js").execute("notify", {
@@ -290,9 +306,13 @@ function recordFailure(p) {
     return {}
 }
 // One period in its own transaction; a failure recorded and named, the caller going on.
-function attempt(invoiceScheduleId, occurrenceDate) {
+function attempt(invoiceScheduleId, occurrenceDate, requireActive = false) {
     try {
-        return lib.probe("mantle.account.RecurringInvoiceServices.generate#Occurrence", {invoiceScheduleId, occurrenceDate})
+        return lib.probe("mantle.account.RecurringInvoiceServices.generate#Occurrence", {
+            invoiceScheduleId,
+            occurrenceDate,
+            requireActive
+        })
     } catch (error) {
         ec.logger.error("Recurring invoice " + invoiceScheduleId + " for " + occurrenceDate + ": " + error.message)
         try {
@@ -329,7 +349,8 @@ function run() {
         let day = dayText(schedule.nextDate)
         for (let count = 0; count < MAX_PER_RUN && day && day <= now; count++) {
             if (schedule.endDate && day > dayText(schedule.endDate)) break
-            const out = attempt(schedule.invoiceScheduleId, day)
+            const out = attempt(schedule.invoiceScheduleId, day, true)
+            if (out.skipped) break
             if (out.failed) {
                 failedCount++
                 break

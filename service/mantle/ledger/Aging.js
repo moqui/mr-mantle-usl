@@ -39,6 +39,60 @@ function bucketOf(dueDay, asOf, periodDays) {
 }
 const empty = () => [0, 1, 2, 3, 4, 5].map(() => toDecimal(0))
 
+// The open portions of invoices, as of the end of a day (now when none is given): what each invoice still owes, and each
+// portion of its due schedule (PaymentTerms.schedules) with what is left of it, what was applied settling the earliest
+// portions first; a portion past the schedule (rounding, or a total changed since it was written) is due on the invoice's
+// due day. Invoices with nothing open are left out. Aging, dunning and the credit check age by these portions.
+function openPortions(invoices, asOfEnd = null) {
+    const list = Array.from(invoices || [])
+    if (!list.length) return {}
+    const totals = invoiceLib.totalsMany(list, asOfEnd)
+    const schedules = terms().schedules(list, asOfEnd || ec.user.nowTimestamp)
+    const out = {}
+    for (const invoice of list) {
+        const value = totals[invoice.invoiceId]
+        if (!value || value.unpaidTotal.isZero()) continue
+        const fallbackDay = dayOf(invoice.dueDate) || dayOf(invoice.accountingDate) || dayOf(invoice.invoiceDate)
+        const portions = []
+        const rows = schedules[invoice.invoiceId]?.rows || []
+        if (!rows.length || value.unpaidTotal.compare(0) < 0) portions.push({dueDay: fallbackDay, amount: value.unpaidTotal})
+        else {
+            let paid = value.invoiceTotal.subtract(value.unpaidTotal)
+            let aged = toDecimal(0)
+            for (const portion of rows) {
+                let left = toDecimal(portion.amount ?? 0)
+                const settled = paid.compare(left) >= 0 ? left : paid.compare(0) > 0 ? paid : toDecimal(0)
+                left = left.subtract(settled)
+                paid = paid.subtract(settled)
+                if (left.isZero()) continue
+                portions.push({dueDay: portion.dueDateText || fallbackDay, amount: left})
+                aged = aged.add(left)
+            }
+            const rest = value.unpaidTotal.subtract(aged)
+            if (!rest.isZero()) portions.push({dueDay: fallbackDay, amount: rest})
+        }
+        out[invoice.invoiceId] = {invoiceTotal: value.invoiceTotal, unpaidTotal: value.unpaidTotal, portions}
+    }
+    return out
+}
+// What of each invoice is past due on a day (portions due before it) and its oldest such due day.
+function pastDue(invoices, day) {
+    const opens = openPortions(invoices)
+    const out = {}
+    for (const [invoiceId, value] of Object.entries(opens)) {
+        const due = value.portions.filter(portion => portion.dueDay && portion.dueDay < day)
+        if (!due.length) continue
+        const oldest = due.map(portion => portion.dueDay).sort()[0]
+        out[invoiceId] = {
+            amount: due.reduce((sum, portion) => sum.add(portion.amount), toDecimal(0)),
+            oldestDueDay: oldest,
+            daysOverdue: dayNumber(day) - dayNumber(oldest),
+            unpaidTotal: value.unpaidTotal
+        }
+    }
+    return out
+}
+
 function aging(p) {
     const payable = p.invoiceType === "payable"
     const s = policy.organization(p, "read")
@@ -96,40 +150,19 @@ function aging(p) {
         )
         read += batch.length
         if (!batch.length) continue
-        const totals = invoiceLib.totalsMany(batch, asOfEnd)
-        const open = batch.filter(row => !totals[row.invoiceId].unpaidTotal.isZero())
+        const opens = openPortions(batch, asOfEnd)
+        const open = batch.filter(row => opens[row.invoiceId])
         if (!open.length) continue
-        const schedules = terms().schedules(open, asOfEnd)
         Object.assign(names, policy.lib.partyNames(open.map(row => row[partyField])))
         for (const invoice of open) {
             const partyId = invoice[partyField]
             if (!names[partyId]) continue
-            const value = totals[invoice.invoiceId]
+            const value = opens[invoice.invoiceId]
             const currency = invoice.currencyUomId
             const amounts = empty()
-            // what was applied by the day settles the earliest portions first
-            let paid = value.invoiceTotal.subtract(value.unpaidTotal)
-            const portions = schedules[invoice.invoiceId]?.rows || []
-            if (!portions.length || value.unpaidTotal.compare(0) < 0) {
-                amounts[bucketOf(dayOf(invoice.dueDate) || dayOf(invoice.invoiceDate), asOf, periodDays)] = value.unpaidTotal
-            } else {
-                for (const portion of portions) {
-                    let left = toDecimal(portion.amount ?? 0)
-                    const settled = paid.compare(left) >= 0 ? left : paid.compare(0) > 0 ? paid : toDecimal(0)
-                    left = left.subtract(settled)
-                    paid = paid.subtract(settled)
-                    if (left.isZero()) continue
-                    const due = portion.dueDateText || dayOf(invoice.dueDate) || dayOf(invoice.invoiceDate)
-                    const index = bucketOf(due, asOf, periodDays)
-                    amounts[index] = amounts[index].add(left)
-                }
-                // rounding or a total changed since the schedule was written: what is left is aged by the invoice
-                const aged = amounts.reduce((sum, amount) => sum.add(amount), toDecimal(0))
-                const rest = value.unpaidTotal.subtract(aged)
-                if (!rest.isZero()) {
-                    const index = bucketOf(dayOf(invoice.dueDate) || dayOf(invoice.invoiceDate), asOf, periodDays)
-                    amounts[index] = amounts[index].add(rest)
-                }
+            for (const portion of value.portions) {
+                const index = bucketOf(portion.dueDay, asOf, periodDays)
+                amounts[index] = amounts[index].add(portion.amount)
             }
             invoiceCount++
             const key = partyId + "|" + currency
@@ -213,6 +246,8 @@ function aging(p) {
 
 ;({
     bucketOf,
+    openPortions,
+    pastDue,
     execute(op, parameters) {
         if (op !== "aging") throw new Error("Unknown aging operation " + op)
         return aging(parameters)

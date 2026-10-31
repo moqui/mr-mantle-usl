@@ -11,11 +11,19 @@ const capture = ec.factory.getTool("MailCapture")
 const prefix = "NATIVE_COLL"
 const day = offset => ec.l10n.format(new Date(Number(ec.user.nowTimestamp) + offset * 86400000), "yyyy-MM-dd")
 let f, second, overdueId, disputedId, secondId, runId
+// A customer of the organization with a billing address.
+function customer(partyId, email) {
+    login("john.doe")
+    svc("create#mantle.party.Party", {partyId, partyTypeEnumId: "PtyOrganization"})
+    svc("create#mantle.party.Organization", {partyId, organizationName: partyId + " customer"})
+    svc("create#mantle.party.PartyRole", {partyId, roleTypeId: "Customer"})
+    svc("mantle.party.ContactServices.create#EmailAddress", {partyId, emailAddress: email, contactMechPurposeId: "EmailBilling"})
+}
 
-// An issued invoice of the organization to a customer, due a number of days ago.
-function overdue(customerPartyId, amount, daysAgo) {
-    login(f.users.ar)
-    const made = svc("mantle.account.InvoiceServices.create#Receivable", {organizationPartyId: f.org, customerPartyId})
+// An issued invoice of the organization (the fixture's, by default) to a customer, due a number of days ago.
+function overdue(customerPartyId, amount, daysAgo, fixture = f) {
+    login(fixture.users.ar)
+    const made = svc("mantle.account.InvoiceServices.create#Receivable", {organizationPartyId: fixture.org, customerPartyId})
     svc("mantle.account.InvoiceServices.store#InvoiceDraftItem", {
         invoiceId: made.invoiceId,
         itemTypeEnumId: "ItemTimeEntry",
@@ -34,6 +42,13 @@ function overdue(customerPartyId, amount, daysAgo) {
         invoiceId: made.invoiceId,
         dueDate: new Date(Number(ec.user.nowTimestamp) - daysAgo * 86400000)
     })
+    // its due schedule moved with it
+    for (const row of rows("mantle.account.invoice.InvoiceDueSchedule", {invoiceId: made.invoiceId}))
+        svc("update#mantle.account.invoice.InvoiceDueSchedule", {
+            invoiceId: made.invoiceId,
+            scheduleSeqId: row.scheduleSeqId,
+            dueDate: day(-daysAgo)
+        })
     return made.invoiceId
 }
 
@@ -250,5 +265,96 @@ feature("a failed recipient does not stop the others, and sending again sends on
         last.body.includes(secondId)
         run.statusId == "DrnSent"
         notices.filter(row => row.statusId == "DntSent").length == 2
+    }
+})
+
+feature("an invoice disputed after the preview is left out when the run is sent, and no reminder goes", {
+    when() {
+        const third = prefix + "_THIRD"
+        customer(third, "ap@third.example")
+        const invoiceId = overdue(third, "60", 6)
+        login(f.users.ar)
+        const preview = collections("preview#Dunning", {organizationPartyId: f.org})
+        const notices = rows("mantle.account.invoice.DunningNotice", {dunningRunId: preview.dunningRunId})
+        collections("record#Activity", {
+            organizationPartyId: f.org,
+            customerPartyId: third,
+            outcomeEnumId: "CaoDisputed",
+            note: "Wrong rate",
+            invoiceIdList: [invoiceId]
+        })
+        capture.clear()
+        const sent = collections("send#Dunning", {dunningRunId: preview.dunningRunId, operationKey: "dunning-disputed"})
+        const notice = rows("mantle.account.invoice.DunningNotice", {
+            dunningRunId: preview.dunningRunId,
+            customerPartyId: third
+        })[0]
+        return {notices, sent, notice, count: capture.count(), invoiceId}
+    },
+    then({notices, sent, notice, count, invoiceId}) {
+        // the reminders the earlier run sent are the same ones again: left out as sent within their cadence
+        notices.filter(row => row.statusId == "DntExcluded" && row.excludedReason == "RECENT_NOTICE").length == 2
+        notices.some(row => row.statusId == "DntPending" && row.invoiceIds == invoiceId)
+        notice.statusId == "DntExcluded"
+        notice.excludedReason == "DISPUTED"
+        sent.sentCount == 0
+        count == 0
+    }
+})
+
+feature("an instalment past due is reminded for its portion, and the credit check ages it by its schedule", {
+    when() {
+        const fourth = prefix + "_FOURTH"
+        customer(fourth, "ap@fourth.example")
+        // issued today, its first half due ten days ago and its second in twenty
+        const invoiceId = overdue(fourth, "200", -20)
+        login("john.doe")
+        for (const row of rows("mantle.account.invoice.InvoiceDueSchedule", {invoiceId}))
+            svc("delete#mantle.account.invoice.InvoiceDueSchedule", {invoiceId, scheduleSeqId: row.scheduleSeqId})
+        for (const [scheduleSeqId, offset] of [
+            ["01", -10],
+            ["02", 20]
+        ])
+            svc("create#mantle.account.invoice.InvoiceDueSchedule", {invoiceId, scheduleSeqId, dueDate: day(offset), amount: 100})
+        login(f.users.ar)
+        const preview = collections("preview#Dunning", {organizationPartyId: f.org})
+        const notice = rows("mantle.account.invoice.DunningNotice", {
+            dunningRunId: preview.dunningRunId,
+            customerPartyId: fourth
+        })[0]
+        const credit = ec.resource
+            .script("component://mr-mantle/service/mantle/account/Credit.js")
+            .exposure(f.org, fourth, "USD", true)
+        return {notice, credit, invoiceId}
+    },
+    then({notice, credit, invoiceId}) {
+        notice.statusId == "DntPending"
+        notice.invoiceIds == invoiceId
+        notice.overdueAmount.eq(100)
+        credit.overdueDays == 10
+        credit.overdueInvoices.eq(100)
+        credit.unpaidInvoices.eq(200)
+    }
+})
+
+feature("a reminder sent by one organization does not keep another's reminder to the same customer", {
+    when() {
+        const other = helper().fixtures(prefix + "2")
+        login(other.users.financeadmin)
+        collections("store#Level", {
+            organizationPartyId: other.org,
+            description: "Reminder",
+            daysOverdueFrom: 1,
+            emailTemplateId: other.emailTemplateId
+        })
+        // the first organization's customer, reminded by it in the earlier run, owes this organization too
+        const invoiceId = overdue(f.customer, "45", 4, other)
+        login(other.users.ar)
+        const preview = collections("preview#Dunning", {organizationPartyId: other.org})
+        return {notices: rows("mantle.account.invoice.DunningNotice", {dunningRunId: preview.dunningRunId}), invoiceId}
+    },
+    then({notices, invoiceId}) {
+        notices.some(row => row.customerPartyId == f.customer && row.statusId == "DntPending" && row.invoiceIds == invoiceId)
+        !notices.some(row => row.excludedReason == "RECENT_NOTICE")
     }
 })

@@ -68,11 +68,15 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
     <service verb="evaluate" noun="OrderCredit" allow-remote="false">
-        <description>The credit check of an order's sales part (an internal organization selling to an outside customer)
-            against the customer's policy in effect, else the organization's default: the exposure (unpaid invoices and open
+        <description>The credit check of an order's sales parts (an internal organization selling to an outside customer),
+            or the part given, each against its customer's policy in effect, else the organization's default. A part released
+            by a credit decision that has not expired passes. An organization with no policy at all is answered by one count.
+            The check: the exposure (unpaid invoices and open
             orders not yet invoiced, less unapplied payments and the payments authorized on the open orders) against the
             limit, and the oldest overdue invoice against the overdue days. Answers pass, warn or hold with each reason and
-            a warning text. With placeHold a hold result puts the order on a Credit hold (hold#Order; reservations stay)
+            a warning text. With placeHold a hold result puts the part on a Credit hold (the order when it has one part;
+            hold#Order; reservations
+            stay; heldPartSeqIds names the parts held)
             and notifies the organization's users who may release it (CreditHoldRelease). No policy, a purchase order or an
             order between internal organizations always passes. approve#Order and the OrderPreApproveCredit SECA on
             check#OrderPreApprove call it; it checks no permission.</description>
@@ -86,6 +90,7 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="reasons" type="List"/>
             <parameter name="warning"/>
             <parameter name="held" type="Boolean"/>
+            <parameter name="heldPartSeqIds" type="List"/>
             <parameter name="orderHoldReasonId"/>
             <parameter name="organizationPartyId"/>
             <parameter name="customerPartyId"/>
@@ -103,13 +108,18 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
     <service verb="release" noun="CreditHold" allow-remote="false">
-        <description>Release an order's credit hold with a reason: a CreditHoldDecision records the decision, who made it,
-            until when it stands (expireDate) and the exposure and limit it was made on; the Credit hold reason is released
-            (release#OrderHold), which approves the order when no other reason is open, and its CreditHoldRelease
-            notifications are marked read. Refuses an order without an open credit hold and a release without a reason.
+        <description>Release an order's credit hold (the part's, given orderPartSeqId) with a reason: a
+            CreditHoldDecision records the decision, who made it, until when it stands (expireDate; the credit check passes
+            the order while it does, and for good without one) and the exposure and limit it was made on; the Credit hold
+            reason is released (release#OrderHold), which returns the order to the status it had when no other reason is
+            open, and its CreditHoldRelease notifications are marked read. An order back in Placed then goes through
+            autoApprove#Order. Refuses an expireDate already past (EXPIRE_DATE_PAST). Refuses an order without an open credit
+            hold and a release without a reason.
             Needs CREDIT_HOLD_RELEASE in the order's organization.</description>
         <in-parameters>
             <parameter name="orderId" required="true"/>
+            <parameter name="orderPartSeqId"><description>The part whose hold is released, for an order held by
+                part.</description></parameter>
             <parameter name="reason" required="true"/>
             <parameter name="expireDate" type="Timestamp"/>
         </in-parameters>

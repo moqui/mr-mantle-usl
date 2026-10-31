@@ -162,10 +162,11 @@ feature("the job makes the periods due and records a failure with its reason and
             again,
             lateMade: rows("mantle.account.invoice.InvoiceScheduleOccurrence", {invoiceScheduleId: lateScheduleId}),
             failed,
-            recipients
+            recipients,
+            noticeCount: notices.length
         }
     },
-    then({ran, again, lateMade, failed, recipients}) {
+    then({ran, again, lateMade, failed, recipients, noticeCount}) {
         ran.generatedCount == 3
         ran.failedCount == 1
         again.generatedCount == 0
@@ -175,6 +176,68 @@ feature("the job makes the periods due and records a failure with its reason and
         failed.errorMessage.includes("TEMPLATE_EMPTY")
         failed.invoiceId == null
         recipients.some(row => row.userId == f.users.ar)
+        // failed again on the second run, still one notice for the period
+        again.failedCount == 1
+        noticeCount == 1
+        failed.attemptCount == 2
+    }
+})
+
+feature("a draft copies every template line but its calculated tax, a child under its parent, and no reference", {
+    when() {
+        login(f.users.ar)
+        const template = helper().draft(f, "100")
+        login("john.doe")
+        svc("update#mantle.account.invoice.Invoice", {invoiceId: template.invoiceId, referenceNumber: "PO-TEMPLATE"})
+        const parent = rows("mantle.account.invoice.InvoiceItem", {invoiceId: template.invoiceId})[0]
+        svc("create#mantle.account.invoice.InvoiceItem", {
+            invoiceId: template.invoiceId,
+            invoiceItemSeqId: "90",
+            parentItemSeqId: parent.invoiceItemSeqId,
+            itemTypeEnumId: "ItemDiscount",
+            quantity: 1,
+            amount: -10,
+            isAdjustment: "Y",
+            itemDate: stamp(-3),
+            description: "Loyalty discount"
+        })
+        svc("create#mantle.account.invoice.InvoiceItem", {
+            invoiceId: template.invoiceId,
+            invoiceItemSeqId: "91",
+            parentItemSeqId: parent.invoiceItemSeqId,
+            itemTypeEnumId: "ItemSalesTax",
+            quantity: 1,
+            amount: 6,
+            taxCalculated: "Y",
+            description: "Sales tax"
+        })
+        login(f.users.ar)
+        const scheduleId = recurring("store#Schedule", {
+            organizationPartyId: f.org,
+            templateInvoiceId: template.invoiceId,
+            intervalUomId: "TF_mon",
+            intervalQuantity: 1,
+            startDate: day(0)
+        }).invoiceScheduleId
+        const made = recurring("generate#Invoices", {invoiceScheduleId: scheduleId})
+        return {
+            parent,
+            invoice: one("mantle.account.invoice.Invoice", {invoiceId: made.invoiceId}),
+            lines: rows("mantle.account.invoice.InvoiceItem", {invoiceId: made.invoiceId})
+        }
+    },
+    then({parent, invoice, lines}) {
+        lines.length == 2
+        lines.some(
+            line =>
+                line.invoiceItemSeqId == "90" &&
+                line.parentItemSeqId == parent.invoiceItemSeqId &&
+                line.isAdjustment == "Y" &&
+                line.itemDate != null
+        )
+        !lines.some(line => line.itemTypeEnumId == "ItemSalesTax")
+        invoice.invoiceTotal.eq(90)
+        invoice.referenceNumber == null
     }
 })
 
@@ -251,13 +314,33 @@ feature("Mantle's aging view puts an invoice 121 days past due in its last bucke
             .condition("fromPartyId", f.org)
             .condition("toPartyId", f.customer)
             .condition("statusId", "in", ["InvoiceFinalized", "InvoiceSent"])
+            .selectField("periodRemaining")
+            .selectField("totalDue")
             .disableAuthz()
             .one()
-        return {found}
+        // a customer with a second role: the sums are not multiplied, and a filter by its role (Marble's Aging) finds
+        // them once
+        svc("create#mantle.party.PartyRole", {partyId: f.customer, roleTypeId: "Supplier"})
+        const sums = role => {
+            let query = ec.entity
+                .find("mantle.account.invoice.InvoiceAgingSummary")
+                .condition("fromPartyId", f.org)
+                .condition("toPartyId", f.customer)
+                .condition("statusId", "in", ["InvoiceFinalized", "InvoiceSent"])
+            if (role) query = query.condition("toRoleTypeId", role)
+            return query.selectField("totalDue").disableAuthz().list()
+        }
+        return {found, plain: sums(null), customer: sums("Customer"), supplier: sums("Supplier"), carrier: sums("Carrier")}
     },
-    then({found}) {
+    then({found, plain, customer, supplier, carrier}) {
         // 131 and 121 days past due today: 200 and 70 beyond the fourth period
         found.periodRemaining.eq(270)
         found.totalDue.eq(320)
+        plain.length == 1
+        plain[0].totalDue.eq(320)
+        customer.length == 1
+        customer[0].totalDue.eq(320)
+        supplier[0].totalDue.eq(320)
+        carrier.length == 0 || carrier[0].totalDue == null
     }
 })
