@@ -280,6 +280,7 @@ feature("readiness names the untied open items and blocks activation, which post
         r.row("SINGLE_CURRENCY").status == "ok"
         r.row("SINGLE_CURRENCY").message.includes("Single currency until base-currency posting")
         r.row("REMINDER_JOB").status == "ok"
+        r.row("POSTED_HISTORY").status == "ok"
         r.row("WIP_TRANSFER").status == "ok"
         r.row("BANK_METHODS").status == "warning"
         r.blocked.includes("SETUP_NOT_READY")

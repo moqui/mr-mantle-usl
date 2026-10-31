@@ -267,6 +267,7 @@ const labels = {
     TAX_METHOD: "Sales tax",
     BANK_METHODS: "Bank accounts",
     REMINDER_JOB: "Past due email job",
+    POSTED_HISTORY: "Entries already posted",
     OPENING_BALANCED: "Opening balances",
     OPEN_ITEM_TIE: "Open items against the opening balances"
 }
@@ -488,6 +489,33 @@ function readiness(p) {
                 return !job || job.paused === "Y"
                     ? ["ok", "Paused: dunning sends the payment reminders"]
                     : ["warning", "Pause the send_SalesInvoicePastDueEmails job; dunning sends the payment reminders"]
+            }
+        ],
+        [
+            "POSTED_HISTORY",
+            () => {
+                // entries posted other than the open items' and the opening entry: the opening balances add to them
+                const opening = run
+                    ? Array.from(find(INVOICE, {openingSetupRunId: run.setupRunId}).selectField("invoiceId").list()).map(
+                          row => row.invoiceId
+                      )
+                    : []
+                let query = find(TRANS, {organizationPartyId: org, isPosted: "Y"}).condition(
+                    "acctgTransTypeEnumId",
+                    "not-equals",
+                    "AttOpeningBalance"
+                )
+                if (opening.length)
+                    query = query.condition(
+                        ec.entity.conditionFactory.makeCondition([
+                            ec.entity.conditionFactory.makeCondition("invoiceId", "is-null", null),
+                            ec.entity.conditionFactory.makeCondition("invoiceId", "not-in", opening)
+                        ], "or")
+                    )
+                const count = query.count()
+                return count
+                    ? ["warning", count + " entries are posted already; the opening balances add to them"]
+                    : ["ok", "No entries posted before the opening balances"]
             }
         ],
         [

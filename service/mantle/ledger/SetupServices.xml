@@ -990,7 +990,8 @@ along with this software (see the LICENSE.md file). If not, see
             posting guard, the migration clearing, receivable and payable accounts, mappings to summary accounts and mapped
             accounts not in the chart, the inventory WIP and transfer accounts and costing basis, single currency until
             base-currency posting (open documents and active prices), the sales tax method, bank accounts, the paused past
-            due email job, balanced opening balances and the open items' tie-out. One check that fails is named and the
+            due email job, entries posted before the opening balances, balanced opening balances and the open items'
+            tie-out. One check that fails is named and the
             others go on. Refuses a user without finance administration.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>

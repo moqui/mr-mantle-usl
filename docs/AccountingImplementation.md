@@ -864,7 +864,8 @@ An organization's accounting is activated once, from a setup run (AC-01). `mantl
   the migration account, the AR and AP accounts, mappings naming a summary account (impl-accounting F71, F251) and
   mapped accounts not in the chart (F190, F250, F271), the inventory WIP and transfer accounts and costing basis, single
   currency (open documents, pending payments and active prices in another currency, D18), the sales tax gateway, a bank
-  account, the paused `send_SalesInvoicePastDueEmails` job, balanced lines and the open items' tie-out.
+  account, the paused `send_SalesInvoicePastDueEmails` job, entries already posted (which the opening balances add to),
+  balanced lines and the open items' tie-out.
   `get#Readiness` also answers `setupStatus` (unconfigured, inSetup, active or configured) for Home.
 - **`activate#Accounting`** locks the organization and the run, answers a retried operation key, answers an activated run
   with its transaction (posting nothing again), refuses a stale `runVersion` and any readiness blocker, then posts one
