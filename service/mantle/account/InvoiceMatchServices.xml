@@ -59,10 +59,14 @@ along with this software (see the LICENSE.md file). If not, see
     <service verb="apply" noun="InvoiceMatch" allow-remote="false">
         <description>Match a bill: each allocation is checked again under lock (the organization, the bill, then its order
             lines in order) and refused when its source does not allow it: an order line not the organization's from the
-            supplier or not approved, another product, a receipt not of the line (SOURCE_INVALID), quantity already billed
-            (ALREADY_BILLED), no accepted receipt on the received basis (MISSING_RECEIPT), or more than is left beyond the
-            quantity tolerance (QUANTITY_EXCESS). It writes or updates each billing link (OrderItemBilling) and gives a
-            receipt with no invoice the bill line, records the match and its lines with the snapshot and the policy row,
+            supplier, not approved or in another currency, another product, a receipt not of the line (SOURCE_INVALID),
+            quantity already billed (ALREADY_BILLED), no accepted receipt on the received basis (MISSING_RECEIPT), or
+            quantity beyond the tolerance (QUANTITY_EXCESS): what other bills billed of the order line (and of the
+            receipt), what this bill's earlier allocations take of it, and this allocation together may not pass the base
+            (accepted less held on the received basis, ordered on the ordered basis) plus the tolerance, the larger of the
+            policy's percent of the base and its fixed quantity. It writes or updates each billing link (OrderItemBilling);
+            a receipt with no invoice that the links now cover in full gets the bill line, as apply#InvoiceItemToOrder
+            does. It records the match and its lines with the snapshot, the policy row and every exception code,
             and for an exception that holds by its policy (price outside tolerance, quantity not matched, no source, no
             receipt where one is required) places the match exception hold, naming the rule. Refuses a cancelled or paid
             bill and a bill already matched (MATCH_EXISTS). Needs INVOICE_MATCH in the organization. The same operationKey
@@ -158,10 +162,12 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
     <service verb="reevaluate" noun="InvoiceMatch" authenticate="false" allow-remote="false">
-        <description>Evaluate one stale applied match again with the policy rows its lines applied: a source that no longer
-            allows its matched quantity is a source change. The result is recorded and the match is no longer stale; an
-            exception that holds places the match exception hold when none is open. A hold is never released here. For
-            run#MatchReevaluation, in its own transaction.</description>
+        <description>Evaluate one stale applied match again with the policy rows its lines applied, the bill locked before the
+            match: a source that no longer allows its matched quantity is a source change, which holds the bill. Another
+            exception that holds places the hold only when the match's lines did not record it, so a hold an approver
+            released for a recorded exception is not placed again; the new exceptions are recorded. A legacy match holds
+            only for a source change. The result is recorded and the match is no longer stale. A hold is never released
+            here. For run#MatchReevaluation, in its own transaction.</description>
         <in-parameters><parameter name="invoiceMatchId" required="true"/></in-parameters>
         <out-parameters>
             <parameter name="skipped" type="Boolean"/>
@@ -207,6 +213,8 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="fromDate" type="Timestamp"/>
             <parameter name="thruDate" type="Timestamp"/>
             <parameter name="limit" type="Integer"/>
+            <parameter name="afterInvoiceId">
+                <description>Continue after this bill (bills are taken in invoice order).</description></parameter>
         </in-parameters>
     </service>
     <service verb="preview" noun="LegacyMatches" allow-remote="false">
@@ -217,6 +225,7 @@ along with this software (see the LICENSE.md file). If not, see
         <implements service="mantle.account.InvoiceMatchServices.define#LegacyMatchParameters"/>
         <out-parameters>
             <parameter name="previewRows" type="List"/>
+            <parameter name="lastInvoiceId"/>
             <parameter name="linkCount" type="Integer"/>
             <parameter name="ambiguousCount" type="Integer"/>
             <parameter name="noEvidenceCount" type="Integer"/>
@@ -226,6 +235,7 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="module" value="component://mr-mantle/service/mantle/account/InvoiceMatch.js"/>
             <set field="previewed" from="ec.resource.script(module).execute('previewLegacy', context)"/>
             <set field="previewRows" from="previewed.previewRows"/>
+            <set field="lastInvoiceId" from="previewed.lastInvoiceId"/>
             <set field="linkCount" from="previewed.linkCount"/>
             <set field="ambiguousCount" from="previewed.ambiguousCount"/>
             <set field="noEvidenceCount" from="previewed.noEvidenceCount"/>
@@ -234,8 +244,11 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
     <service verb="apply" noun="LegacyMatches" allow-remote="false" transaction="ignore">
         <description>Link the bills from their evidence, each in its own transaction (apply#LegacyMatch): a legacy match
-            with a line for each link, and each ambiguous line as a match exception line; no hold is placed and no
-            unexplained balance is matched. A bill that fails is named and the others go on. Needs INVOICE_MATCH in the
+            with a line for each link and each ambiguous line as a match exception line, every line with the policy row in
+            effect; matched when every product line is linked in full, partly matched when a line has no evidence or a
+            quantity its evidence does not explain, an exception when a line is ambiguous. No hold is placed and no
+            unexplained balance is matched. A bill that fails is named and the others go on. Bills are read in invoice
+            order a batch at a time, matched ones left out, so a run goes on past them. Needs INVOICE_MATCH in the
             organization.</description>
         <implements service="mantle.account.InvoiceMatchServices.define#LegacyMatchParameters"/>
         <in-parameters><parameter name="invoiceIdList" type="List"/></in-parameters>
@@ -301,7 +314,11 @@ along with this software (see the LICENSE.md file). If not, see
         <description>Change an organization's match policy for its own row, a product category or a product: the row in
             effect for the same scope ends at fromDate (now by default) and the next starts there with the fields given
             and the others carried over (defaults: received basis, receipt required, no tolerance, hold); nothing changes
-            when nothing differs. A bill line already matched keeps the row it applied. Refuses both a product and a
+            when nothing differs. A bill line already matched keeps the row it applied. Which row applies to a bill line:
+            the product's row, else the row of a category the product is in (of several, the one that started last), else
+            the organization's row, else the defaults. selfBillingDefault is read only from the organization's row: a
+            supplier's SupplierProfile change takes it when no profile row of the supplier is in effect at the change's
+            date (store#SupplierProfile). Refuses both a product and a
             category, an unknown product, category, basis or action, a negative tolerance, a start before the row in
             effect and a start before a later row of the scope (POLICY_OVERLAP). Needs ACCOUNTING_ADMIN.</description>
         <in-parameters>

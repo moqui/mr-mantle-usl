@@ -48,6 +48,7 @@ function user(kind, permissions) {
 }
 // An approved purchase order of the product from a supplier.
 function purchase(vendorPartyId, quantity, unitAmount) {
+    login("john.doe")
     const order = svc("mantle.order.OrderServices.create#Order", {
         customerPartyId: org,
         vendorPartyId,
@@ -68,6 +69,7 @@ function purchase(vendorPartyId, quantity, unitAmount) {
 }
 // A delivery of the order's product, received with the quantity accepted; its receipt.
 function deliver(orderId, accepted) {
+    login("john.doe")
     const shipment = svc("mantle.shipment.ShipmentServices.create#OrderPartShipment", {
         orderId,
         orderPartSeqId: "01",
@@ -399,9 +401,20 @@ feature("the legacy backfill links unambiguous evidence and names an ambiguous l
         const linkedMatch = one("mantle.account.invoice.InvoiceMatch", {invoiceId: linked, statusId: "ImApplied"})
         const ambiguousMatch = one("mantle.account.invoice.InvoiceMatch", {invoiceId: ambiguous, statusId: "ImApplied"})
         const noneMatch = one("mantle.account.invoice.InvoiceMatch", {invoiceId: none, statusId: "ImApplied"})
-        return {preview, applied, linked, ambiguous, linkedMatch, ambiguousMatch, noneMatch}
+        // a legacy match evaluated again holds only for a source change, not for its ambiguous line
+        match("queue#MatchReevaluation", {invoiceId: ambiguous, staleReason: "Checked again"})
+        const rerun = match("run#MatchReevaluation", {})
+        // the bills are read in invoice order: one at a time, the next page goes on after the last
+        const firstPage = match("preview#LegacyMatches", {organizationPartyId: org, supplierPartyId: legacySupplier, limit: 1})
+        const next = match("preview#LegacyMatches", {
+            organizationPartyId: org,
+            supplierPartyId: legacySupplier,
+            limit: 1,
+            afterInvoiceId: firstPage.lastInvoiceId
+        })
+        return {preview, applied, linked, ambiguous, linkedMatch, ambiguousMatch, noneMatch, none, rerun, firstPage, next}
     },
-    then({preview, applied, linked, ambiguous, linkedMatch, ambiguousMatch, noneMatch}) {
+    then({preview, applied, linked, ambiguous, linkedMatch, ambiguousMatch, noneMatch, none, rerun, firstPage, next}) {
         preview.linkCount == 1
         preview.ambiguousCount == 1
         preview.noEvidenceCount == 1
@@ -412,13 +425,229 @@ feature("the legacy backfill links unambiguous evidence and names an ambiguous l
         applied.failedCount == 0
         applied.matchedCount == 2
         linkedMatch.isLegacy == "Y"
-        linkedMatch.resultEnumId == "ImrMatched"
+        linkedMatch.resultEnumId == "ImrPartial"
+        linkedMatch.resultText.includes("2 not explained")
         rows("mantle.account.invoice.InvoiceMatchLine", {invoiceMatchId: linkedMatch.invoiceMatchId}).length == 1
+        rows("mantle.account.invoice.InvoiceMatchLine", {invoiceMatchId: linkedMatch.invoiceMatchId})[0].invoiceMatchPolicyId ==
+            ids.policyId
         rows("mantle.order.OrderItemBilling", {invoiceId: linked})[0].quantity == 3
         ambiguousMatch.resultEnumId == "ImrException"
         rows("mantle.account.invoice.InvoiceMatchLine", {invoiceMatchId: ambiguousMatch.invoiceMatchId})[0].exceptionEnumId ==
             "MeAmbiguous"
         openHolds(ambiguous).length == 0
         noneMatch == null
+        rerun.resultList.some(row => row.invoiceId == ambiguous)
+        openHolds(ambiguous).length == 0
+        firstPage.lastInvoiceId == none
+        next.previewRows.length == 0
+    }
+})
+
+feature("one bill cannot bill the same source twice, across its lines or across receipts of one order line", {
+    when() {
+        // two lines of one bill against one order line of ten accepted: twenty is refused
+        const po = purchase(supplier, 10, 5)
+        const receipt = deliver(po.orderId, 10)
+        const twice = bill("MATCH-TWICE", 10, 5)
+        svc("mantle.account.InvoiceServices.create#InvoiceItem", {
+            invoiceId: twice,
+            itemTypeEnumId: "ItemInventory",
+            productId: product,
+            quantity: 10,
+            amount: 5
+        })
+        const [first, second] = rows("mantle.account.invoice.InvoiceItem", {invoiceId: twice}).map(row => row.invoiceItemSeqId)
+        login(users.matcher)
+        const proposal = match("evaluate#InvoiceMatch", {invoiceId: twice, orderId: po.orderId})
+        const doubled = refused("mantle.account.InvoiceMatchServices.apply#InvoiceMatch", {
+            invoiceId: twice,
+            allocationList: [allocation(po, receipt, 10, first), allocation(po, receipt, 10, second)]
+        })
+        // an order line of ten in two receipts of five, four already billed on the order line: eight is more than its six
+        const split = purchase(supplier, 10, 5)
+        const firstHalf = deliver(split.orderId, 5)
+        const secondHalf = deliver(split.orderId, 5)
+        const earlier = bill("MATCH-ORDERED", 4, 5)
+        svc("create#mantle.order.OrderItemBilling", {
+            orderId: split.orderId,
+            orderItemSeqId: split.orderItemSeqId,
+            invoiceId: earlier,
+            invoiceItemSeqId: lineSeq(earlier),
+            quantity: 4,
+            amount: 5
+        })
+        const both = bill("MATCH-BOTH", 8, 5)
+        login(users.matcher)
+        const overOrder = refused("mantle.account.InvoiceMatchServices.apply#InvoiceMatch", {
+            invoiceId: both,
+            allocationList: [allocation(split, firstHalf, 4, lineSeq(both)), allocation(split, secondHalf, 4, lineSeq(both))]
+        })
+        const bothProposal = match("evaluate#InvoiceMatch", {invoiceId: both, orderId: split.orderId})
+        return {proposal, doubled, overOrder, bothProposal, second}
+    },
+    then({proposal, doubled, overOrder, bothProposal, second}) {
+        proposal.sourceRows.length == 1
+        proposal.exceptionRows.some(row => row.invoiceItemSeqId == second && row.exceptionEnumId == "MeNoSource")
+        doubled.includes("ALREADY_BILLED")
+        overOrder.includes("QUANTITY_EXCESS")
+        bothProposal.sourceRows.reduce((sum, row) => sum.add(row.quantity), toDecimal(0)).compare(6) == 0
+    }
+})
+
+feature("an approver's release of a price hold stays released when the order line is touched again", {
+    when() {
+        const po = purchase(supplier, 10, 5)
+        const receipt = deliver(po.orderId, 10)
+        const priced = bill("MATCH-PRICED", 4, "6")
+        login(users.matcher)
+        const held = match("apply#InvoiceMatch", {
+            invoiceId: priced,
+            allocationList: [allocation(po, receipt, 4, lineSeq(priced))]
+        })
+        login(users.approver)
+        svc("mantle.account.InvoiceServices.release#InvoiceHold", {
+            invoiceHoldId: held.invoiceHoldId,
+            releaseComment: "Price agreed with the supplier"
+        })
+        // another bill takes the rest of the receipt, which now names it: a write of the receipt's invoice queues nothing
+        const rest = bill("MATCH-REST", 6, 5)
+        login(users.matcher)
+        match("apply#InvoiceMatch", {invoiceId: rest, allocationList: [allocation(po, receipt, 6, lineSeq(rest))]})
+        const stale = one("mantle.account.invoice.InvoiceMatch", {invoiceId: priced, statusId: "ImApplied"}).staleDate
+        const receiptInvoice = one("mantle.product.receipt.AssetReceipt", {assetReceiptId: receipt.assetReceiptId}).invoiceId
+        // evaluated again anyway, the recorded price variance places no new hold
+        match("queue#MatchReevaluation", {invoiceId: priced, staleReason: "Checked again"})
+        const ran = match("run#MatchReevaluation", {})
+        return {held, stale, receiptInvoice, rest, ran, priced}
+    },
+    then({held, stale, receiptInvoice, rest, ran, priced}) {
+        held.invoiceHoldId != null
+        stale == null
+        receiptInvoice == rest
+        ran.resultList.some(row => row.invoiceId == priced && !row.held)
+        openHolds(priced).length == 0
+    }
+})
+
+feature("two bills share a receipt; unapplying one leaves the receipt with the other, so its order does not bill it again", {
+    when() {
+        const po = purchase(supplier, 6, 5)
+        const receipt = deliver(po.orderId, 6)
+        const firstBill = bill("MATCH-SHARE-1", 3, 5)
+        const secondBill = bill("MATCH-SHARE-2", 3, 5)
+        login(users.matcher)
+        match("apply#InvoiceMatch", {invoiceId: firstBill, allocationList: [allocation(po, receipt, 3, lineSeq(firstBill))]})
+        const afterFirst = one("mantle.product.receipt.AssetReceipt", {assetReceiptId: receipt.assetReceiptId}).invoiceId
+        match("apply#InvoiceMatch", {invoiceId: secondBill, allocationList: [allocation(po, receipt, 3, lineSeq(secondBill))]})
+        const afterSecond = one("mantle.product.receipt.AssetReceipt", {assetReceiptId: receipt.assetReceiptId}).invoiceId
+        match("unapply#InvoiceMatch", {invoiceId: secondBill})
+        const afterUnapply = one("mantle.product.receipt.AssetReceipt", {assetReceiptId: receipt.assetReceiptId}).invoiceId
+        login(users.ap)
+        const rebill = refused("mantle.account.InvoiceServices.create#InvoiceFromSource", {
+            orderId: po.orderId,
+            organizationPartyId: org,
+            basis: "received",
+            shipmentId: receipt.shipmentId
+        })
+        return {afterFirst, afterSecond, afterUnapply, rebill, firstBill, secondBill}
+    },
+    then({afterFirst, afterSecond, afterUnapply, rebill, firstBill, secondBill}) {
+        afterFirst == null
+        afterSecond == secondBill
+        afterUnapply == firstBill
+        rebill.includes("SOURCE_ALREADY_INVOICED")
+    }
+})
+
+feature("a source in another currency is refused, and a failed re-evaluation is recorded and moved back", {
+    when() {
+        const order = svc("mantle.order.OrderServices.create#Order", {
+            customerPartyId: org,
+            vendorPartyId: supplier,
+            currencyUomId: "EUR",
+            facilityId: facility
+        })
+        const item = svc("mantle.order.OrderServices.add#OrderProductQuantity", {
+            orderId: order.orderId,
+            orderPartSeqId: order.orderPartSeqId,
+            productId: product,
+            quantity: 2,
+            unitAmount: 5,
+            itemTypeEnumId: "ItemInventory"
+        })
+        svc("mantle.order.OrderServices.place#Order", {orderId: order.orderId})
+        svc("mantle.order.OrderServices.approve#Order", {orderId: order.orderId})
+        const billId = bill("MATCH-EUR", 2, 5)
+        login(users.matcher)
+        const evaluated = match("evaluate#InvoiceMatch", {
+            invoiceId: billId,
+            allocationList: [allocation({orderId: order.orderId, orderItemSeqId: item.orderItemSeqId}, null, 2, lineSeq(billId))]
+        })
+        // a stale match recorded for the wrong organization fails; the job records it, moves it to the back and goes on
+        login("john.doe")
+        const broken = svc("create#mantle.account.invoice.InvoiceMatch", {
+            invoiceId: billId,
+            organizationPartyId: supplier,
+            statusId: "ImApplied",
+            staleDate: new Date(Number(ec.user.nowTimestamp) - 600000)
+        }).invoiceMatchId
+        const ran = match("run#MatchReevaluation", {})
+        const after = one("mantle.account.invoice.InvoiceMatch", {invoiceMatchId: broken})
+        svc("update#mantle.account.invoice.InvoiceMatch", {invoiceMatchId: broken, statusId: "ImUnapplied", staleDate: null})
+        return {evaluated, ran, after}
+    },
+    then({evaluated, ran, after}) {
+        evaluated.sourceRows[0].refusedReason == "SOURCE_INVALID"
+        evaluated.sourceRows[0].exceptionText.includes("EUR")
+        ran.failedCount == 1
+        after.staleReason.startsWith("Re-evaluation failed")
+        Number(after.staleDate) > Date.now() - 60000
+    }
+})
+
+feature("the quantity tolerance is a share of the source, across successive bills, as a percent or a fixed quantity", {
+    when() {
+        const tolerance = (fields, minutesAgo) => {
+            login(users.admin)
+            match(
+                "store#MatchPolicy",
+                Object.assign(
+                    {
+                        organizationPartyId: org,
+                        priceTolerancePercent: 2,
+                        fromDate: new Date(Number(ec.user.nowTimestamp) - minutesAgo * 60000),
+                        changeReason: "Quantity tolerance"
+                    },
+                    fields
+                )
+            )
+        }
+        const successive = quantities => {
+            const po = purchase(supplier, 10, 5)
+            const receipt = deliver(po.orderId, 10)
+            return quantities.map((quantity, index) => {
+                const billId = bill("MATCH-TOL-" + po.orderId + "-" + index, quantity, 5)
+                login(users.matcher)
+                return refused("mantle.account.InvoiceMatchServices.apply#InvoiceMatch", {
+                    invoiceId: billId,
+                    allocationList: [allocation(po, receipt, quantity, lineSeq(billId))]
+                })
+            })
+        }
+        // 10% of the ten accepted: eleven in all, never 10% of what is left
+        tolerance({quantityTolerancePercent: 10, quantityToleranceQuantity: 0}, 30)
+        const percent = successive([6, 5, 1])
+        // a fixed two: twelve in all
+        tolerance({quantityTolerancePercent: 0, quantityToleranceQuantity: 2}, 20)
+        const fixed = successive([10, 2, 1])
+        return {percent, fixed}
+    },
+    then({percent, fixed}) {
+        percent[0] == ""
+        percent[1] == ""
+        percent[2].includes("QUANTITY_EXCESS") || percent[2].includes("ALREADY_BILLED")
+        fixed[0] == ""
+        fixed[1] == ""
+        fixed[2].includes("QUANTITY_EXCESS") || fixed[2].includes("ALREADY_BILLED")
     }
 })

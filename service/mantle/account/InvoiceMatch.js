@@ -44,19 +44,23 @@ function bill(p, write = false) {
         invoiceId: scope.record.invoiceId,
         organizationPartyId: scope.organizationPartyId,
         supplierPartyId: scope.partyId,
-        currencyUomId: scope.record.currencyUomId
+        currencyUomId: scope.record.currencyUomId,
+        receivable: false
     }
 }
 // The same scope for the re-evaluation job, which has no user: the bill's own parties.
 function jobBill(invoiceId, organizationPartyId) {
     const record = find(I, {invoiceId}).forUpdate(true).one()
     if (!record) denied("INVOICE_UNAVAILABLE", "Invoice is not available")
+    if (record.toPartyId !== organizationPartyId)
+        denied("MATCH_SCOPE_INVALID", "Bill " + invoiceId + " is not a bill of organization " + organizationPartyId)
     return {
         record,
         invoiceId,
         organizationPartyId,
         supplierPartyId: record.fromPartyId === organizationPartyId ? record.toPartyId : record.fromPartyId,
-        currencyUomId: record.currencyUomId
+        currencyUomId: record.currencyUomId,
+        receivable: false
     }
 }
 
@@ -70,8 +74,8 @@ function inEffect(query, asOf) {
             cf.makeCondition([cf.makeCondition("thruDate", "is-null", null), cf.makeCondition("thruDate", "greater", asOf)], "or")
         )
 }
-// The policy row in effect for a product: its own row, else one of a category it is in, else the organization's row,
-// else the default.
+// The policy row in effect for a product: its own row, else the row of a category it is in (of several, the one that
+// started last), else the organization's row, else the default.
 function policyFor(organizationPartyId, productId, asOf = ec.user.nowTimestamp) {
     const candidates = Array.from(inEffect(find(P, {organizationPartyId}), asOf).orderBy("-fromDate").list())
     if (productId) {
@@ -128,6 +132,8 @@ function orderLine(scope, orderId, orderItemSeqId) {
     if (part.customerPartyId !== scope.organizationPartyId || part.vendorPartyId !== scope.supplierPartyId)
         denied("SOURCE_INVALID", "Order " + orderId + " is not this organization's order from the bill's supplier")
     if (!sourceOrderStates.includes(header.statusId)) denied("SOURCE_INVALID", "Order " + orderId + " is not approved")
+    if (header.currencyUomId && scope.currencyUomId && header.currencyUomId !== scope.currencyUomId)
+        denied("SOURCE_INVALID", "Order " + orderId + " is in " + header.currencyUomId + ", the bill in " + scope.currencyUomId)
     return item
 }
 // The receipts of an order line, with the part of each still in quarantine (held: open inspection, D21).
@@ -162,12 +168,27 @@ function billedByOthers(invoiceId, key) {
     )
 }
 
+// What this bill's allocations checked so far take of each order line and receipt, so two lines of one bill cannot
+// both bill the same source.
+function newTaken() {
+    return {order: {}, receipt: {}}
+}
+const orderKeyText = row => row.orderId + ":" + row.orderItemSeqId
+function takenOf(taken, kind, key) {
+    return taken[kind][key] || zero()
+}
+function takeSource(taken, row) {
+    const key = orderKeyText(row)
+    taken.order[key] = takenOf(taken, "order", key).add(row.quantity)
+    if (row.assetReceiptId) taken.receipt[row.assetReceiptId] = takenOf(taken, "receipt", row.assetReceiptId).add(row.quantity)
+}
+
 // ---- checks
 
 // One allocation of a bill line to an order line (and a receipt), checked against the sources as they are now under the
 // line's policy: the snapshot, the quantity the source still allows, a refusal when the quantity is beyond it, and the
 // exceptions (price, missing receipt, inspection hold).
-function checkAllocation(scope, line, allocation, policy) {
+function checkAllocation(scope, line, allocation, policy, taken = newTaken()) {
     const item = orderLine(scope, allocation.orderId, allocation.orderItemSeqId)
     if (line.productId && item.productId && line.productId !== item.productId)
         denied("SOURCE_INVALID", "Order line " + allocation.orderId + ":" + allocation.orderItemSeqId + " is another product")
@@ -176,38 +197,57 @@ function checkAllocation(scope, line, allocation, policy) {
     const held = receipts.reduce((sum, row) => sum.add(row.held), zero())
     const orderKey = {orderId: item.orderId, orderItemSeqId: item.orderItemSeqId}
     const priorBilled = billedByOthers(scope.invoiceId, orderKey)
+    const thisBill = takenOf(taken, "order", orderKeyText(orderKey))
     const orderQuantity = dec(item.quantity ?? 1)
     const basis = policy.billBasisEnumId || "ImbReceived"
-    let eligible = (basis === "ImbReceived" ? accepted.subtract(held) : orderQuantity).subtract(priorBilled)
+    // the tolerance is a share of the source's base (accepted less held, or ordered), not of what is left of it
+    const base = basis === "ImbReceived" ? accepted.subtract(held) : orderQuantity
+    const used = priorBilled.add(thisBill)
+    const quantity = dec(allocation.quantity)
+    const baseAllowance = allowance(base, policy.quantityTolerancePercent, policy.quantityToleranceQuantity)
+    let remaining = base.subtract(used)
+    let over = used.add(quantity).compare(base.add(baseAllowance)) > 0
+    let usedUp = used.compare(0) > 0 && used.compare(base) >= 0
     let receipt = null
     if (allocation.assetReceiptId) {
         receipt = receipts.find(row => row.assetReceiptId === allocation.assetReceiptId)
         if (!receipt) denied("SOURCE_INVALID", "Receipt " + allocation.assetReceiptId + " is not of this order line")
-        const receiptEligible = receipt.accepted
-            .subtract(receipt.held)
-            .subtract(billedByOthers(scope.invoiceId, {assetReceiptId: receipt.assetReceiptId}))
-        eligible = min(eligible, receiptEligible)
+        const receiptBase = receipt.accepted.subtract(receipt.held)
+        const receiptUsed = billedByOthers(scope.invoiceId, {assetReceiptId: receipt.assetReceiptId}).add(
+            takenOf(taken, "receipt", receipt.assetReceiptId)
+        )
+        const receiptAllowance = allowance(receiptBase, policy.quantityTolerancePercent, policy.quantityToleranceQuantity)
+        remaining = min(remaining, receiptBase.subtract(receiptUsed))
+        over = over || receiptUsed.add(quantity).compare(receiptBase.add(receiptAllowance)) > 0
+        usedUp = usedUp || (receiptUsed.compare(0) > 0 && receiptUsed.compare(receiptBase) >= 0)
     }
-    eligible = max(eligible, zero())
-    const quantity = dec(allocation.quantity)
-    const quantityAllowance = allowance(eligible, policy.quantityTolerancePercent, policy.quantityToleranceQuantity)
+    remaining = max(remaining, zero())
     let refusal = null
-    if (quantity.compare(eligible.add(quantityAllowance)) > 0) {
+    if (over) {
         const where =
             "order line " + item.orderId + ":" + item.orderItemSeqId + (receipt ? " receipt " + receipt.assetReceiptId : "")
-        if (eligible.isZero() && priorBilled.compare(0) > 0)
-            refusal = ["ALREADY_BILLED", "The " + where + " is already billed (" + text(priorBilled) + " on other bills)"]
-        else if (basis === "ImbReceived" && accepted.subtract(held).compare(0) <= 0)
+        if (usedUp && base.compare(0) > 0)
+            refusal = [
+                "ALREADY_BILLED",
+                "The " +
+                    where +
+                    " is already billed (" +
+                    text(priorBilled) +
+                    " on other bills" +
+                    (thisBill.isZero() ? "" : ", " + text(thisBill) + " on this bill") +
+                    ")"
+            ]
+        else if (basis === "ImbReceived" && base.compare(0) <= 0)
             refusal = ["MISSING_RECEIPT", "The " + where + " has no accepted receipt to bill"]
         else
             refusal = [
                 "QUANTITY_EXCESS",
                 text(quantity) +
                     " is more than the " +
-                    text(eligible) +
+                    text(remaining) +
                     " left to bill on the " +
                     where +
-                    (quantityAllowance.isZero() ? "" : " with the tolerance of " + text(quantityAllowance))
+                    (baseAllowance.isZero() ? "" : " with the tolerance of " + text(baseAllowance))
             ]
     }
     const exceptions = []
@@ -278,7 +318,7 @@ function checkAllocation(scope, line, allocation, policy) {
         acceptedQuantity: receipt ? receipt.accepted : accepted,
         heldQuantity: receipt ? receipt.held : held,
         priorBilledQuantity: priorBilled,
-        remainingQuantity: eligible,
+        remainingQuantity: remaining,
         priceVariance,
         billBasisEnumId: basis,
         invoiceMatchPolicyId: policy.invoiceMatchPolicyId,
@@ -326,19 +366,23 @@ function billLines(invoiceId) {
 // Allocations for a bill line with no applied match: its existing billing links (Mantle's, from the order or receipt it
 // was billed from), else the organization's approved order lines of the product from the supplier, oldest first, on the
 // policy's basis, up to the line's quantity.
-function propose(scope, line, policy, orderId) {
+function propose(scope, line, policy, orderId, taken = newTaken()) {
     const existing = Array.from(
         find(OIB, {invoiceId: scope.invoiceId, invoiceItemSeqId: line.invoiceItemSeqId})
             .condition("quantity", "greater", 0)
             .list()
     )
     if (existing.length)
-        return existing.map(row => ({
-            orderId: row.orderId,
-            orderItemSeqId: row.orderItemSeqId,
-            assetReceiptId: row.assetReceiptId,
-            quantity: dec(row.quantity)
-        }))
+        return existing.map(row => {
+            const allocation = {
+                orderId: row.orderId,
+                orderItemSeqId: row.orderItemSeqId,
+                assetReceiptId: row.assetReceiptId,
+                quantity: dec(row.quantity)
+            }
+            takeSource(taken, allocation)
+            return allocation
+        })
     if (!line.productId) return []
     let parts = find("mantle.order.OrderPart", {
         customerPartyId: scope.organizationPartyId,
@@ -352,9 +396,11 @@ function propose(scope, line, policy, orderId) {
             find("mantle.order.OrderHeader")
                 .condition("orderId", "in", orderIds)
                 .condition("statusId", "in", sourceOrderStates)
+                .condition("currencyUomId", scope.currencyUomId)
                 .list()
         ).map(row => row.orderId)
     )
+    if (!approved.size) return []
     const items = Array.from(
         find("mantle.order.OrderItem")
             .condition("orderId", "in", [...approved])
@@ -365,36 +411,36 @@ function propose(scope, line, policy, orderId) {
     )
     let remaining = dec(line.quantity ?? 1)
     const proposals = []
-    const take = (available, allocation) => {
+    const add = (available, allocation) => {
         const quantity = min(remaining, available)
-        if (quantity.compare(0) <= 0) return
-        proposals.push(Object.assign(allocation, {quantity}))
+        if (quantity.compare(0) <= 0) return zero()
+        const proposal = Object.assign(allocation, {quantity})
+        proposals.push(proposal)
+        takeSource(taken, proposal)
         remaining = remaining.subtract(quantity)
+        return quantity
     }
     for (const item of items) {
         if (remaining.compare(0) <= 0) break
         const orderKey = {orderId: item.orderId, orderItemSeqId: item.orderItemSeqId}
-        const priorBilled = billedByOthers(scope.invoiceId, orderKey)
+        const used = billedByOthers(scope.invoiceId, orderKey).add(takenOf(taken, "order", orderKeyText(orderKey)))
         if ((policy.billBasisEnumId || "ImbReceived") === "ImbReceived") {
-            let orderLeft = zero()
             const receipts = receiptsOf(item.orderId, item.orderItemSeqId).sort(
                 (a, b) => Number(a.receivedDate || 0) - Number(b.receivedDate || 0)
             )
-            for (const receipt of receipts) orderLeft = orderLeft.add(receipt.accepted).subtract(receipt.held)
-            orderLeft = orderLeft.subtract(priorBilled)
+            let orderLeft = receipts
+                .reduce((sum, receipt) => sum.add(receipt.accepted).subtract(receipt.held), zero())
+                .subtract(used)
             for (const receipt of receipts) {
                 if (remaining.compare(0) <= 0 || orderLeft.compare(0) <= 0) break
-                const left = min(
-                    orderLeft,
-                    receipt.accepted
-                        .subtract(receipt.held)
-                        .subtract(billedByOthers(scope.invoiceId, {assetReceiptId: receipt.assetReceiptId}))
-                )
-                const before = remaining
-                take(left, Object.assign({assetReceiptId: receipt.assetReceiptId}, orderKey))
-                orderLeft = orderLeft.subtract(before.subtract(remaining))
+                const receiptLeft = receipt.accepted
+                    .subtract(receipt.held)
+                    .subtract(billedByOthers(scope.invoiceId, {assetReceiptId: receipt.assetReceiptId}))
+                    .subtract(takenOf(taken, "receipt", receipt.assetReceiptId))
+                const allocation = Object.assign({assetReceiptId: receipt.assetReceiptId}, orderKey)
+                orderLeft = orderLeft.subtract(add(min(orderLeft, receiptLeft), allocation))
             }
-        } else take(dec(item.quantity ?? 1).subtract(priorBilled), Object.assign({assetReceiptId: null}, orderKey))
+        } else add(dec(item.quantity ?? 1).subtract(used), Object.assign({assetReceiptId: null}, orderKey))
     }
     return proposals
 }
@@ -416,6 +462,7 @@ function evaluateAllocations(scope, allocations, policyOf) {
     const sources = []
     const exceptions = []
     const lineRows = []
+    const taken = newTaken()
     let partial = false
     for (const line of lines) {
         const policy = policyOf(line)
@@ -423,7 +470,8 @@ function evaluateAllocations(scope, allocations, policyOf) {
         for (const allocation of byLine[line.invoiceItemSeqId] || []) {
             let checked
             try {
-                checked = checkAllocation(scope, line, allocation, policy)
+                checked = checkAllocation(scope, line, allocation, policy, taken)
+                if (!checked.refusal) takeSource(taken, checked)
             } catch (error) {
                 checked = {
                     orderId: allocation.orderId,
@@ -535,11 +583,12 @@ function evaluate(p) {
                 : policyFor(scope.organizationPartyId, line.productId)
     } else {
         policyOf = line => policyFor(scope.organizationPartyId, line.productId)
+        const proposalTaken = newTaken()
         allocations =
             Array.isArray(p.allocationList) && p.allocationList.length
                 ? Array.from(p.allocationList).map(row => Object.assign({}, row))
                 : billLines(scope.invoiceId).flatMap(line =>
-                      propose(scope, line, policyOf(line), p.orderId).map(row =>
+                      propose(scope, line, policyOf(line), p.orderId, proposalTaken).map(row =>
                           Object.assign({invoiceItemSeqId: line.invoiceItemSeqId}, row)
                       )
                   )
@@ -590,24 +639,14 @@ function evaluate(p) {
 
 // ---- apply and unapply
 
-// The match exception hold, placed by the match itself (from INVOICE_MATCH, or by the re-evaluation job with no user)
-// when none is open; an approver who did not place it releases it with release#InvoiceHold.
-function placeMatchHold(invoiceId, comment) {
-    const open = find("mantle.account.invoice.InvoiceHold", {invoiceId, holdReasonEnumId: "IhrMatchException"})
-        .condition("releasedDate", "is-null", null)
-        .one()
-    if (open) return {invoiceHoldId: open.invoiceHoldId, placed: false}
-    const created = call("create#mantle.account.invoice.InvoiceHold", {
-        invoiceId,
-        holdReasonEnumId: "IhrMatchException",
-        holdComment: String(comment).slice(0, 4000),
-        placedByUserId: ec.user.userId || null,
-        placedDate: ec.user.nowTimestamp
-    })
-    return {invoiceHoldId: created.invoiceHoldId, placed: true}
+// The match exception hold, through the shared hold creation (InvoiceWorkflowLib.placeHold) after the match's own
+// INVOICE_MATCH check, or by the re-evaluation job with no user; an open one is answered. An approver who did not place
+// it releases it with release#InvoiceHold.
+function placeMatchHold(scope, comment) {
+    return lib.placeHold(scope, "IhrMatchException", comment, {existingOk: true})
 }
 // A billing link for an allocation: the existing link of this bill line to the source is updated (its quantity before
-// kept), else one is created; a receipt with no invoice gets this bill line, as Mantle's apply#InvoiceItemToOrder sets it.
+// kept), else one is created.
 function writeLink(scope, line, source) {
     const key = {
         invoiceId: scope.invoiceId,
@@ -632,19 +671,35 @@ function writeLink(scope, line, source) {
                 amount: line.amount
             })
         )
-    let receiptLinked = "N"
-    if (source.assetReceiptId) {
-        const receipt = one("mantle.product.receipt.AssetReceipt", {assetReceiptId: source.assetReceiptId})
-        if (receipt && !receipt.invoiceId) {
-            call("update#mantle.product.receipt.AssetReceipt", {
-                assetReceiptId: source.assetReceiptId,
-                invoiceId: scope.invoiceId,
-                invoiceItemSeqId: line.invoiceItemSeqId
-            })
-            receiptLinked = "Y"
-        }
-    }
-    return {orderItemBillingId: link.orderItemBillingId, previousQuantity, receiptLinked}
+    return {orderItemBillingId: link.orderItemBillingId, previousQuantity}
+}
+// The billing links with a quantity of a receipt.
+function receiptLinks(assetReceiptId) {
+    return Array.from(find(OIB, {assetReceiptId}).condition("quantity", "greater", 0).orderBy("orderItemBillingId").list())
+}
+// A receipt with no invoice gets the bill line once the billing links with a quantity cover its accepted quantity, as
+// Mantle's apply#InvoiceItemToOrder sets it; Mantle's receipt billing then does not bill it again. Y when set here.
+function coverReceipt(assetReceiptId, invoiceId, invoiceItemSeqId) {
+    const receipt = find("mantle.product.receipt.AssetReceipt", {assetReceiptId}).forUpdate(true).one()
+    if (!receipt || receipt.invoiceId) return "N"
+    const linked = receiptLinks(assetReceiptId).reduce((sum, row) => sum.add(row.quantity ?? 0), zero())
+    if (linked.isZero() || linked.compare(dec(receipt.quantityAccepted)) < 0) return "N"
+    call("update#mantle.product.receipt.AssetReceipt", {assetReceiptId, invoiceId, invoiceItemSeqId})
+    return "Y"
+}
+// A receipt that names this bill, which no longer links it with a quantity, names another bill still linked to it, or
+// none once no link remains.
+function releaseReceipt(assetReceiptId, invoiceId) {
+    const receipt = find("mantle.product.receipt.AssetReceipt", {assetReceiptId}).forUpdate(true).one()
+    if (!receipt || receipt.invoiceId !== invoiceId) return
+    const links = receiptLinks(assetReceiptId)
+    if (links.some(row => row.invoiceId === invoiceId)) return
+    const other = links[0]
+    call("update#mantle.product.receipt.AssetReceipt", {
+        assetReceiptId,
+        invoiceId: other ? other.invoiceId : null,
+        invoiceItemSeqId: other ? other.invoiceItemSeqId : null
+    })
 }
 function lineValues(source) {
     const out = {}
@@ -668,6 +723,15 @@ function lineValues(source) {
     ])
         if (source[field] != null) out[field] = source[field]
     return out
+}
+// The exceptions of a source row as stored on its match line: the one that holds first, and every code.
+function exceptionValues(exceptions, text) {
+    const first = exceptions.find(row => row.holds) || exceptions[0]
+    return {
+        exceptionEnumId: first?.exceptionEnumId || null,
+        exceptionCodes: exceptions.length ? exceptions.map(row => row.exceptionEnumId).join(",") : null,
+        exceptionText: text || null
+    }
 }
 // apply#InvoiceMatch: the allocations re-checked under lock (the bill, then each order line in order), the billing
 // links written, the match and its lines recorded, and a hold placed for an exception that holds by its policy.
@@ -739,11 +803,8 @@ function apply(p) {
             .reduce((sum, row) => sum.add(row.quantity), zero())
         const policy = policyOf(line)
         const lineQuantity = dec(line.quantity ?? 1)
-        if (
-            allocated.compare(
-                lineQuantity.add(allowance(lineQuantity, policy.quantityTolerancePercent, policy.quantityToleranceQuantity))
-            ) > 0
-        )
+        const lineAllowance = allowance(lineQuantity, policy.quantityTolerancePercent, policy.quantityToleranceQuantity)
+        if (allocated.compare(lineQuantity.add(lineAllowance)) > 0)
             denied(
                 "QUANTITY_EXCESS",
                 text(allocated) + " is more than the " + text(lineQuantity) + " of line " + line.invoiceItemSeqId
@@ -763,27 +824,37 @@ function apply(p) {
     const invoiceMatchId = match.invoiceMatchId
     let seq = 0
     const nextSeq = () => String(++seq).padStart(5, "0")
-    for (const source of evaluated.sources) {
-        const link = writeLink(scope, lines[source.invoiceItemSeqId], source)
-        const exception = source.exceptions.find(row => row.holds) || source.exceptions[0]
-        call(
-            "create#" + L,
-            Object.assign(lineValues(source), link, {
-                invoiceMatchId,
-                invoiceMatchLineSeqId: nextSeq(),
-                invoiceId: scope.invoiceId,
-                currencyUomId: scope.currencyUomId,
-                exceptionEnumId: exception?.exceptionEnumId || null,
-                exceptionText: source.exceptionText || null
-            })
-        )
-    }
+    // the links first, then the receipts they cover, then the lines
+    const written = evaluated.sources.map(source => writeLink(scope, lines[source.invoiceItemSeqId], source))
     // a link of a matched line that the match leaves out is set to zero, kept on a line so unapply restores it
     const matchedKeys = new Set(evaluated.sources.map(row => row.key))
+    const zeroed = []
     for (const link of Array.from(find(OIB, {invoiceId: scope.invoiceId}).condition("quantity", "greater", 0).list())) {
         if (!evaluated.sources.some(row => row.invoiceItemSeqId === link.invoiceItemSeqId)) continue
         if (matchedKeys.has(sourceKey(link))) continue
         call("update#" + OIB, {orderItemBillingId: link.orderItemBillingId, quantity: 0})
+        zeroed.push(link)
+    }
+    const covered = {}
+    for (const link of zeroed) if (link.assetReceiptId) releaseReceipt(link.assetReceiptId, scope.invoiceId)
+    for (const source of evaluated.sources)
+        if (source.assetReceiptId && !(source.assetReceiptId in covered))
+            covered[source.assetReceiptId] = coverReceipt(source.assetReceiptId, scope.invoiceId, source.invoiceItemSeqId)
+    evaluated.sources.forEach((source, index) => {
+        const linkedHere = covered[source.assetReceiptId] === "Y"
+        if (linkedHere) covered[source.assetReceiptId] = "done"
+        call(
+            "create#" + L,
+            Object.assign(lineValues(source), written[index], exceptionValues(source.exceptions, source.exceptionText), {
+                invoiceMatchId,
+                invoiceMatchLineSeqId: nextSeq(),
+                invoiceId: scope.invoiceId,
+                currencyUomId: scope.currencyUomId,
+                receiptLinked: linkedHere ? "Y" : "N"
+            })
+        )
+    })
+    for (const link of zeroed)
         call("create#" + L, {
             invoiceMatchId,
             invoiceMatchLineSeqId: nextSeq(),
@@ -797,11 +868,8 @@ function apply(p) {
             previousQuantity: link.quantity,
             receiptLinked: "N"
         })
-    }
     // the bill lines' own exceptions (no source, unmatched quantity)
-    for (const exception of evaluated.exceptions.filter(row =>
-        ["MeNoSource", "MeQuantityVariance"].includes(row.exceptionEnumId)
-    ))
+    for (const exception of evaluated.exceptions.filter(row => lineExceptionCodes.includes(row.exceptionEnumId)))
         call("create#" + L, {
             invoiceMatchId,
             invoiceMatchLineSeqId: nextSeq(),
@@ -809,11 +877,12 @@ function apply(p) {
             invoiceItemSeqId: exception.invoiceItemSeqId,
             invoiceMatchPolicyId: policyOf(lines[exception.invoiceItemSeqId]).invoiceMatchPolicyId,
             exceptionEnumId: exception.exceptionEnumId,
+            exceptionCodes: exception.exceptionEnumId,
             exceptionText: exception.text
         })
     let invoiceHoldId = null
     const holding = evaluated.exceptions.filter(row => row.holds)
-    if (holding.length) invoiceHoldId = placeMatchHold(scope.invoiceId, holding.map(row => row.text).join("; ")).invoiceHoldId
+    if (holding.length) invoiceHoldId = placeMatchHold(scope, holding.map(row => row.text).join("; ")).invoiceHoldId
     // the receipt links written above queued this match; it is evaluated now
     call("update#" + M, {invoiceMatchId, invoiceHoldId, staleDate: null, staleReason: null})
     const result = {
@@ -826,21 +895,23 @@ function apply(p) {
     if (operation) lib.complete(operation, M, invoiceMatchId, result)
     return result
 }
+const lineExceptionCodes = ["MeNoSource", "MeQuantityVariance"]
 // Reverse a match's billing links: a link it created goes to zero (as Mantle's unapply#InvoiceItemFromOrder does), one it
-// updated gets its quantity back, and a receipt it gave this bill is cleared.
+// updated or zeroed gets its quantity back; then each receipt it touched names a bill still linked to it, or none, and
+// one that is covered again by a restored link names this bill.
 function reverseLinks(invoiceId, lines) {
+    const receipts = {}
     for (const line of lines) {
         if (line.orderItemBillingId)
             call("update#" + OIB, {orderItemBillingId: line.orderItemBillingId, quantity: line.previousQuantity ?? 0})
-        if (line.receiptLinked === "Y" && line.assetReceiptId) {
-            const receipt = one("mantle.product.receipt.AssetReceipt", {assetReceiptId: line.assetReceiptId})
-            if (receipt?.invoiceId === invoiceId && receipt.invoiceItemSeqId === line.invoiceItemSeqId)
-                call("update#mantle.product.receipt.AssetReceipt", {
-                    assetReceiptId: line.assetReceiptId,
-                    invoiceId: null,
-                    invoiceItemSeqId: null
-                })
+        if (line.assetReceiptId && line.orderItemBillingId) {
+            const restored = dec(line.previousQuantity).compare(0) > 0
+            if (!receipts[line.assetReceiptId] || restored) receipts[line.assetReceiptId] = restored ? line : null
         }
+    }
+    for (const [assetReceiptId, restored] of Object.entries(receipts)) {
+        releaseReceipt(assetReceiptId, invoiceId)
+        if (restored) coverReceipt(assetReceiptId, invoiceId, restored.invoiceItemSeqId)
     }
 }
 // unapply#InvoiceMatch: ends the bill's applied match and reverses its links. Its hold stays until an approver releases it.
@@ -864,12 +935,17 @@ function unapply(p) {
 
 // ---- re-evaluation
 
-// One stale match evaluated again against its sources with the policy rows its lines applied: the result recorded, the
-// staleness cleared and, for an exception that holds, a hold placed. A hold is never released here.
+// One stale match evaluated again against its sources with the policy rows its lines applied, the bill locked before the
+// match as apply and unapply lock them. A source that no longer allows its matched quantity is a source change, which
+// holds the bill; another exception holds it only when its lines did not record it already, so a hold an approver
+// released for an exception the match recorded is not placed again. A legacy match holds only for a source change. New
+// exceptions are recorded on the lines; the staleness is cleared. A hold is never released here.
 function reevaluate(p) {
+    const found = one(M, {invoiceMatchId: p.invoiceMatchId})
+    if (!found || found.statusId !== "ImApplied" || !found.staleDate) return {skipped: true}
+    const scope = jobBill(found.invoiceId, found.organizationPartyId)
     const match = find(M, {invoiceMatchId: p.invoiceMatchId}).forUpdate(true).one()
     if (!match || match.statusId !== "ImApplied" || !match.staleDate) return {skipped: true}
-    const scope = jobBill(match.invoiceId, match.organizationPartyId)
     const kept = matchLines(match.invoiceMatchId)
     const policyIds = {}
     for (const row of kept) policyIds[row.invoiceItemSeqId] = row.invoiceMatchPolicyId
@@ -881,29 +957,64 @@ function reevaluate(p) {
         call("update#" + M, {invoiceMatchId: match.invoiceMatchId, staleDate: null, evaluatedDate: ec.user.nowTimestamp})
         return {invoiceId: match.invoiceId, resultEnumId: match.resultEnumId, resultText: "The bill is closed; not evaluated"}
     }
-    const allocations = kept
-        .filter(row => row.orderId && dec(row.quantity).compare(0) > 0)
-        .map(row => ({
-            invoiceItemSeqId: row.invoiceItemSeqId,
-            orderId: row.orderId,
-            orderItemSeqId: row.orderItemSeqId,
-            assetReceiptId: row.assetReceiptId,
-            quantity: row.quantity
-        }))
+    const sourceLines = kept.filter(row => row.orderId && dec(row.quantity).compare(0) > 0)
+    const allocations = sourceLines.map(row => ({
+        invoiceItemSeqId: row.invoiceItemSeqId,
+        orderId: row.orderId,
+        orderItemSeqId: row.orderItemSeqId,
+        assetReceiptId: row.assetReceiptId,
+        quantity: row.quantity
+    }))
     const evaluated = evaluateAllocations(scope, allocations, policyOf)
-    // a source that no longer allows its matched quantity is a source change, which holds the bill
     const changed = evaluated.refused.map(row => ({
         exceptionEnumId: "MeSourceChanged",
         holds: true,
         text: "Source changed: " + row.refusal[1]
     }))
-    const holding = [...changed, ...evaluated.exceptions.filter(row => row.holds)]
+    const recorded = new Set()
+    for (const row of kept)
+        for (const code of [row.exceptionEnumId, ...String(row.exceptionCodes || "").split(",")].filter(Boolean))
+            recorded.add(row.invoiceItemSeqId + "|" + code)
+    const fresh = evaluated.exceptions.filter(row => !recorded.has(row.invoiceItemSeqId + "|" + row.exceptionEnumId))
+    const legacy = match.isLegacy === "Y"
+    const holding = [...changed, ...(legacy ? [] : fresh.filter(row => row.holds))]
     const resultEnumId = changed.length ? "ImrException" : evaluated.resultEnumId
-    const resultText = [resultNames[resultEnumId], ...holding.map(row => row.text)].join(". ")
+    const resultText = [resultNames[resultEnumId], ...changed.map(row => row.text), ...evaluated.exceptions.map(row => row.text)]
+        .filter(Boolean)
+        .join(". ")
+    // record the exceptions found now, so the next evaluation does not hold the bill for them again
+    for (const source of evaluated.sources) {
+        const line = sourceLines.find(row => sourceKey(row) === source.key)
+        const codes = source.exceptions
+            .map(row => row.exceptionEnumId)
+            .filter(code => !recorded.has(source.invoiceItemSeqId + "|" + code))
+        if (!line || !codes.length) continue
+        call("update#" + L, {
+            invoiceMatchId: line.invoiceMatchId,
+            invoiceMatchLineSeqId: line.invoiceMatchLineSeqId,
+            exceptionCodes: [
+                ...String(line.exceptionCodes || "")
+                    .split(",")
+                    .filter(Boolean),
+                ...codes
+            ].join(",")
+        })
+    }
+    let seq = kept.reduce((top, row) => Math.max(top, Number(row.invoiceMatchLineSeqId) || 0), 0)
+    for (const exception of fresh.filter(row => lineExceptionCodes.includes(row.exceptionEnumId)))
+        call("create#" + L, {
+            invoiceMatchId: match.invoiceMatchId,
+            invoiceMatchLineSeqId: String(++seq).padStart(5, "0"),
+            invoiceId: scope.invoiceId,
+            invoiceItemSeqId: exception.invoiceItemSeqId,
+            exceptionEnumId: exception.exceptionEnumId,
+            exceptionCodes: exception.exceptionEnumId,
+            exceptionText: exception.text
+        })
     let invoiceHoldId = match.invoiceHoldId
     let placed = false
     if (holding.length) {
-        const hold = placeMatchHold(scope.invoiceId, holding.map(row => row.text).join("; "))
+        const hold = placeMatchHold(scope, holding.map(row => row.text).join("; "))
         invoiceHoldId = hold.invoiceHoldId
         placed = hold.placed
     }
@@ -918,8 +1029,8 @@ function reevaluate(p) {
     })
     return {invoiceId: match.invoiceId, resultEnumId, resultText, held: placed}
 }
-// The job: the stale matches, oldest first, each evaluated in its own transaction; a failure is logged naming the bill
-// and the others go on.
+// The job: the stale matches, oldest first, each evaluated in its own transaction. A failure is logged naming the bill,
+// recorded on the match and its staleness moved to now, so the next run takes the others first and nothing starves.
 function run(p) {
     const limit = Math.max(1, Math.min(500, Number(p.limit) || 200))
     const stale = Array.from(
@@ -942,14 +1053,20 @@ function run(p) {
                 })
         } catch (error) {
             failedCount++
+            const message = String(error.message)
             ec.logger.error(
-                "Match re-evaluation of bill " + match.invoiceId + " (" + match.invoiceMatchId + ") failed: " + error.message
+                "Match re-evaluation of bill " + match.invoiceId + " (" + match.invoiceMatchId + ") failed: " + message
             )
-            resultList.push({
-                invoiceId: match.invoiceId,
-                invoiceMatchId: match.invoiceMatchId,
-                resultText: "Failed: " + error.message
-            })
+            try {
+                lib.probe("update#" + M, {
+                    invoiceMatchId: match.invoiceMatchId,
+                    staleDate: ec.user.nowTimestamp,
+                    staleReason: ("Re-evaluation failed: " + message).slice(0, 255)
+                })
+            } catch (recordError) {
+                ec.logger.error("Could not record the failure of match " + match.invoiceMatchId + ": " + recordError.message)
+            }
+            resultList.push({invoiceId: match.invoiceId, invoiceMatchId: match.invoiceMatchId, resultText: "Failed: " + message})
         }
     }
     return {evaluatedCount: resultList.length - failedCount, failedCount, resultList}
@@ -957,31 +1074,42 @@ function run(p) {
 
 // ---- legacy backfill
 
-// The organization's bills with no applied match, oldest first, from a supplier and a bill date range when given.
-function legacyBills(organizationPartyId, p, lock = false) {
-    let query = find(I, {toPartyId: organizationPartyId})
-        .condition("fromPartyId", "not-equals", organizationPartyId)
-        .condition("statusId", "not-equals", "InvoiceCancelled")
-        .condition("invoiceTypeEnumId", "not-equals", "InvoiceCreditMemo")
-    if (p.supplierPartyId) query = query.condition("fromPartyId", p.supplierPartyId)
-    if (p.fromDate) query = query.condition("invoiceDate", "greater-equals", p.fromDate)
-    if (p.thruDate) query = query.condition("invoiceDate", "less", p.thruDate)
-    if (p.invoiceIdList && Array.from(p.invoiceIdList).length)
-        query = query.condition("invoiceId", "in", Array.from(p.invoiceIdList))
-    const bills = Array.from(query.orderBy("invoiceDate,invoiceId").limit(500).list())
-    if (!bills.length) return []
-    const matched = new Set(
-        Array.from(
-            find(M, {statusId: "ImApplied"})
-                .condition(
-                    "invoiceId",
-                    "in",
-                    bills.map(row => row.invoiceId)
-                )
-                .list()
-        ).map(row => row.invoiceId)
-    )
-    return bills.filter(row => !matched.has(row.invoiceId)).slice(0, Math.max(1, Math.min(200, Number(p.limit) || 100)))
+// The organization's bills with no applied match, in invoice order after afterInvoiceId, from a supplier and a bill date
+// range when given. Bills are read a batch at a time and the matched ones left out, so a run goes on past them; at most
+// limit bills (100 by default) and 5000 read.
+function legacyBills(organizationPartyId, p) {
+    const wanted = Math.max(1, Math.min(200, Number(p.limit) || 100))
+    const out = []
+    let after = p.afterInvoiceId || null
+    for (let read = 0; out.length < wanted && read < 5000;) {
+        let query = find(I, {toPartyId: organizationPartyId})
+            .condition("fromPartyId", "not-equals", organizationPartyId)
+            .condition("statusId", "not-equals", "InvoiceCancelled")
+            .condition("invoiceTypeEnumId", "not-equals", "InvoiceCreditMemo")
+        if (p.supplierPartyId) query = query.condition("fromPartyId", p.supplierPartyId)
+        if (p.fromDate) query = query.condition("invoiceDate", "greater-equals", p.fromDate)
+        if (p.thruDate) query = query.condition("invoiceDate", "less", p.thruDate)
+        if (p.invoiceIdList && Array.from(p.invoiceIdList).length)
+            query = query.condition("invoiceId", "in", Array.from(p.invoiceIdList))
+        if (after) query = query.condition("invoiceId", "greater", after)
+        const batch = Array.from(query.orderBy("invoiceId").limit(500).list())
+        if (!batch.length) break
+        read += batch.length
+        after = batch[batch.length - 1].invoiceId
+        const matched = new Set(
+            Array.from(
+                find(M, {statusId: "ImApplied"})
+                    .condition(
+                        "invoiceId",
+                        "in",
+                        batch.map(row => row.invoiceId)
+                    )
+                    .list()
+            ).map(row => row.invoiceId)
+        )
+        for (const row of batch) if (!matched.has(row.invoiceId) && out.length < wanted) out.push(row)
+    }
+    return out
 }
 // The evidence of one bill line: its billing links, else its receipts. A link or receipt of another party, product or
 // line, receipts of more than one order line, or links over the line's quantity are ambiguous; a line with neither has no
@@ -1109,7 +1237,8 @@ function legacyScope(p) {
 function previewLegacy(p) {
     const organizationPartyId = legacyScope(p)
     const previewRows = []
-    for (const record of legacyBills(organizationPartyId, p)) {
+    const bills = legacyBills(organizationPartyId, p)
+    for (const record of bills) {
         const scope = {
             record,
             invoiceId: record.invoiceId,
@@ -1124,6 +1253,7 @@ function previewLegacy(p) {
     const count = result => previewRows.filter(row => row.result === result).length
     return {
         previewRows,
+        lastInvoiceId: bills.length ? bills[bills.length - 1].invoiceId : null,
         linkCount: count("link"),
         ambiguousCount: count("ambiguous"),
         noEvidenceCount: count("none"),
@@ -1140,10 +1270,21 @@ function applyLegacyBill(p) {
     const linkCount = evidence.reduce((sum, [, row]) => sum + (row.result === "link" ? row.links.length : 0), 0)
     const ambiguous = evidence.filter(([, row]) => row.result === "ambiguous")
     if (!linkCount && !ambiguous.length) return {invoiceId: scope.invoiceId, resultText: "No evidence; not linked", skipped: true}
-    const resultEnumId = ambiguous.length ? "ImrException" : "ImrMatched"
-    const resultText = ambiguous.length
-        ? "Exception. " + ambiguous.map(([line, row]) => "Line " + line.invoiceItemSeqId + ": " + row.text).join(". ")
-        : "Matched from existing billing and receipt evidence"
+    // matched only when every product line is linked in full; a line without evidence or a quantity the evidence does not
+    // explain leaves it partly matched, an ambiguous line makes it an exception
+    const open = evidence.filter(([, row]) => row.result === "none" || (row.result === "link" && row.unexplained.compare(0) > 0))
+    const resultEnumId = ambiguous.length ? "ImrException" : open.length ? "ImrPartial" : "ImrMatched"
+    const resultText = [
+        resultNames[resultEnumId],
+        ...ambiguous.map(([line, row]) => "Line " + line.invoiceItemSeqId + ": " + row.text),
+        ...open.map(
+            ([line, row]) =>
+                "Line " +
+                line.invoiceItemSeqId +
+                ": " +
+                (row.result === "none" ? row.text : text(row.unexplained) + " not explained")
+        )
+    ].join(". ")
     const match = call("create#" + M, {
         invoiceId: scope.invoiceId,
         organizationPartyId: scope.organizationPartyId,
@@ -1158,21 +1299,26 @@ function applyLegacyBill(p) {
     let seq = 0
     const nextSeq = () => String(++seq).padStart(5, "0")
     for (const [line, row] of evidence) {
+        const invoiceMatchPolicyId = policyFor(scope.organizationPartyId, line.productId).invoiceMatchPolicyId
         if (row.result === "ambiguous")
             call("create#" + L, {
                 invoiceMatchId: match.invoiceMatchId,
                 invoiceMatchLineSeqId: nextSeq(),
                 invoiceId: scope.invoiceId,
                 invoiceItemSeqId: line.invoiceItemSeqId,
+                invoiceMatchPolicyId,
                 exceptionEnumId: "MeAmbiguous",
+                exceptionCodes: "MeAmbiguous",
                 exceptionText: row.text
             })
         if (row.result !== "link") continue
         for (const link of row.links) {
-            let written
-            if (link.orderItemBillingId)
-                written = {orderItemBillingId: link.orderItemBillingId, previousQuantity: link.quantity, receiptLinked: "N"}
-            else written = writeLink(scope, line, link)
+            const written = link.orderItemBillingId
+                ? {orderItemBillingId: link.orderItemBillingId, previousQuantity: link.quantity}
+                : writeLink(scope, line, link)
+            const receiptLinked = link.assetReceiptId
+                ? coverReceipt(link.assetReceiptId, scope.invoiceId, line.invoiceItemSeqId)
+                : "N"
             call("create#" + L, {
                 invoiceMatchId: match.invoiceMatchId,
                 invoiceMatchLineSeqId: nextSeq(),
@@ -1186,9 +1332,10 @@ function applyLegacyBill(p) {
                 invoiceQuantity: line.quantity,
                 invoiceUnitAmount: line.amount,
                 currencyUomId: scope.currencyUomId,
+                invoiceMatchPolicyId,
                 orderItemBillingId: written.orderItemBillingId,
                 previousQuantity: written.previousQuantity,
-                receiptLinked: written.receiptLinked
+                receiptLinked
             })
         }
     }
