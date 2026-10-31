@@ -48,6 +48,7 @@ function capabilities() {
         holdRelease: has("INVOICE_HOLD_RELEASE"),
         payableImport: has("PAYABLE_IMPORT"),
         supplierTermsEdit: has("SUPPLIER_TERMS_EDIT"),
+        returnCreditApprove: has("RETURN_CREDIT_APPROVE"),
         fiscalClose: has("FISCAL_CLOSE"),
         fiscalReopen: has("FISCAL_REOPEN"),
         creditView: has("CUSTOMER_CREDIT_VIEW"),
