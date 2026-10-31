@@ -1640,6 +1640,19 @@ along with this software (see the LICENSE.md file). If not, see
     <mantle.ledger.account.GlAccountOrganization glAccountId="850000000" organizationPartyId="DefaultSettings"/>
     <mantle.ledger.account.GlAccountOrganization glAccountId="864000000" organizationPartyId="DefaultSettings"/>
     <mantle.ledger.account.GlAccountOrganization glAccountId="865000000" organizationPartyId="DefaultSettings"/>
+    <!-- the fixed asset accounts the AssetTypeGlAccount defaults below name: unreceived, accumulated depreciation and
+        depreciation expense, so the posting guard takes a fixed asset's receipt and depreciation (impl-accounting F250) -->
+    <mantle.ledger.account.GlAccountOrganization glAccountId="139100000" organizationPartyId="DefaultSettings"/>
+    <mantle.ledger.account.GlAccountOrganization glAccountId="139200000" organizationPartyId="DefaultSettings"/>
+    <mantle.ledger.account.GlAccountOrganization glAccountId="139300000" organizationPartyId="DefaultSettings"/>
+    <mantle.ledger.account.GlAccountOrganization glAccountId="181000000" organizationPartyId="DefaultSettings"/>
+    <mantle.ledger.account.GlAccountOrganization glAccountId="181800000" organizationPartyId="DefaultSettings"/>
+    <mantle.ledger.account.GlAccountOrganization glAccountId="182000000" organizationPartyId="DefaultSettings"/>
+    <mantle.ledger.account.GlAccountOrganization glAccountId="183500000" organizationPartyId="DefaultSettings"/>
+    <mantle.ledger.account.GlAccountOrganization glAccountId="671000000" organizationPartyId="DefaultSettings"/>
+    <mantle.ledger.account.GlAccountOrganization glAccountId="671800000" organizationPartyId="DefaultSettings"/>
+    <mantle.ledger.account.GlAccountOrganization glAccountId="672000000" organizationPartyId="DefaultSettings"/>
+    <mantle.ledger.account.GlAccountOrganization glAccountId="673500000" organizationPartyId="DefaultSettings"/>
 
     <mantle.ledger.config.GlAccountTypeDefault glAccountId="121000000" glAccountTypeEnumId="GatAccountsReceivable" organizationPartyId="DefaultSettings"/>
     <mantle.ledger.config.GlAccountTypeDefault glAccountId="121500000" glAccountTypeEnumId="GatInterestIncomeRec" organizationPartyId="DefaultSettings"/>
