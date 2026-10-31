@@ -116,6 +116,7 @@ feature("AR issues an invoice's capability in its organization; AP, another orga
     },
     then({issued, row, draftRefused, scopeRefused, apRefused, otherRefused, check}) {
         issued.token.length == 48
+        issued.url == "https://billing.portal.example.test/billing/InvoicePay?token=" + issued.token
         row.tokenDigest != issued.token
         row.organizationPartyId == f.org
         row.partyId == f.customer
@@ -126,6 +127,37 @@ feature("AR issues an invoice's capability in its organization; AP, another orga
         otherRefused.includes("ORGANIZATION_DENIED")
         check.valid == true
         check.recordType == "Invoice"
+    }
+})
+
+feature("AP issues a purchase order's bill link for its supplier, listed and revoked without its token; AR cannot", {
+    when() {
+        const c = settlement().call
+        c("create#mantle.party.Party", {partyId: "ACCT_PORTAL_SUPPLIER", partyTypeEnumId: "PtyOrganization"})
+        c("create#mantle.order.OrderHeader", {orderId: "ACCT_PORTAL_PO", statusId: "OrderApproved", currencyUomId: "USD"})
+        c("create#mantle.order.OrderPart", {
+            orderId: "ACCT_PORTAL_PO",
+            orderPartSeqId: "01",
+            vendorPartyId: "ACCT_PORTAL_SUPPLIER",
+            customerPartyId: f.org
+        })
+        login(f.users.ap)
+        const issued = access("create#AccessCapability", {recordType: "Order", recordId: "ACCT_PORTAL_PO", scopes: "BillUpload"})
+        const listed = access("find#AccessCapabilities", {recordType: "Order", recordId: "ACCT_PORTAL_PO"}).capabilityList
+        access("revoke#AccessCapability", {capabilityId: issued.capabilityId})
+        const after = access("find#AccessCapabilities", {recordType: "Order", recordId: "ACCT_PORTAL_PO"}).capabilityList
+        login(f.users.ar)
+        const arRefused = rejected("create#AccessCapability", {recordType: "Order", recordId: "ACCT_PORTAL_PO", scopes: "BillUpload"})
+        return {issued, listed, after, arRefused}
+    },
+    then({issued, listed, after, arRefused}) {
+        issued.url == "https://billing.portal.example.test/supplier/BillUpload?token=" + issued.token
+        listed.length == 1
+        listed[0].active == true
+        listed[0].token === undefined
+        listed[0].scopes == "BillUpload"
+        after[0].active == false
+        arRefused.includes("PERMISSION_DENIED")
     }
 })
 

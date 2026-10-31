@@ -31,6 +31,8 @@ along with this software (see the LICENSE.md file). If not, see
         <out-parameters>
             <parameter name="capabilityId"/>
             <parameter name="token"/>
+            <parameter name="url"><description>The record's page with the token on the organization's first published
+                site with its app (Billing's InvoicePay, Supplier's BillUpload); empty without one.</description></parameter>
             <parameter name="thruDate" type="Timestamp"/>
         </out-parameters>
         <actions>
@@ -40,6 +42,7 @@ along with this software (see the LICENSE.md file). If not, see
                 validDays:validDays, thruDate:thruDate})"/>
             <set field="capabilityId" from="created.capabilityId"/>
             <set field="token" from="created.token"/>
+            <set field="url" from="created.url"/>
             <set field="thruDate" from="created.thruDate"/>
         </actions>
     </service>

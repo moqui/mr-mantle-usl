@@ -15,6 +15,7 @@ const records = {
     Invoice: {
         permission: "RECEIVABLE_EDIT",
         scopes: ["InvoicePay"],
+        page: {app: "billing", path: "/InvoicePay?token="},
         resolve(recordId) {
             const invoice = one("mantle.account.invoice.Invoice", {invoiceId: recordId})
             if (!invoice || !issuedInvoice.includes(invoice.statusId) || !internal(invoice.fromPartyId)) return null
@@ -25,6 +26,7 @@ const records = {
     Order: {
         permission: "PAYABLE_EDIT",
         scopes: ["BillUpload", "OrderAcknowledgement"],
+        page: {app: "supplier", path: "/BillUpload?token="},
         resolve(recordId) {
             const order = one("mantle.order.OrderHeader", {orderId: recordId})
             if (!order || closedOrder.includes(order.statusId)) return null
@@ -88,7 +90,11 @@ function create(p) {
         thruDate,
         createdByUserId: ec.user.userId
     })
-    return {capabilityId: out.capabilityId, token, thruDate, organizationPartyId: record.organizationPartyId}
+    // the link: the record's page of the organization's first published site with the app
+    const apps = ec.resource.script("component://mr-mantle/service/mantle/public/PublicApps.js")
+    const siteId = apps.sitesFor(kind.page.app, record.organizationPartyId)[0]
+    const url = siteId ? apps.pageUrl(siteId, kind.page.app, kind.page.path + encodeURIComponent(token)) : null
+    return {capabilityId: out.capabilityId, token, url, thruDate, organizationPartyId: record.organizationPartyId}
 }
 // Where a failed token lookup comes from: a registered PASS deployment forwards its browser's address.
 function requesterKey() {
