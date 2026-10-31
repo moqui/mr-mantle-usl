@@ -40,12 +40,17 @@ const mappingFields = [
     "issuanceTransTypeEnumId"
 ]
 const reversibleTypes = ["AbeCapitalize", "AbeAdjust", "AbeDispose"]
+// the events that decide which one is the latest: an acquire cost repair after an event keeps it from being reversed
+const latestTypes = [...reversibleTypes, "AbeCostRepair"]
 
 const today = () => ec.l10n.format(ec.user.nowTimestamp, "yyyy-MM-dd")
 // A book day's timestamp: noon in the user's zone, so its day is the same in every zone near it.
 const stamp = day => ec.l10n.parseTimestamp(day + " 12:00:00", "yyyy-MM-dd HH:mm:ss")
 const dayOf = value => (value == null || value === "" ? today() : lib.calendarDateText(value))
 const stampDay = value => (value == null || value === "" ? null : lib.bookDay(null, value))
+// The start of a moment's day in the user's zone: class versions change by day, so one added this afternoon applies to an
+// asset in service today.
+const dayStart = value => ec.l10n.parseTimestamp(lib.bookDay(null, value) + " 00:00:00", "yyyy-MM-dd HH:mm:ss")
 const enumText = enumId => (enumId ? one("moqui.basic.Enumeration", {enumId})?.description || enumId : "")
 const decimal = value => toDecimal(value ?? 0)
 const negate = value => toDecimal(0).subtract(value)
@@ -82,9 +87,8 @@ function closedPeriods(org, day) {
         )
     )
 }
-// A book day (yyyy-MM-dd) in an open period: refused in a closed one.
-function openDay(org, value) {
-    const day = dayOf(value)
+// Refused when the book day (yyyy-MM-dd) is in a closed fiscal period.
+function checkOpen(org, day) {
     const closed = closedPeriods(org, day)
     if (closed.length) denied("PERIOD_CLOSED", "The fiscal period of " + day + " (" + closed[0].periodName + ") is closed")
     return day
@@ -159,6 +163,8 @@ function postBook(org, type, day, asset, lines, description) {
         assetId: asset.assetId,
         description
     })
+    // the book day is the posting's accounting day, whatever the user's zone
+    call("update#" + TRANS, {acctgTransId: tx.acctgTransId, accountingDate: day})
     for (const entry of lines) {
         if (entry.amount.isZero()) continue
         call("mantle.ledger.LedgerServices.create#AcctgTransEntry", {
@@ -246,7 +252,7 @@ function storeClass(p) {
         denied("CLASS_UNAVAILABLE", "The asset class is not available")
     // only an end date: end the version
     if (replaced && p.usefulLifeYears == null) {
-        const end = p.thruDate || ec.user.nowTimestamp
+        const end = dayStart(p.thruDate || ec.user.nowTimestamp)
         if (ms(end) <= ms(replaced.fromDate)) denied("CLASS_DATES_INVALID", "A version must end after it starts")
         lib.audit(["thruDate"], why)
         call("update#" + CLASS, {fixedAssetClassId: replaced.fixedAssetClassId, thruDate: end})
@@ -276,8 +282,8 @@ function storeClass(p) {
         accounts[field] = p[field] || replaced?.[field] || null
         if (accounts[field]) lib.account(org, accounts[field])
     }
-    const fromDate = p.fromDate || ec.user.nowTimestamp,
-        thruDate = p.thruDate || null
+    const fromDate = dayStart(p.fromDate || ec.user.nowTimestamp),
+        thruDate = p.thruDate ? dayStart(p.thruDate) : null
     if (thruDate && ms(thruDate) <= ms(fromDate)) denied("CLASS_DATES_INVALID", "A version must end after it starts")
     if (replaced && ms(fromDate) <= ms(replaced.fromDate))
         denied("CLASS_DATES_INVALID", "A new version starts after the one it replaces")
@@ -317,7 +323,7 @@ function storeClass(p) {
 
 function capitalize(p) {
     const {asset, org} = assetScope(p.assetId, "glPost", true)
-    const day = openDay(org, p.inServiceDate)
+    const day = dayOf(p.inServiceDate)
     const why = String(p.changeReason || "").trim() || "Capitalized"
     const request = {day, why}
     for (const field of [
@@ -332,11 +338,13 @@ function capitalize(p) {
         "accDepreciationGlAccountId",
         "depreciationGlAccountId",
         "sourceInvoiceId",
-        "sourceAssetReceiptId"
+        "sourceAssetReceiptId",
+        "offsetGlAccountId"
     ])
         request[field] = p[field] == null || p[field] === "" ? null : String(p[field])
     const op = lib.lib.operation(p, "AssetCapitalize", org, request)
     if (op.old) return lib.lib.previous(op)
+    checkOpen(org, day)
     if (capitalization(asset.assetId)) denied("ALREADY_CAPITALIZED", "The asset is already on the books")
     if (asset.actualEndOfLife) denied("ASSET_DISPOSED", "The asset was disposed")
     const currency = lib.preference(org).baseCurrencyUomId
@@ -351,10 +359,15 @@ function capitalize(p) {
         denied("SOURCE_INVALID", "Choose a receipt of this asset")
     if (p.sourceInvoiceId && one("mantle.account.invoice.Invoice", {invoiceId: p.sourceInvoiceId})?.toPartyId !== org)
         denied("SOURCE_INVALID", "Choose a bill the organization received")
-    const receiptTrans = receipts
-        .map(r => find(TRANS, {assetReceiptId: r.assetReceiptId, isPosted: "Y"}).one())
-        .filter(Boolean)
-    const received = receiptTrans.length > 0
+    // any receipt makes the asset received: its cost is on the books once the receipt posts, never from Unreceived
+    const receiptTrans = receipts.map(r => {
+        const tx = find(TRANS, {assetReceiptId: r.assetReceiptId}).orderBy("acctgTransId").one()
+        if (tx?.isPosted !== "Y")
+            denied("RECEIPT_NOT_POSTED", "Receipt " + r.assetReceiptId + " of this asset has not posted; post the receipt first")
+        return tx
+    })
+    const received = receipts.length > 0
+    if (received && p.offsetGlAccountId) denied("OFFSET_FROM_RECEIPT", "A received asset's cost came from its receipt")
     // a received asset's cost is on the books from its receipt; another is capitalized at the cost given
     let cost
     if (received) {
@@ -389,7 +402,8 @@ function capitalize(p) {
     if (!received) {
         // the cost from the clearing account a fixed asset bill debits (Unreceived Fixed Asset)
         lines.push(line(accounts.assetGlAccountId, cost))
-        lines.push(line(postingAccount(org, base.receiptGlAccountId, "unreceived fixed asset"), negate(cost)))
+        const offset = p.offsetGlAccountId || base.receiptGlAccountId
+        lines.push(line(postingAccount(org, offset, "unreceived fixed asset"), negate(cost)))
     } else {
         // the receipt debited its type's asset account: reclassify to the class's when they differ
         const receiptAccount = rows("mantle.ledger.transaction.AcctgTransEntry", {
@@ -444,6 +458,26 @@ function checkNotDepreciatedAfter(assetId, day) {
     if (later)
         denied("DEPRECIATED_AFTER", "Depreciation is posted for " + later.fromDay + " on; date the change in that period or after")
 }
+// Refused while a fiscal month of the organization from the asset's in-service day through the month before the disposal
+// has no depreciation and the asset is not fully depreciated: depreciate those months first.
+function checkDepreciationDue(asset, org, day) {
+    if (!asset.depreciationTypeEnumId || !asset.acquiredDate) return
+    const depreciable = decimal(asset.acquireCost).subtract(decimal(asset.salvageValue))
+    if (decimal(asset.depreciation).compare(depreciable) >= 0) return
+    const inService = stampDay(asset.acquiredDate)
+    const months = Array.from(
+        find(PERIOD, {partyId: org, timePeriodTypeId: "FiscalMonth"})
+            .condition("thruDate", "greater-equals", inService)
+            .condition("thruDate", "less", day)
+            .list()
+    ).filter(m => lib.calendarDateText(m.thruDate) < day)
+    const missing = months.filter(m => !one(DEPRECIATION, {assetId: asset.assetId, timePeriodId: m.timePeriodId}))
+    if (missing.length)
+        denied(
+            "DEPRECIATION_DUE",
+            "Depreciate " + missing.map(m => m.periodName || m.timePeriodId).join(", ") + " before disposing of the asset"
+        )
+}
 function bookedAsset(p, need = "glPost") {
     const scoped = assetScope(p.assetId, need, true)
     if (!capitalization(scoped.asset.assetId)) denied("NOT_CAPITALIZED", "Capitalize the asset first")
@@ -453,17 +487,19 @@ function bookedAsset(p, need = "glPost") {
 
 function adjust(p) {
     const {asset, org} = assetScope(p.assetId, "glPost", true)
-    const day = openDay(org, p.effectiveDate)
-    const why = lib.reason(p)
+    const day = dayOf(p.effectiveDate)
     const op = lib.lib.operation(p, "AssetBookAdjust", org, {
         assetId: asset.assetId,
         day,
         costChange: String(p.costChange ?? ""),
         usefulLifeChange: String(p.usefulLifeChange ?? ""),
         salvageChange: String(p.salvageChange ?? ""),
-        why
+        offset: p.offsetGlAccountId || null,
+        why: String(p.changeReason || "").trim()
     })
     if (op.old) return lib.lib.previous(op)
+    checkOpen(org, day)
+    const why = lib.reason(p)
     bookedAsset(p)
     const currency = lib.preference(org).baseCurrencyUomId
     const costChange = lib.lib.money(p.costChange, currency),
@@ -485,11 +521,17 @@ function adjust(p) {
         : lib.calendarDateText(asset.expectedEndOfLife)
     if (newEnd <= day) denied("LIFE_INVALID", "The useful life ends after the change's day")
     const mapping = mappingOf(asset)
+    // a received asset's change of cost comes from an account the user names (a bill's, an expense); another's from the
+    // Unreceived Fixed Asset clearing account its capitalization used, unless one is named
+    const received = rows("mantle.product.receipt.AssetReceipt", {assetId: asset.assetId}).length > 0
+    const offset = p.offsetGlAccountId || (received ? null : mapping.receiptGlAccountId)
+    if (!costChange.isZero() && !offset)
+        denied("OFFSET_REQUIRED", "Choose the account the change of a received asset's cost comes from")
     let acctgTransId = null
     if (!costChange.isZero())
         acctgTransId = postBook(org, "AttAssetBookAdjust", day, asset, [
             line(postingAccount(org, mapping.assetGlAccountId, "asset"), costChange),
-            line(postingAccount(org, mapping.receiptGlAccountId, "unreceived fixed asset"), negate(costChange))
+            line(postingAccount(org, offset, "offset"), negate(costChange))
         ], why)
     const before = bookOf(asset)
     lib.audit(["acquireCost", "salvageValue"], why)
@@ -502,7 +544,7 @@ function adjust(p) {
         newUnitCost: newCost,
         acctgTransId,
         assetGlAccountId: acctgTransId ? mapping.assetGlAccountId : null,
-        offsetGlAccountId: acctgTransId ? mapping.receiptGlAccountId : null,
+        offsetGlAccountId: acctgTransId ? offset : null,
         operationKey: op.operationKey,
         changeReason: why,
         bookBeforeJson: JSON.stringify(before),
@@ -518,23 +560,27 @@ function adjust(p) {
 // itself (an ItemAsset line) posts that sale with the invoice, so it is not disposed here.
 function dispose(p) {
     const {asset, org} = assetScope(p.assetId, "glPost", true)
-    const day = openDay(org, p.disposalDate)
-    const why = lib.reason(p)
+    const day = dayOf(p.disposalDate)
     const sale = p.disposalTypeEnumId === "AdtSale"
-    if (!["AdtSale", "AdtScrap"].includes(p.disposalTypeEnumId)) denied("DISPOSAL_TYPE_REQUIRED", "Choose scrap or sale")
     const op = lib.lib.operation(p, "AssetDispose", org, {
         assetId: asset.assetId,
         day,
-        type: p.disposalTypeEnumId,
+        type: p.disposalTypeEnumId || null,
         proceeds: String(p.proceedsAmount ?? ""),
         buyer: p.buyerPartyId || null,
         invoice: p.salesInvoiceId || null,
-        why
+        why: String(p.changeReason || "").trim()
     })
     if (op.old) return lib.lib.previous(op)
+    checkOpen(org, day)
+    const why = lib.reason(p)
+    if (!["AdtSale", "AdtScrap"].includes(p.disposalTypeEnumId)) denied("DISPOSAL_TYPE_REQUIRED", "Choose scrap or sale")
     if (asset.actualEndOfLife) denied("ALREADY_DISPOSED", "The asset was already disposed")
     bookedAsset(p)
+    if (asset.acquiredDate && day < stampDay(asset.acquiredDate))
+        denied("DISPOSAL_DATE_INVALID", "A disposal is dated on or after the asset went in service")
     checkNotDepreciatedAfter(asset.assetId, day)
+    checkDepreciationDue(asset, org, day)
     const currency = lib.preference(org).baseCurrencyUomId
     const proceeds = sale ? lib.lib.amount(p.proceedsAmount, currency) : toDecimal(0)
     if (!sale && p.proceedsAmount != null && p.proceedsAmount !== "" && !decimal(p.proceedsAmount).isZero())
@@ -546,6 +592,13 @@ function dispose(p) {
             denied("SOURCE_INVALID", "Choose a sales invoice of the organization to the buyer")
         if (rows("mantle.account.invoice.InvoiceItem", {invoiceId: p.salesInvoiceId, assetId: asset.assetId}).length)
             denied("ASSET_SOLD_BY_INVOICE", "This invoice sells the asset itself, and its posting disposes of it")
+        // the invoice bills the sale on a line to the clearing account the disposal debits
+        const clearing = mappingOf(asset).issuanceGlAccountId
+        const saleLines = clearing
+            ? rows("mantle.account.invoice.InvoiceItem", {invoiceId: p.salesInvoiceId, overrideGlAccountId: clearing})
+            : []
+        if (!saleLines.length)
+            denied("SOURCE_INVALID", "The invoice has no line to the disposal clearing account " + clearing)
     }
     const cost = decimal(asset.acquireCost),
         accumulated = decimal(asset.depreciation),
@@ -591,15 +644,20 @@ function reverse(p) {
     const initial = p.assetBookEventId && one(EVENT, {assetBookEventId: p.assetBookEventId})
     if (!initial) denied("EVENT_UNAVAILABLE", "The book event is not available")
     const {asset, org} = assetScope(initial.assetId, "glPost", true)
-    const day = openDay(org, p.reversalDate)
-    const why = lib.reason(p)
-    const op = lib.lib.operation(p, "AssetBookReverse", org, {assetBookEventId: initial.assetBookEventId, day, why})
+    const day = dayOf(p.reversalDate)
+    const op = lib.lib.operation(p, "AssetBookReverse", org, {
+        assetBookEventId: initial.assetBookEventId,
+        day,
+        why: String(p.changeReason || "").trim()
+    })
     if (op.old) return lib.lib.previous(op)
+    checkOpen(org, day)
+    const why = lib.reason(p)
     if (!reversibleTypes.includes(initial.eventTypeEnumId))
         denied("EVENT_NOT_REVERSIBLE", "Only a capitalization, adjustment or disposal is reversed here")
     const {events, reversed} = eventsOf(asset.assetId)
     if (reversed.has(initial.assetBookEventId)) denied("EVENT_REVERSED", "The book event was already reversed")
-    const latest = events.find(e => reversibleTypes.includes(e.eventTypeEnumId) && !reversed.has(e.assetBookEventId))
+    const latest = events.find(e => latestTypes.includes(e.eventTypeEnumId) && !reversed.has(e.assetBookEventId))
     if (latest?.assetBookEventId !== initial.assetBookEventId)
         denied("EVENT_NOT_LATEST", "Reverse the asset's later book events first")
     const eventDay = stampDay(initial.eventDate)
@@ -640,11 +698,19 @@ function reverse(p) {
 // receipts, issuances and counts), audited and only while every posting of the asset is in an open period (F39).
 function repairCost(p) {
     const {asset, org} = assetScope(p.assetId, "admin", true)
+    const op = lib.lib.operation(p, "AssetCostRepair", org, {
+        assetId: asset.assetId,
+        cost: String(p.acquireCost ?? ""),
+        why: String(p.changeReason || "").trim()
+    })
+    if (op.old) return lib.lib.previous(op)
     const why = lib.reason(p)
     const currency = asset.acquireCostUomId || lib.preference(org).baseCurrencyUomId
     const newCost = lib.lib.amount(p.acquireCost, currency)
-    const op = lib.lib.operation(p, "AssetCostRepair", org, {assetId: asset.assetId, cost: String(newCost), why})
-    if (op.old) return lib.lib.previous(op)
+    // a capitalized asset's cost is its book's: update#AssetAcquireCost reposts only its receipts and issuances, so the
+    // capitalization, adjustments and depreciation would no longer agree with it
+    if (asset.actualEndOfLife) denied("ASSET_DISPOSED", "The asset was disposed")
+    if (capitalization(asset.assetId)) denied("ASSET_CAPITALIZED", "The asset is on the books; adjust the book instead")
     for (const tx of postingsOf(asset.assetId)) {
         const day = lib.postingDay(tx)
         if (closedPeriods(org, day).length)
@@ -693,7 +759,7 @@ function book(p) {
     const capitalized = capitalization(asset.assetId)
     const disposed = !!asset.actualEndOfLife
     const {events, reversed} = eventsOf(asset.assetId)
-    const latest = events.find(e => reversibleTypes.includes(e.eventTypeEnumId) && !reversed.has(e.assetBookEventId))
+    const latest = events.find(e => latestTypes.includes(e.eventTypeEnumId) && !reversed.has(e.assetBookEventId))
     const depreciations = depreciationsOf(asset.assetId)
     const lastDepreciatedDay = depreciations.length ? depreciations[depreciations.length - 1].thruDay : ""
     const todayOpen = !closedPeriods(org, today()).length
@@ -773,7 +839,7 @@ function book(p) {
         canCapitalize: !!c.glPost && !capitalized && !disposed && todayOpen,
         canAdjust: !!c.glPost && !!capitalized && !disposed && todayOpen,
         canDispose: !!c.glPost && !!capitalized && !disposed && todayOpen,
-        canRepair: !!c.admin && todayOpen,
+        canRepair: !!c.admin && todayOpen && !capitalized && !disposed,
         canPostLedger: !!c.glPost,
         periodOpen: todayOpen
     }
@@ -798,7 +864,8 @@ function calculateRun(p) {
     const results = []
     for (const asset of Array.from(query.orderBy("assetId").list())) {
         if (asset.acquiredDate && stampDay(asset.acquiredDate) > thruDay) continue
-        if (asset.actualEndOfLife && lib.calendarDateText(asset.actualEndOfLife) <= thruDay) continue
+        // disposed (here, or sold on an invoice that posted its sale) assets are not depreciated again
+        if (asset.actualEndOfLife || soldByInvoice(asset)) continue
         if (one(DEPRECIATION, {assetId: asset.assetId, timePeriodId: period.timePeriodId})) continue
         const result = {sourceEntityName: ASSET, sourceId: asset.assetId, description: asset.assetName || asset.assetId}
         try {
@@ -824,10 +891,18 @@ function calculateRun(p) {
     }
     return {results}
 }
+// Whether a posted sales invoice of the asset's owner sells the asset itself (an ItemAsset line).
+function soldByInvoice(asset) {
+    return rows("mantle.account.invoice.InvoiceItem", {assetId: asset.assetId, itemTypeEnumId: "ItemAsset"}).some(item => {
+        const invoice = one("mantle.account.invoice.Invoice", {invoiceId: item.invoiceId})
+        return invoice?.fromPartyId === asset.ownerPartyId && !!find(TRANS, {invoiceId: item.invoiceId, isPosted: "Y"}).count()
+    })
+}
 // One asset's depreciation for the period, in the caller's new transaction: Mantle calculates and posts it with its
 // depreciation row; when its transaction did not post, the error rolls both back, so no row is left.
 function postAssetPeriod(p) {
     const {asset} = assetScope(p.assetId, "glPost", true)
+    if (asset.actualEndOfLife || soldByInvoice(asset)) denied("ASSET_DISPOSED", "The asset was disposed")
     if (one(DEPRECIATION, {assetId: asset.assetId, timePeriodId: p.timePeriodId}))
         denied("ALREADY_DEPRECIATED", "The asset is already depreciated for this period")
     const out = call("mantle.ledger.AssetAutoPostServices.calculateAndPost#FixedAssetDepreciation", {
@@ -836,6 +911,9 @@ function postAssetPeriod(p) {
         transactionDate: p.transactionDate
     })
     if (!out.acctgTransId) denied("NOTHING_TO_POST", "The asset has no depreciation to post for this period")
+    // the amount reviewed in the run: a change rolls this asset back (post#Run checked the run's version before)
+    if (p.expectedAmount != null && !decimal(out.monthlyDepreciation).eq(decimal(p.expectedAmount)))
+        denied("RUN_CHANGED", "The asset's depreciation changed from " + p.expectedAmount + " to " + out.monthlyDepreciation)
     const tx = one(TRANS, {acctgTransId: out.acctgTransId})
     if (tx?.isPosted !== "Y")
         denied(tx?.postingFailureCode || "POSTING_FAILED", tx?.postingFailureMessage || "The depreciation did not post")
@@ -858,7 +936,12 @@ function postRun(p) {
                 ec.service
                     .sync()
                     .name("mantle.ledger.AssetBookServices.post#AssetPeriodDepreciation")
-                    .parameters({assetId: result.sourceId, timePeriodId: run.timePeriodId, transactionDate})
+                    .parameters({
+                        assetId: result.sourceId,
+                        timePeriodId: run.timePeriodId,
+                        transactionDate,
+                        expectedAmount: result.amount
+                    })
                     .disableAuthz()
                     .requireNewTransaction(true)
                     .call() || {}

@@ -77,7 +77,14 @@ spec({
             thruDate: f.lastMonthDay,
             isClosed: "N"
         })
-        for (const id of ["TRUCK", "VAN", "PRESS", "OLD"]) newAsset("P12_" + id)
+        for (const id of ["TRUCK", "VAN", "PRESS", "OLD", "RCV", "LAPTOP", "SOLD", "UNPOSTED"]) newAsset("P12_" + id)
+        // a receipt of the unposted asset whose transaction has not posted
+        call("create#mantle.product.receipt.AssetReceipt", {
+            assetReceiptId: "P12_RCPT",
+            assetId: "P12_UNPOSTED",
+            quantityAccepted: 1,
+            receivedDate: f.timestamp
+        })
         newAsset("P12_PRINTER", {depreciationTypeEnumId: "DtpStraightLine", assetName: "Printer without a cost"})
         call(books + "capitalize#Asset", {
             assetId: "P12_OLD",
@@ -86,6 +93,16 @@ spec({
             usefulLifeYears: 4,
             depreciationTypeEnumId: "DtpStraightLine",
             operationKey: "p12-cap-old"
+        })
+        // a posting of the not capitalized asset in last month (as its receipt's would be)
+        call("create#mantle.ledger.transaction.AcctgTrans", {
+            acctgTransId: "P12_RCV_TX",
+            organizationPartyId: f.org,
+            acctgTransTypeEnumId: "AttAssetReceipt",
+            transactionDate: ec.l10n.parseTimestamp(f.lastMonthDay + " 12:00:00", "yyyy-MM-dd HH:mm:ss"),
+            accountingDate: f.lastMonthDay,
+            assetId: "P12_RCV",
+            isPosted: "Y"
         })
         call("update#mantle.party.time.TimePeriod", {timePeriodId: f.lastMonthId, isClosed: "Y"})
         f.twoYearsAgo = ec.l10n.parseTimestamp(yearsLater(f.day, -2) + " 00:00:00", "yyyy-MM-dd HH:mm:ss")
@@ -239,7 +256,12 @@ feature("a depreciation that goes to the error journal leaves no depreciation ro
                 timePeriodId: f.monthId
             })
             return {
-                tx: one("mantle.ledger.transaction.AcctgTrans", {acctgTransId: out.acctgTransId}),
+                out,
+                unposted: ec.entity
+                    .find("mantle.ledger.transaction.AcctgTrans")
+                    .condition({assetId: "P12_PRESS", acctgTransTypeEnumId: "AttDepreciation", isPosted: "N"})
+                    .disableAuthz()
+                    .count(),
                 row: one("mantle.product.asset.AssetDepreciation", {assetId: "P12_PRESS", timePeriodId: f.monthId}),
                 press: asset("P12_PRESS")
             }
@@ -247,9 +269,40 @@ feature("a depreciation that goes to the error journal leaves no depreciation ro
             call("update#mantle.ledger.config.PartyAcctgPreference", {organizationPartyId: f.org, postingGuardEnabled: "Y"})
         }
     },
-    then({tx, row, press}) {
-        tx.isPosted == "N"
+    then({out, unposted, row, press}) {
+        // its unposted transaction is removed too (F260)
+        out.acctgTransId == null && unposted == 0
         row == null && press.depreciation == null
+    }
+})
+
+feature("a run whose only failure is at calculation is posted with failures (F259)", {
+    when() {
+        const own = one("mantle.ledger.config.AssetTypeGlAccount", {assetId: "P12_PRESS"})
+        call("update#mantle.ledger.config.AssetTypeGlAccount", {
+            assetTypeGlAccountId: own.assetTypeGlAccountId,
+            depreciationGlAccountId: "672000000"
+        })
+        return asUser(f.users.gl, () => {
+            const preview = call(books + "preview#Depreciation", {
+                organizationPartyId: f.org,
+                timePeriodId: f.monthId,
+                assetIdList: ["P12_PRESS", "P12_PRINTER"]
+            })
+            const posted = call(books + "post#Depreciation", {
+                periodRunId: preview.periodRunId,
+                calculationVersion: preview.calculationVersion,
+                operationKey: "p12-dep2-" + preview.periodRunId
+            })
+            const run = one("mantle.ledger.transaction.AccountingPeriodRun", {periodRunId: preview.periodRunId})
+            return {preview, posted, run}
+        })
+    },
+    then({preview, posted, run}) {
+        preview.resultCount == 2 && preview.failedCount == 1
+        posted.statusId == "PrnPartial" && posted.postedCount == 1 && posted.failedCount == 0
+        run.failedCount == 1
+        toDecimal(asset("P12_PRESS").depreciation).toNumber() == 83.33
     }
 })
 
@@ -270,7 +323,7 @@ feature("an adjustment changes the book from its day; a read user cannot", {
     then({readRefusal, adjusted, before, after}) {
         readRefusal.includes("PERMISSION_DENIED")
         lines(adjusted.acctgTransId) == "C 139100000 500, D 131100000 500"
-        adjusted.netBookBefore.toNumber() == 5000 && adjusted.netBookAfter.toNumber() == 5500
+        adjusted.netBookBefore.toNumber() == 4916.67 && adjusted.netBookAfter.toNumber() == 5416.67
         calendar(after.expectedEndOfLife) ==
             yearsLater(calendar(before.expectedEndOfLife), 1)
     }
@@ -326,8 +379,8 @@ feature("a sale disposes at a gain, a scrap at a loss, and the sale is reversed 
     then({sale, scrap, twice, disposedVan, reversal, reversedTwice, depreciated}) {
         sale.gainLossAmount.toNumber() == 500
         lines(sale.acctgTransId) == "C 131100000 3600, C 814100000 500, D 182000000 100, D 253100000 4000"
-        scrap.gainLossAmount.toNumber() == -5500
-        lines(scrap.acctgTransId) == "C 131100000 5500, D 793100000 5500"
+        scrap.gainLossAmount.toNumber() == -5416.67
+        lines(scrap.acctgTransId) == "C 131100000 5500, D 182000000 83.33, D 793100000 5416.67"
         twice.includes("ALREADY_DISPOSED")
         disposedVan.actualEndOfLife != null && asset("P12_VAN").actualEndOfLife == null
         lines(reversal.acctgTransId) == "C 182000000 100, C 253100000 4000, D 131100000 3600, D 814100000 500"
@@ -335,6 +388,60 @@ feature("a sale disposes at a gain, a scrap at a loss, and the sale is reversed 
             sale.acctgTransId
         reversedTwice.includes("EVENT_REVERSED")
         depreciated.includes("EVENT_DEPRECIATED")
+    }
+})
+
+feature("a disposal waits for the months before it; disposed and capitalized assets refuse repair and runs (F257, F258)", {
+    when() {
+        return {
+            due: asUser(f.users.gl, () =>
+                rejected("dispose#Asset", {
+                    assetId: "P12_OLD",
+                    disposalTypeEnumId: "AdtScrap",
+                    changeReason: "Scrapped",
+                    operationKey: "p12-scrap-old"
+                })
+            ),
+            disposedRun: asUser(f.users.gl, () =>
+                call(books + "preview#Depreciation", {
+                    organizationPartyId: f.org,
+                    timePeriodId: f.monthId,
+                    assetIdList: ["P12_PRESS"]
+                })
+            ),
+            disposedRepair: asUser(f.users.financeadmin, () =>
+                rejected("repair#AcquireCost", {
+                    assetId: "P12_PRESS",
+                    acquireCost: "6000",
+                    changeReason: "Wrong cost",
+                    operationKey: "p12-fix-press"
+                })
+            ),
+            capitalizedRepair: asUser(f.users.financeadmin, () =>
+                rejected("repair#AcquireCost", {
+                    assetId: "P12_TRUCK",
+                    acquireCost: "13000",
+                    changeReason: "Wrong cost",
+                    operationKey: "p12-fix-truck"
+                })
+            ),
+            unpostedReceipt: asUser(f.users.gl, () =>
+                rejected("capitalize#Asset", {
+                    assetId: "P12_UNPOSTED",
+                    acquireCost: "700",
+                    usefulLifeYears: 3,
+                    depreciationTypeEnumId: "DtpStraightLine",
+                    operationKey: "p12-cap-unposted"
+                })
+            )
+        }
+    },
+    then({due, disposedRun, disposedRepair, capitalizedRepair, unpostedReceipt}) {
+        due.includes("DEPRECIATION_DUE") && due.includes("Last month")
+        disposedRun.resultCount == 0
+        disposedRepair.includes("ASSET_DISPOSED")
+        capitalizedRepair.includes("ASSET_CAPITALIZED")
+        unpostedReceipt.includes("RECEIPT_NOT_POSTED")
     }
 })
 
@@ -364,7 +471,7 @@ feature("a closed month refuses depreciation, capitalization and an acquire cost
             ),
             closedRepair: asUser(f.users.financeadmin, () =>
                 rejected("repair#AcquireCost", {
-                    assetId: "P12_OLD",
+                    assetId: "P12_RCV",
                     acquireCost: "2100",
                     changeReason: "Freight left out",
                     operationKey: "p12-fix-old"
@@ -388,5 +495,76 @@ feature("a closed month refuses depreciation, capitalization and an acquire cost
         toDecimal(asset("P12_PRINTER").acquireCost).toNumber() == 800
         one("mantle.product.asset.AssetBookEvent", {assetBookEventId: repaired.assetBookEventId}).eventTypeEnumId ==
             "AbeCostRepair"
+    }
+})
+
+feature("a class added today applies to an asset in service today (F261)", {
+    when() {
+        asUser(f.users.financeadmin, () =>
+            call(books + "store#Class", {
+                organizationPartyId: f.org,
+                classEnumId: "AsClsLaptop",
+                usefulLifeYears: 3,
+                depreciationTypeEnumId: "DtpStraightLine",
+                changeReason: "Laptops over three years"
+            })
+        )
+        const capitalized = asUser(f.users.gl, () =>
+            call(books + "capitalize#Asset", {
+                assetId: "P12_LAPTOP",
+                classEnumId: "AsClsLaptop",
+                acquireCost: "1500",
+                operationKey: "p12-cap-laptop"
+            })
+        )
+        return {capitalized, laptop: asset("P12_LAPTOP")}
+    },
+    then({capitalized, laptop}) {
+        capitalized.assetBookEventId != null
+        calendar(laptop.expectedEndOfLife) == yearsLater(f.day, 3)
+    }
+})
+
+feature("an asset sold on a posted invoice line ends its life and is not depreciated again (F262)", {
+    when() {
+        asUser(f.users.gl, () =>
+            call(books + "capitalize#Asset", {
+                assetId: "P12_SOLD",
+                acquireCost: "1000",
+                usefulLifeYears: 2,
+                depreciationTypeEnumId: "DtpStraightLine",
+                operationKey: "p12-cap-sold"
+            })
+        )
+        const made = call("create#mantle.account.invoice.Invoice", {
+            invoiceTypeEnumId: "InvoiceSales",
+            fromPartyId: f.org,
+            toPartyId: f.customer,
+            statusId: "InvoiceInProcess",
+            invoiceDate: f.timestamp,
+            accountingDate: f.day,
+            currencyUomId: "USD"
+        })
+        call("mantle.account.InvoiceServices.create#InvoiceItem", {
+            invoiceId: made.invoiceId,
+            itemTypeEnumId: "ItemAsset",
+            assetId: "P12_SOLD",
+            quantity: "1",
+            amount: "900",
+            description: "Sold asset"
+        })
+        call("update#mantle.account.invoice.Invoice", {invoiceId: made.invoiceId, statusId: "InvoiceFinalized"})
+        const run = asUser(f.users.gl, () =>
+            call(books + "preview#Depreciation", {
+                organizationPartyId: f.org,
+                timePeriodId: f.monthId,
+                assetIdList: ["P12_SOLD"]
+            })
+        )
+        return {sold: asset("P12_SOLD"), run}
+    },
+    then({sold, run}) {
+        calendar(sold.actualEndOfLife) == f.day
+        run.resultCount == 0
     }
 })

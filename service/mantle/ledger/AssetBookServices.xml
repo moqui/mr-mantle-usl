@@ -179,8 +179,9 @@
         <description>Put a fixed asset in service on the books (ACCOUNTING_GL_POST in its owner organization): its
             class's version in effect on the in-service day fills what is not given (useful life, residual, method,
             accounts), the asset takes that basis and its own account row, and an asset not received posts its cost from
-            the Unreceived Fixed Asset clearing account (a received one is on the books from its receipt, reclassified when
-            the class's asset account differs). Writes an AbeCapitalize book event; a retry with the same operation key
+            the offset account given, else the Unreceived Fixed Asset clearing account (a received one is on the books from
+            its receipt, reclassified when the class's asset account differs; one whose receipt has not posted is refused,
+            RECEIPT_NOT_POSTED). Writes an AbeCapitalize book event; a retry with the same operation key
             answers the first. Refuses a closed period, an asset already capitalized or disposed, another currency, a
             received asset's cost changed here (COST_FROM_RECEIPT), a source that is not the asset's receipt or the
             organization's bill, and missing accounts.</description>
@@ -198,6 +199,7 @@
             <parameter name="depreciationGlAccountId"/>
             <parameter name="sourceInvoiceId"/>
             <parameter name="sourceAssetReceiptId"/>
+            <parameter name="offsetGlAccountId"/>
             <parameter name="changeReason"/>
             <parameter name="operationKey" required="true"/>
         </in-parameters>
@@ -217,7 +219,8 @@
     <service verb="adjust" noun="AssetBook" allow-remote="false">
         <description>Change a capitalized asset's book basis from a day forward (ACCOUNTING_GL_POST): a change in cost
             posts against the Unreceived Fixed Asset clearing account, a change in useful life moves its end, a change in
-            residual its salvage value; later depreciation uses the new basis. Writes an AbeAdjust book event with the net
+            residual its salvage value; later depreciation uses the new basis. A received asset's change of cost needs the
+            offset account it comes from (OFFSET_REQUIRED). Writes an AbeAdjust book event with the net
             book before and after. Refuses a closed period, an asset not capitalized or disposed, no change, a day before
             posted depreciation (DEPRECIATED_AFTER), a residual not below the cost, a cost below the depreciation posted
             (BOOK_NEGATIVE), a life ending by the day and a missing reason.</description>
@@ -227,6 +230,7 @@
             <parameter name="costChange" type="BigDecimal"/>
             <parameter name="usefulLifeChange" type="Integer"/>
             <parameter name="salvageChange" type="BigDecimal"/>
+            <parameter name="offsetGlAccountId"/>
             <parameter name="changeReason"/>
             <parameter name="operationKey" required="true"/>
         </in-parameters>
@@ -252,8 +256,10 @@
             the books, a sale's proceeds go to the clearing account its invoice line credits (the asset's Unissued Fixed
             Asset account), and the difference posts as a gain or a loss; the asset ends its life on the day and is kept.
             Writes an AbeDispose book event. Refuses a closed period, an asset not capitalized or already disposed, a day
-            before posted depreciation, a sale without proceeds, proceeds on a scrap, an invoice that is not the
-            organization's to the buyer or that sells the asset itself (ASSET_SOLD_BY_INVOICE) and a missing reason.</description>
+            before it went in service or before posted depreciation, a month before the disposal not yet depreciated
+            (DEPRECIATION_DUE), an invoice without a line to the clearing account, a sale without proceeds, proceeds on a
+            scrap, an invoice that is not the organization's to the buyer or that sells the asset itself
+            (ASSET_SOLD_BY_INVOICE) and a missing reason.</description>
         <in-parameters>
             <parameter name="assetId" required="true"/>
             <parameter name="disposalDate" type="Date"/>
@@ -308,7 +314,8 @@
     <service verb="repair" noun="AcquireCost" allow-remote="false">
         <description>Rewrite one asset's acquire cost as audited data repair (ACCOUNTING_ADMIN), through
             mantle.product.AssetServices.update#AssetAcquireCost, which reposts its receipts, issuances and counts: only
-            while every posted transaction of the asset is in an open period (F39). Writes an AbeCostRepair book event with
+            while every posted transaction of the asset is in an open period (F39), and never on a capitalized asset
+            (ASSET_CAPITALIZED: adjust the book) or a disposed one. Writes an AbeCostRepair book event with
             the old and new cost. Refuses a period closed for any of its postings (PERIOD_CLOSED), a cost that is not
             positive and a missing reason.</description>
         <in-parameters>
@@ -479,6 +486,7 @@
             <parameter name="assetId" required="true"/>
             <parameter name="timePeriodId" required="true"/>
             <parameter name="transactionDate" type="Timestamp"/>
+            <parameter name="expectedAmount" type="BigDecimal"/>
         </in-parameters>
         <out-parameters>
             <parameter name="acctgTransId"/>

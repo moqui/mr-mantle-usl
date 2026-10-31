@@ -458,29 +458,33 @@ retry answers the first.
   expense, gain and loss accounts (empty: the asset type's). `store#Class` (ACCOUNTING_ADMIN; a reason, audit-logged)
   starts a version and ends the one it replaces, or ends one, and refuses overlaps (`CLASS_OVERLAP`).
 - **Book events.** Each writes an `AssetBookEvent` (create-only) with its posted transaction, accounts and the basis
-  before and after it. `capitalize#Asset` (ACCOUNTING_GL_POST) adopts the class version of the in-service day for what is
-  not given, writes the basis on the Asset (class, `acquiredDate`, cost, residual, method, `expectedEndOfLife`) and the
-  accounts as the asset's own `AssetTypeGlAccount` row, and posts `AttCapitalization` from Unreceived Fixed Asset for an
-  asset not received (a received one is reclassified only when the class's asset account differs). `adjust#AssetBook`
-  changes cost (posted `AttAssetBookAdjust` against the same clearing), life and residual from a day forward.
-  `dispose#Asset` (scrap or sale) posts `AttAssetDisposal`: cost and accumulated depreciation out, proceeds to the
-  asset's Unissued Fixed Asset account, the gain or loss, and ends the asset's life on the day. `reverse#AssetBookEvent`
-  reverses the asset's latest event in force (`post#ReverseAcctgTrans`) and restores its basis; a capitalization or
-  adjustment that depreciation used is not reversed (`EVENT_DEPRECIATED`). `repair#AcquireCost` (ACCOUNTING_ADMIN; a
-  reason) is the audited data repair over `AssetServices.update#AssetAcquireCost`, refused while any posting of the asset
-  is in a closed period (F39). `get#AssetBook` reads an asset's book for a user with GL posting, report read or finance
-  administration in its organization.
+  before and after it. `capitalize#Asset` (ACCOUNTING_GL_POST) adopts the class version of the in-service day for what
+  is not given, writes the basis on the Asset (class, `acquiredDate`, cost, residual, method, `expectedEndOfLife`) and
+  the accounts as the asset's own `AssetTypeGlAccount` row, and posts `AttCapitalization` from the offset account given
+  (else Unreceived Fixed Asset) for an asset not received (a received one is reclassified only when the class's asset
+  account differs; one whose receipt has not posted is refused). `adjust#AssetBook` changes cost (posted
+  `AttAssetBookAdjust` against the same clearing), life and residual from a day forward. `dispose#Asset` (scrap or sale;
+  refused while a month before it is not depreciated, `DEPRECIATION_DUE`) posts `AttAssetDisposal`: cost and accumulated
+  depreciation out, proceeds to the asset's Unissued Fixed Asset account, the gain or loss, and ends the asset's life on
+  the day. `reverse#AssetBookEvent` reverses the asset's latest event in force (`post#ReverseAcctgTrans`) and restores
+  its basis; a capitalization or adjustment that depreciation used is not reversed (`EVENT_DEPRECIATED`).
+  `repair#AcquireCost` (ACCOUNTING_ADMIN; a reason) is the audited data repair over
+  `AssetServices.update#AssetAcquireCost`, refused while any posting of the asset is in a closed period (F39) and on a
+  capitalized or disposed asset. `get#AssetBook` reads an asset's book for a user with GL posting, report read or
+  finance administration in its organization.
 - **Depreciation.** The `PrkDepreciation` period run kind (fiscal months): `calculate#DepreciationRun` gives the month's
   amount (`calculate#FixedAssetDepreciation`) of each fixed asset with a method, in service by the month's end, not
   disposed by it and without depreciation for it, or why it cannot be computed; `post#DepreciationRun` posts each ready
   asset in its own transaction through `post#AssetPeriodDepreciation` over `calculateAndPost#FixedAssetDepreciation`,
-  refused (rolling back the transaction and its row) when it did not post. `post#FixedAssetDepreciation` records no
-  depreciation row or amount for a transaction that did not post (F38). `preview#Depreciation` (a class or assets),
-  `get#DepreciationPreview` (each asset's cost, residual, depreciation before, the month and the net book after) and
-  `post#Depreciation` are the screen's calls over `PeriodRunServices`.
+  refused (rolling back the transaction and its row) when it did not post or its amount changed from the run's. Disposed
+  assets, and assets a posted invoice sells (whose posting now ends their life), are left out.
+  `post#FixedAssetDepreciation` records no depreciation row or amount for a transaction that did not post, and deletes
+  that transaction (F38, F260). `preview#Depreciation` (a class or assets), `get#DepreciationPreview` (each asset's
+  cost, residual, depreciation before, the month and the net book after) and `post#Depreciation` are the screen's calls
+  over `PeriodRunServices`.
 - **Seed.** `FixedAssetData.xml`: the event types (`AbeCapitalize`, `AbeAdjust`, `AbeDispose`, `AbeReversal`,
-  `AbeCostRepair`), the disposal types, the two transaction types and the run kind. DefaultSettings assigns the fixed asset
-  accounts its type mappings name (F250).
+  `AbeCostRepair`), the disposal types, the two transaction types and the run kind. DefaultSettings assigns the fixed
+  asset accounts its type mappings name (F250).
 
 ## Tax (P14)
 
