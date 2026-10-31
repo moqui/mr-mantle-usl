@@ -530,16 +530,610 @@ along with this software (see the LICENSE.md file). If not, see
     <service verb="get" noun="Readiness" allow-remote="false">
         <description>Check the organization's accounting setup (preferences, fiscal periods, chart of accounts) for any
             finance reader without showing administration settings; each failed check is named in findings and the others
-            go on.</description>
+            go on. setupStatus says where its setup stands: unconfigured, inSetup (a setup run not yet activated), active
+            or configured (set up without a setup run).</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
         </in-parameters>
         <out-parameters>
             <parameter name="findings" type="List"/>
+            <parameter name="setupStatus"/>
         </out-parameters>
         <actions>
             <script>ec.context.putAll(ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingSetup.js')
                 .execute('readiness', context))</script>
+        </actions>
+    </service>
+    <!-- ========== Setup and activation (AC-01) ========== -->
+    <service verb="store" noun="SetupRun" allow-remote="false">
+        <description>Start or change the organization's accounting setup run. An organization with no accounting preference,
+            its own or one inherited through its rollup, is set up from a chart template (init#PartyAccountingConfiguration with
+            sourcePartyId, the base currency, fiscal year start and costing basis, and the posting guard and single-currency
+            documents on); for one with its own preference a changed basis goes through store#Preferences, and one that inherits
+            keeps its parent's basis (a change is refused, BASIS_INHERITED). The fiscal periods of the opening day are made when
+            missing. The opening balances are replaced (balances, or balancesCsvText with the headers account, debit and credit)
+            or one line is saved (balanceLine; empty amounts remove it). Each change raises runVersion. Refuses a user without
+            finance administration, a source that is not a chart template, a stale runVersion, an activated run, a new opening day
+            or migration account once open items are imported, a migration or line account that is not an active posting account
+            of the organization, a line of the migration account, a line with both a debit and a credit, and an account on two
+            lines.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="sourcePartyId"><description>The chart template, for an organization not set up
+                yet.</description></parameter>
+            <parameter name="baseCurrencyUomId"/>
+            <parameter name="fiscalYearStartMonth"/>
+            <parameter name="fiscalYearStartDay"/>
+            <parameter name="cogsMethodEnumId"/>
+            <parameter name="openingDate"><description>The cutover day (yyyy-MM-dd): the opening balances and open items
+                post on it.</description></parameter>
+            <parameter name="migrationGlAccountId"><description>Defaults to the organization's GatMigrationClearing
+                account.</description></parameter>
+            <parameter name="balances" type="List"/>
+            <parameter name="balancesCsvText" allow-html="any"/>
+            <parameter name="balanceLine" type="Map"/>
+            <parameter name="runVersion" type="Integer"><description>The version reviewed; required once the run
+                exists.</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="setupRunId"/>
+            <parameter name="runVersion" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <set field="policy" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')"/>
+            <set field="activation"
+                    from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingActivation.js')"/>
+            <set field="organizationPartyId" from="policy.organization(context, 'admin').organizationPartyId"/>
+            <!-- lock order: the organization, then its run -->
+            <entity-find-one entity-name="mantle.party.Party" value-field="organization" for-update="true" disable-authz="true">
+                <field-map field-name="partyId" from="organizationPartyId"/>
+            </entity-find-one>
+            <entity-find entity-name="mantle.ledger.config.AccountingSetupRun" list="runList" for-update="true"
+                    disable-authz="true">
+                <econdition field-name="organizationPartyId"/>
+            </entity-find>
+            <set field="setupRun" from="runList[0] || null"/>
+            <if condition="setupRun?.statusId == 'AsrActivated'">
+                <return error="true" message="SETUP_ACTIVATED: Accounting is activated; its setup is not changed again"/>
+            </if>
+            <if condition="setupRun != null
+                    &amp;&amp; (runVersion == null || Number(runVersion) !== Number(setupRun.runVersion))">
+                <return error="true" message="STALE_REVISION: The setup changed; review it again before saving"/>
+            </if>
+            <entity-find-one entity-name="mantle.ledger.config.PartyAcctgPreference" value-field="ownPreference"
+                    disable-authz="true">
+                <field-map field-name="organizationPartyId"/>
+            </entity-find-one>
+            <!-- an organization configured through its rollup (PrtOrgRollup) inherits its parent's preference: it is
+                configured, is not set up from a template and keeps the parent's basis -->
+            <set field="effectivePreference" from="policy.preference(organizationPartyId)"/>
+            <set field="initialized" from="false"/>
+            <if condition="!ownPreference &amp;&amp; !effectivePreference.organizationPartyId">
+                <then>
+                    <if condition="!sourcePartyId">
+                        <return error="true" message="TEMPLATE_REQUIRED: Choose the chart template"/>
+                    </if>
+                    <entity-find-count entity-name="mantle.party.PartyRole" count-field="templateCount" disable-authz="true">
+                        <econdition field-name="partyId" from="sourcePartyId"/>
+                        <econdition field-name="roleTypeId" value="OrgAccountingTemplate"/>
+                    </entity-find-count>
+                    <if condition="!templateCount">
+                        <return error="true" message="TEMPLATE_INVALID: Choose one of the chart templates"/>
+                    </if>
+                    <if condition="!baseCurrencyUomId">
+                        <return error="true" message="BASE_CURRENCY_REQUIRED: Choose the base currency"/>
+                    </if>
+                    <script>policy.currency(baseCurrencyUomId)</script>
+                    <set field="startMonth" from="Number(fiscalYearStartMonth || 1)"/>
+                    <set field="startDay" from="Number(fiscalYearStartDay || 1)"/>
+                    <if condition="!Number.isInteger(startMonth) || startMonth &lt; 1 || startMonth &gt; 12 ||
+                            !Number.isInteger(startDay) || startDay &lt; 1 || startDay &gt; 31">
+                        <return error="true" message="FISCAL_START_INVALID: Choose a valid fiscal year start"/>
+                    </if>
+                    <service-call name="mantle.ledger.LedgerServices.init#PartyAccountingConfiguration" disable-authz="true"
+                            in-map="{sourcePartyId:sourcePartyId, organizationPartyId:organizationPartyId,
+                                baseCurrencyUomId:baseCurrencyUomId, fiscalYearStartMonth:startMonth,
+                                fiscalYearStartDay:startDay, cogsMethodEnumId:cogsMethodEnumId || null,
+                                postingGuardEnabled:'Y', singleCurrencyDocumentsOnly:'Y'}"/>
+                    <set field="initialized" from="true"/>
+                </then>
+                <else-if condition="!ownPreference">
+                    <set field="inheritedChanges" from="[['baseCurrencyUomId', baseCurrencyUomId],
+                            ['fiscalYearStartMonth', fiscalYearStartMonth], ['fiscalYearStartDay', fiscalYearStartDay],
+                            ['cogsMethodEnumId', cogsMethodEnumId]].filter(([field, value]) =&gt; value != null
+                                &amp;&amp; value !== '' &amp;&amp; String(value) !== String(effectivePreference[field] ?? ''))"/>
+                    <if condition="inheritedChanges.length">
+                        <set field="refusal" from="'BASIS_INHERITED: The organization inherits its accounting basis from '
+                                + effectivePreference.organizationPartyId + '; change it there'"/>
+                        <return error="true" message="${refusal}"/>
+                    </if>
+                </else-if>
+                <else>
+                    <!-- a changed basis through store#Preferences, which refuses one that posted history depends on -->
+                    <set field="basisChanges" from="Object.fromEntries([['baseCurrencyUomId', baseCurrencyUomId],
+                            ['fiscalYearStartMonth', fiscalYearStartMonth], ['fiscalYearStartDay', fiscalYearStartDay],
+                            ['cogsMethodEnumId', cogsMethodEnumId]].filter(([field, value]) =&gt; value != null
+                                &amp;&amp; value !== '' &amp;&amp; String(value) !== String(ownPreference[field] ?? '')))"/>
+                    <if condition="Object.keys(basisChanges).length">
+                        <service-call name="mantle.ledger.SetupServices.store#Preferences" disable-authz="true"
+                                in-map="{organizationPartyId:organizationPartyId, settings:basisChanges,
+                                    changeReason:'Accounting setup', lastUpdatedStamp:ownPreference.lastUpdatedStamp}"/>
+                    </if>
+                </else>
+            </if>
+            <set field="openingDay" from="openingDate ? String(openingDate).trim().slice(0, 10)
+                    : (setupRun ? policy.calendarDateText(setupRun.openingDate) : null)"/>
+            <if condition="!openingDay || !/^\d{4}-\d{2}-\d{2}$/.test(openingDay)
+                    || !ec.l10n.parseDate(openingDay, 'yyyy-MM-dd')">
+                <return error="true" message="OPENING_DATE_REQUIRED: Choose the opening day"/>
+            </if>
+            <set field="openingStamp" from="activation.dayStamp(openingDay)"/>
+            <set field="migrationGlAccountId" from="migrationGlAccountId || setupRun?.migrationGlAccountId || null"/>
+            <if condition="!migrationGlAccountId">
+                <service-call name="mantle.ledger.LedgerServices.get#DefaultGlAccountByType" out-map="migrationOut"
+                        disable-authz="true"
+                        in-map="{organizationPartyId:organizationPartyId, glAccountTypeEnumId:'GatMigrationClearing'}"/>
+                <set field="migrationGlAccountId" from="migrationOut.glAccountId || null"/>
+            </if>
+            <if condition="!migrationGlAccountId">
+                <return error="true" message="MIGRATION_ACCOUNT_REQUIRED: Choose the migration clearing account"/>
+            </if>
+            <script>policy.account(organizationPartyId, migrationGlAccountId, openingStamp)</script>
+            <if condition="setupRun">
+                <entity-find-count entity-name="mantle.account.invoice.Invoice" count-field="openItemCount" disable-authz="true">
+                    <econdition field-name="openingSetupRunId" from="setupRun.setupRunId"/>
+                </entity-find-count>
+                <if condition="openItemCount &gt; 0 &amp;&amp; (openingDay !== policy.calendarDateText(setupRun.openingDate)
+                        || migrationGlAccountId !== setupRun.migrationGlAccountId)">
+                    <set field="refusal" from="'OPEN_ITEMS_IMPORTED: The open items are posted on the opening day against '
+                            + 'the migration account; keep both'"/>
+                    <return error="true" message="${refusal}"/>
+                </if>
+            </if>
+            <!-- the fiscal periods of the opening day, made when the organization has none for it -->
+            <service-call name="mantle.ledger.LedgerServices.get#OrganizationFiscalTimePeriods" disable-authz="true"
+                    in-map="{organizationPartyId:organizationPartyId, filterDate:openingStamp, accountingDate:openingDay}"/>
+            <if condition="setupRun == null">
+                <then>
+                    <service-call name="create#mantle.ledger.config.AccountingSetupRun" out-map="createdRun"
+                            disable-authz="true"
+                            in-map="{organizationPartyId:organizationPartyId, statusId:'AsrDraft',
+                                sourcePartyId:(initialized ? sourcePartyId : null), openingDate:openingDay,
+                                migrationGlAccountId:migrationGlAccountId, runVersion:1, createdByUserId:ec.user.userId,
+                                createdDate:ec.user.nowTimestamp}"/>
+                    <set field="setupRunId" from="createdRun.setupRunId"/>
+                    <set field="runVersion" from="1"/>
+                </then>
+                <else>
+                    <set field="setupRunId" from="setupRun.setupRunId"/>
+                    <set field="runVersion" from="Number(setupRun.runVersion || 0) + 1"/>
+                    <service-call name="update#mantle.ledger.config.AccountingSetupRun" disable-authz="true"
+                            in-map="{setupRunId:setupRunId, openingDate:openingDay, migrationGlAccountId:migrationGlAccountId,
+                                runVersion:runVersion}"/>
+                </else>
+            </if>
+            <!-- the opening balances: all replaced, or one line saved -->
+            <set field="lineContext" from="{organizationPartyId:organizationPartyId, openingDate:openingDay,
+                    migrationGlAccountId:migrationGlAccountId, currencyUomId:activation.baseCurrency(organizationPartyId)}"/>
+            <if condition="balancesCsvText">
+                <set field="balances" from="activation.execute('balanceRows', {csvText:balancesCsvText}).lines"/>
+            </if>
+            <if condition="balances != null">
+                <entity-find entity-name="mantle.ledger.config.AccountingSetupBalance" list="oldLines" disable-authz="true">
+                    <econdition field-name="setupRunId"/>
+                    <order-by field-name="glAccountId"/>
+                </entity-find>
+                <iterate list="oldLines" entry="oldLine">
+                    <service-call name="delete#mantle.ledger.config.AccountingSetupBalance" disable-authz="true"
+                            in-map="{setupRunId:setupRunId, glAccountId:oldLine.glAccountId}"/>
+                </iterate>
+                <set field="savedAccounts" from="[]"/>
+                <iterate list="balances" entry="line">
+                    <set field="checked" from="activation.execute('balanceLine', Object.assign({line:line}, lineContext))"/>
+                    <if condition="savedAccounts.includes(checked.glAccountId)">
+                        <return error="true" message="BALANCE_DUPLICATE: Account ${checked.glAccountId} has more than one line"/>
+                    </if>
+                    <script>savedAccounts.push(checked.glAccountId)</script>
+                    <if condition="!checked.empty">
+                        <service-call name="create#mantle.ledger.config.AccountingSetupBalance" disable-authz="true"
+                                in-map="{setupRunId:setupRunId, glAccountId:checked.glAccountId,
+                                    debitAmount:checked.debitAmount, creditAmount:checked.creditAmount}"/>
+                    </if>
+                </iterate>
+            </if>
+            <if condition="balanceLine">
+                <set field="checked" from="activation.execute('balanceLine', Object.assign({line:balanceLine}, lineContext))"/>
+                <entity-find-one entity-name="mantle.ledger.config.AccountingSetupBalance" value-field="oldLine"
+                        for-update="true" disable-authz="true">
+                    <field-map field-name="setupRunId"/>
+                    <field-map field-name="glAccountId" from="checked.glAccountId"/>
+                </entity-find-one>
+                <if condition="checked.empty">
+                    <then>
+                        <if condition="oldLine">
+                            <service-call name="delete#mantle.ledger.config.AccountingSetupBalance" disable-authz="true"
+                                    in-map="{setupRunId:setupRunId, glAccountId:checked.glAccountId}"/>
+                        </if>
+                    </then>
+                    <else>
+                        <set field="lineValues" from="{setupRunId:setupRunId, glAccountId:checked.glAccountId,
+                                debitAmount:checked.debitAmount, creditAmount:checked.creditAmount}"/>
+                        <if condition="oldLine">
+                            <then>
+                                <service-call name="update#mantle.ledger.config.AccountingSetupBalance" disable-authz="true"
+                                        in-map="lineValues"/>
+                            </then>
+                            <else>
+                                <service-call name="create#mantle.ledger.config.AccountingSetupBalance" disable-authz="true"
+                                        in-map="lineValues"/>
+                            </else>
+                        </if>
+                    </else>
+                </if>
+            </if>
+        </actions>
+    </service>
+    <service verb="preview" noun="OpeningBalances" allow-remote="false">
+        <description>The organization's setup run for review: its basis, the chart templates, the opening balance lines with
+            their totals, each receivable and payable control account's balance against what the open items posted to it,
+            and a page of the open items with each side's count and total. Changes nothing. Refuses a user without finance
+            administration.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="pageIndex" type="Integer"/>
+            <parameter name="pageSize" type="Integer"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="configured" type="Boolean"/>
+            <parameter name="basis" type="Map"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="setupRun" type="Map"/>
+            <parameter name="lastImport" type="Map"/>
+            <parameter name="lastCheck" type="Map"/>
+            <parameter name="inheritedFrom"/>
+            <parameter name="templateOptions" type="List"/>
+            <parameter name="defaultMigrationGlAccountId"/>
+            <parameter name="balanceRows" type="List"/>
+            <parameter name="debitTotal" type="BigDecimal"/>
+            <parameter name="creditTotal" type="BigDecimal"/>
+            <parameter name="balanced" type="Boolean"/>
+            <parameter name="tieRows" type="List"/>
+            <parameter name="ties" type="Boolean"/>
+            <parameter name="migrationNet" type="BigDecimal"/>
+            <parameter name="openItemRows" type="List"/>
+            <parameter name="openItemsCount" type="Integer"/>
+            <parameter name="openItemRowsCount" type="Integer"/>
+            <parameter name="openItemRowsPageIndex" type="Integer"/>
+            <parameter name="openItemRowsPageSize" type="Integer"/>
+            <parameter name="openItemRowsPageMaxIndex" type="Integer"/>
+            <parameter name="openItemRowsPageRangeLow" type="Integer"/>
+            <parameter name="openItemRowsPageRangeHigh" type="Integer"/>
+            <parameter name="receivableCount" type="Integer"/>
+            <parameter name="receivableTotal" type="BigDecimal"/>
+            <parameter name="payableCount" type="Integer"/>
+            <parameter name="payableTotal" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <script>ec.context.putAll(ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingActivation.js')
+                .execute('preview', context))</script>
+        </actions>
+    </service>
+    <service verb="import" noun="OpenItems" allow-remote="false">
+        <description>Import the open customer invoices and supplier bills at cutover, from rows or a CSV text or file with the
+            headers direction (receivable or payable), partyId, documentNumber, documentDate, dueDate and openAmount, and
+            optionally currencyUomId and description. Each row goes through create#OpenItem in its own transaction: a refused row
+            is named with its reason and the others are kept; a row imported before answers its invoice, so importing again makes
+            nothing twice. The counts and refused rows are kept on the run (preview#OpeningBalances lastImport), a check's apart
+            (lastCheck). With verifyOnly the rows are checked and nothing is made. Refuses a user without finance administration,
+            a file without the headers and more than 5,000 rows.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="rows" type="List"/>
+            <parameter name="csvText" allow-html="any"/>
+            <parameter name="openItemFile" type="org.apache.commons.fileupload2.core.FileItem"/>
+            <parameter name="verifyOnly" type="Boolean" default="false"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="rowResults" type="List"/>
+            <parameter name="createdCount" type="Integer"/>
+            <parameter name="existingCount" type="Integer"/>
+            <parameter name="validCount" type="Integer"/>
+            <parameter name="failedCount" type="Integer"/>
+            <parameter name="complete" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <script>ec.context.putAll(ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingActivation.js')
+                .execute('importItems', context))</script>
+        </actions>
+    </service>
+    <service verb="create" noun="OpenItem" allow-remote="false">
+        <description>One open customer invoice or supplier bill at cutover, for import#OpenItems: a real invoice with the
+            opening flag (openingSetupRunId), dated at its document date, due at its own due date, booked on the opening day, with
+            one line of its open amount on the migration clearing account; it is finalized (an invoice) or approved (a bill)
+            through update#Invoice, so its posting and due schedule SECAs run, and the posting must complete. The same
+            organization, side, party and document number answers the invoice made before. Raises the run's version. With
+            verifyOnly only checks. Refuses a user without finance administration (and, for a bill, INVOICE_APPROVE), no setup run
+            or an activated one, the posting guard off, a side that is not receivable or payable, an unknown, private or internal
+            party, no document number, a date that is not yyyy-MM-dd, a document after the opening day, a currency other than the
+            base currency (single currency until base-currency posting), an amount that is not positive or finer than the
+            currency, and a document imported before with another amount or due date.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="direction"/>
+            <parameter name="partyId"/>
+            <parameter name="documentNumber"/>
+            <parameter name="documentDate"/>
+            <parameter name="dueDate"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="openAmount"/>
+            <parameter name="description"/>
+            <parameter name="verifyOnly" type="Boolean" default="false"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceId"/>
+            <parameter name="result"><description>created, existing or valid (verifyOnly)</description></parameter>
+        </out-parameters>
+        <actions>
+            <set field="policy" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')"/>
+            <set field="activation"
+                    from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingActivation.js')"/>
+            <set field="organizationPartyId" from="policy.organization(context, 'admin').organizationPartyId"/>
+            <!-- an import locks the organization, which serializes every writer of its setup run; a check takes no
+                lock -->
+            <if condition="!verifyOnly">
+                <entity-find-one entity-name="mantle.party.Party" value-field="organization" for-update="true"
+                        disable-authz="true">
+                    <field-map field-name="partyId" from="organizationPartyId"/>
+                </entity-find-one>
+            </if>
+            <entity-find entity-name="mantle.ledger.config.AccountingSetupRun" list="runList" disable-authz="true">
+                <econdition field-name="organizationPartyId"/>
+            </entity-find>
+            <set field="setupRun" from="runList[0] || null"/>
+            <if condition="!setupRun">
+                <return error="true" message="SETUP_RUN_REQUIRED: Save the setup basis before importing open items"/>
+            </if>
+            <if condition="setupRun.statusId == 'AsrActivated'">
+                <return error="true" message="SETUP_ACTIVATED: Accounting is activated; open items are not imported now"/>
+            </if>
+            <!-- the posting guard dates an open item's posting on the opening day (its accountingDate) -->
+            <if condition="policy.preference(organizationPartyId).postingGuardEnabled != 'Y'">
+                <return error="true" message="POSTING_GUARD_REQUIRED: Turn on the posting guard before importing open items"/>
+            </if>
+            <set field="side" from="String(direction || '').trim().toLowerCase()"/>
+            <set field="receivable" from="['receivable', 'ar', 'customer', 'invoice'].includes(side)"/>
+            <if condition="!receivable &amp;&amp; !['payable', 'ap', 'supplier', 'bill'].includes(side)">
+                <return error="true" message="DIRECTION_INVALID: Give the side as receivable or payable"/>
+            </if>
+            <!-- an open bill is imported approved, which needs approval authority -->
+            <if condition="!receivable &amp;&amp; !policy.lib.access.has('INVOICE_APPROVE')">
+                <return error="true" message="PERMISSION_DENIED: Importing open bills needs invoice approval (INVOICE_APPROVE)"/>
+            </if>
+            <set field="partyId" from="String(partyId || '').trim()"/>
+            <script>policy.counterparty(partyId || '_NA_')</script>
+            <if condition="!partyId || partyId == organizationPartyId">
+                <return error="true" message="PARTY_UNAVAILABLE: Counterparty is not available"/>
+            </if>
+            <entity-find-count entity-name="mantle.party.PartyRole" count-field="internalCount" disable-authz="true">
+                <econdition field-name="partyId"/>
+                <econdition field-name="roleTypeId" value="OrgInternal"/>
+            </entity-find-count>
+            <if condition="internalCount">
+                <return error="true" message="PARTY_INTERNAL: Open items between internal organizations are not imported"/>
+            </if>
+            <set field="documentNumber" from="String(documentNumber || '').trim()"/>
+            <if condition="!documentNumber || documentNumber.length &gt; 60">
+                <return error="true" message="DOCUMENT_NUMBER_REQUIRED: Give the document number"/>
+            </if>
+            <set field="openingDay" from="policy.calendarDateText(setupRun.openingDate)"/>
+            <iterate list="[['documentDate', documentDate], ['dueDate', dueDate]]" entry="dateEntry">
+                <set field="dayText" from="String(dateEntry[1] || '').trim()"/>
+                <if condition="!/^\d{4}-\d{2}-\d{2}$/.test(dayText) || !ec.l10n.parseDate(dayText, 'yyyy-MM-dd')">
+                    <set field="dateName" from="dateEntry[0] == 'dueDate' ? 'due date' : 'document date'"/>
+                    <return error="true" message="DATE_INVALID: Give the ${dateName} as yyyy-MM-dd"/>
+                </if>
+            </iterate>
+            <set field="documentDay" from="String(documentDate).trim()"/>
+            <set field="dueDay" from="String(dueDate).trim()"/>
+            <if condition="documentDay &gt; openingDay">
+                <return error="true" message="DOCUMENT_AFTER_OPENING: The document is dated after the opening day ${openingDay}"/>
+            </if>
+            <set field="baseCurrencyUomId" from="activation.baseCurrency(organizationPartyId)"/>
+            <set field="currencyUomId" from="String(currencyUomId || '').trim() || baseCurrencyUomId"/>
+            <if condition="currencyUomId !== baseCurrencyUomId">
+                <set field="refusal" from="'CURRENCY_NOT_BASE: Single currency until base-currency posting: the open item '
+                        + 'must be in ' + baseCurrencyUomId"/>
+                <return error="true" message="${refusal}"/>
+            </if>
+            <set field="amount" from="policy.lib.amount(String(openAmount ?? '').trim(), currencyUomId)"/>
+            <!-- the document imported before (the same organization, side, party and number) answers its invoice -->
+            <entity-find entity-name="mantle.account.invoice.Invoice" list="importedList" disable-authz="true">
+                <econdition field-name="openingSetupRunId" operator="is-not-null"/>
+                <econdition field-name="statusId" operator="not-equals" value="InvoiceCancelled"/>
+                <econdition field-name="referenceNumber" from="documentNumber"/>
+                <econdition field-name="fromPartyId" from="receivable ? organizationPartyId : partyId"/>
+                <econdition field-name="toPartyId" from="receivable ? partyId : organizationPartyId"/>
+                <order-by field-name="invoiceId"/>
+            </entity-find>
+            <if condition="importedList.length">
+                <set field="imported" from="importedList[0]"/>
+                <if condition="!toDecimal(imported.invoiceTotal ?? 0).eq(amount)
+                        || policy.lib.bookDay(null, imported.dueDate) !== dueDay">
+                    <set field="refusal" from="'OPEN_ITEM_CONFLICT: Document ' + documentNumber + ' was imported as invoice '
+                            + imported.invoiceId + ' with another amount or due date'"/>
+                    <return error="true" message="${refusal}"/>
+                </if>
+                <set field="invoiceId" from="imported.invoiceId"/>
+                <set field="result" value="existing"/>
+                <return/>
+            </if>
+            <if condition="verifyOnly">
+                <set field="result" value="valid"/>
+                <return/>
+            </if>
+            <service-call name="mantle.account.InvoiceServices.create#Invoice" out-map="created" disable-authz="true"
+                    in-map="{fromPartyId:(receivable ? organizationPartyId : partyId),
+                        toPartyId:(receivable ? partyId : organizationPartyId),
+                        invoiceTypeEnumId:'InvoiceSales',
+                        invoiceDate:activation.dayStamp(documentDay), dueDate:activation.dayStamp(dueDay),
+                        currencyUomId:currencyUomId, referenceNumber:documentNumber,
+                        description:(description || 'Opening balance ' + documentNumber),
+                        openingSetupRunId:setupRun.setupRunId}"/>
+            <set field="invoiceId" from="created.invoiceId"/>
+            <!-- booked on the opening day, so its posting is dated then; a bill carries its importer's approval -->
+            <service-call name="update#mantle.account.invoice.Invoice" disable-authz="true"
+                    in-map="Object.assign({invoiceId:invoiceId, accountingDate:openingDay}, receivable ? {}
+                        : {approvedByUserId:ec.user.userId, approvedDate:ec.user.nowTimestamp, isSelfApproved:'Y'})"/>
+            <service-call name="mantle.account.InvoiceServices.create#InvoiceItem" disable-authz="true"
+                    in-map="{invoiceId:invoiceId, itemTypeEnumId:'ItemOpeningBalance', quantity:1, amount:amount,
+                        overrideGlAccountId:setupRun.migrationGlAccountId,
+                        description:('Open balance of ' + documentNumber)}"/>
+            <service-call name="update#mantle.account.invoice.Invoice" disable-authz="true"
+                    in-map="{invoiceId:invoiceId, statusId:(receivable ? 'InvoiceFinalized' : 'InvoiceApproved'),
+                        statusId_changeReason:'Open item at accounting setup'}"/>
+            <!-- the posting completes, or the row is refused with its reason -->
+            <entity-find entity-name="mantle.ledger.transaction.AcctgTrans" list="postings" disable-authz="true">
+                <econdition field-name="invoiceId"/>
+                <econdition field-name="organizationPartyId"/>
+                <econdition field-name="reverseOfAcctgTransId" operator="is-null"/>
+                <econdition field-name="reversedByAcctgTransId" operator="is-null"/>
+                <order-by field-name="acctgTransId"/>
+            </entity-find>
+            <set field="failedPosting" from="postings.find(row =&gt; row.isPosted !== 'Y')"/>
+            <if condition="!postings.length || failedPosting">
+                <set field="refusal" from="(failedPosting?.postingFailureCode || 'OPEN_ITEM_POST_FAILED') + ': '
+                        + (failedPosting?.postingFailureMessage || 'The open item did not post')"/>
+                <return error="true" message="${refusal}"/>
+            </if>
+            <service-call name="update#mantle.ledger.config.AccountingSetupRun" disable-authz="true"
+                    in-map="{setupRunId:setupRun.setupRunId, runVersion:Number(setupRun.runVersion || 0) + 1}"/>
+            <set field="result" value="created"/>
+        </actions>
+    </service>
+    <service verb="check" noun="Readiness" allow-remote="false">
+        <description>Whether the organization's accounting can be activated, as rows each with its state (ready, check or
+            blocks activation), message and the items it names: preferences, chart, the open periods of the opening day, the
+            posting guard, the migration clearing, receivable and payable accounts, mappings to summary accounts and mapped
+            accounts not in the chart, the inventory WIP and transfer accounts and costing basis, single currency until base-
+            currency posting (open documents and active prices), the sales tax method, bank accounts, the paused past due email
+            job, the production cost accounts (a warning until Manufacturing), entries posted before the opening balances,
+            balanced opening balances and the open items' tie-out. One check that fails is named and the others go on. Refuses a
+            user without finance administration.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="readinessRows" type="List"/>
+            <parameter name="blockerCount" type="Integer"/>
+            <parameter name="warningCount" type="Integer"/>
+            <parameter name="ready" type="Boolean"/>
+            <parameter name="runVersion" type="Integer"/>
+            <parameter name="activated" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <script>ec.context.putAll(ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingActivation.js')
+                .execute('readiness', context))</script>
+        </actions>
+    </service>
+    <service verb="activate" noun="Accounting" allow-remote="false">
+        <description>Activate the organization's accounting once: post the reviewed version of its opening balances on the
+            opening day (AttOpeningBalance; a receivable or payable control account's balance, which the open items carry,
+            against the migration clearing account, which then nets to zero) and mark the run activated. The same
+            operationKey answers the first result; an activated run answers its posting and posts nothing again. Refuses a
+            user without finance administration, no run, a runVersion that is not the run's, a readiness blocker, and a
+            posting the guard refuses.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="runVersion" type="Integer" required="true"/>
+            <parameter name="operationKey" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="setupRunId"/>
+            <parameter name="acctgTransId"/>
+            <parameter name="statusId"/>
+            <parameter name="alreadyActivated" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="policy" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')"/>
+            <set field="activation" value="component://mr-mantle/service/mantle/ledger/AccountingActivation.js"/>
+            <set field="organizationPartyId" from="policy.organization(context, 'admin').organizationPartyId"/>
+            <entity-find-one entity-name="mantle.party.Party" value-field="organization" for-update="true" disable-authz="true">
+                <field-map field-name="partyId" from="organizationPartyId"/>
+            </entity-find-one>
+            <entity-find entity-name="mantle.ledger.config.AccountingSetupRun" list="runList" for-update="true"
+                    disable-authz="true">
+                <econdition field-name="organizationPartyId"/>
+            </entity-find>
+            <set field="setupRun" from="runList[0] || null"/>
+            <if condition="!setupRun">
+                <return error="true" message="SETUP_RUN_REQUIRED: Save the setup basis first"/>
+            </if>
+            <set field="setupRunId" from="setupRun.setupRunId"/>
+            <!-- a retry with the same key answers the first result, before any other check -->
+            <set field="operation" from="policy.lib.operation(context, 'AccountingActivation', organizationPartyId,
+                    {setupRunId:setupRunId, runVersion:Number(runVersion)})"/>
+            <if condition="operation.old">
+                <script>ec.context.putAll(policy.lib.previous(operation))</script>
+                <set field="alreadyActivated" from="true"/>
+                <return/>
+            </if>
+            <if condition="setupRun.statusId == 'AsrActivated'">
+                <set field="acctgTransId" from="setupRun.activatedAcctgTransId"/>
+                <set field="statusId" from="setupRun.statusId"/>
+                <set field="alreadyActivated" from="true"/>
+                <return/>
+            </if>
+            <if condition="Number(runVersion) !== Number(setupRun.runVersion)">
+                <return error="true" message="STALE_REVISION: The setup changed since it was reviewed; review it again"/>
+            </if>
+            <set field="readiness"
+                    from="ec.resource.script(activation).execute('readiness', {organizationPartyId:organizationPartyId})"/>
+            <set field="blockers" from="readiness.readinessRows.filter(row =&gt; row.status === 'blocker')"/>
+            <if condition="blockers.length">
+                <set field="refusal" from="blockers.map(row =&gt; row.label + ': ' + row.message).join('; ')"/>
+                <return error="true" message="SETUP_NOT_READY: ${refusal}"/>
+            </if>
+            <set field="entries"
+                    from="ec.resource.script(activation).execute('activationEntries', {setupRunId:setupRunId}).entries"/>
+            <set field="openingDay" from="policy.calendarDateText(setupRun.openingDate)"/>
+            <set field="acctgTransId" from="null"/>
+            <if condition="entries.length">
+                <service-call name="mantle.ledger.LedgerServices.create#AcctgTrans" out-map="createdTrans" disable-authz="true"
+                        in-map="{acctgTransTypeEnumId:'AttOpeningBalance', organizationPartyId:organizationPartyId,
+                            transactionDate:ec.resource.script(activation).dayStamp(openingDay),
+                            amountUomId:policy.preference(organizationPartyId).baseCurrencyUomId,
+                            description:'Opening balances'}"/>
+                <set field="acctgTransId" from="createdTrans.acctgTransId"/>
+                <service-call name="update#mantle.ledger.transaction.AcctgTrans" disable-authz="true"
+                        in-map="{acctgTransId:acctgTransId, accountingDate:openingDay}"/>
+                <iterate list="entries" entry="entry">
+                    <service-call name="mantle.ledger.LedgerServices.create#AcctgTransEntry" disable-authz="true"
+                            in-map="{acctgTransId:acctgTransId, glAccountId:entry.glAccountId,
+                                debitCreditFlag:entry.debitCreditFlag, amount:entry.amount, description:'Opening balance'}"/>
+                </iterate>
+                <service-call name="mantle.ledger.LedgerServices.post#AcctgTrans" disable-authz="true"
+                        in-map="{acctgTransId:acctgTransId, reviewed:true}"/>
+                <entity-find-one entity-name="mantle.ledger.transaction.AcctgTrans" value-field="posted" disable-authz="true">
+                    <field-map field-name="acctgTransId"/>
+                </entity-find-one>
+                <if condition="posted.isPosted != 'Y'">
+                    <set field="refusal" from="(posted.postingFailureCode || 'ACTIVATION_POST_FAILED') + ': '
+                            + (posted.postingFailureMessage || 'The opening balances did not post')"/>
+                    <return error="true" message="${refusal}"/>
+                </if>
+            </if>
+            <service-call name="update#mantle.ledger.config.AccountingSetupRun" disable-authz="true"
+                    in-map="{setupRunId:setupRunId, statusId:'AsrActivated', activatedAcctgTransId:acctgTransId,
+                        activatedDate:ec.user.nowTimestamp, activatedByUserId:ec.user.userId}"/>
+            <set field="statusId" value="AsrActivated"/>
+            <set field="alreadyActivated" from="false"/>
+            <script>policy.lib.complete(operation, 'mantle.ledger.config.AccountingSetupRun', setupRunId,
+                {organizationPartyId:organizationPartyId, setupRunId:setupRunId, acctgTransId:acctgTransId,
+                    statusId:statusId})</script>
         </actions>
     </service>
 </services>

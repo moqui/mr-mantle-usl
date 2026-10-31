@@ -258,8 +258,24 @@ function changeState(p) {
 }
 
 // The finance account of each credit line: the account the original line posted to, else its override, else the item's
-// account for the direction. More than one posted account for a line refuses, as does none.
-function lineAccount(scope, line, entries) {
+// account for the direction. More than one posted account for a line refuses, as does none. An open item imported at
+// accounting setup posted to migration clearing, which a later credit must not reach: its credit takes the account the
+// organization maps to the Opening balance item type for the direction (impl-accounting §4, F403).
+function lineAccount(scope, line, entries, opening = false) {
+    if (opening) {
+        const mapped = call("mantle.ledger.InvoiceAutoPostServices.get#InvoiceItemGlAccount", {
+            organizationPartyId: scope.organizationPartyId,
+            otherPartyId: scope.partyId,
+            itemTypeEnumId: line.itemTypeEnumId,
+            direction: scope.receivable ? "O" : "I"
+        }).glAccountId
+        if (!mapped)
+            denied(
+                "CREDIT_ACCOUNT_MISSING",
+                "Map the Opening balance item type in the posting defaults to credit an open item imported at setup"
+            )
+        return mapped
+    }
     const posted = [...new Set(entries.filter(row => row.invoiceItemSeqId === line.invoiceItemSeqId).map(row => row.glAccountId))]
     if (posted.length > 1)
         denied("CREDIT_ACCOUNT_AMBIGUOUS", "Source line " + line.invoiceItemSeqId + " has several posted accounts")
@@ -319,7 +335,7 @@ function creditLines(p) {
             productId: line.productId,
             quantity: "1",
             amount: portion,
-            overrideGlAccountId: lineAccount(scope, line, entries),
+            overrideGlAccountId: lineAccount(scope, line, entries, !!record.openingSetupRunId),
             description: p.description || line.description || "Credit for " + p.invoiceId
         })
     })

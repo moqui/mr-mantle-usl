@@ -131,6 +131,16 @@ function readiness(p) {
             ]
         }
     const org = s.organizationPartyId
+    // where the organization's accounting setup stands: not set up, being set up (a setup run not yet activated), active
+    // (activated), or set up without a setup run
+    const run = find("mantle.ledger.config.AccountingSetupRun", {organizationPartyId: org}).one()
+    const setupStatus = run
+        ? run.statusId === "AsrActivated"
+            ? "active"
+            : "inSetup"
+        : lib.preference(org).organizationPartyId
+          ? "configured"
+          : "unconfigured"
     for (const [name, check] of [
         [
             "PREFERENCES",
@@ -166,7 +176,7 @@ function readiness(p) {
             findings.push({code: name, message: error.message})
         }
     }
-    return {findings}
+    return {findings, setupStatus}
 }
 function mappingList(p) {
     const s = lib.scope(p, "admin"),
