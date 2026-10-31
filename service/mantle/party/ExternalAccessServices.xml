@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<!-- External access (CX-PORTALS): capabilities over one record for an outside party, as bearer tokens or for its
+    signed-in contacts, and invitations that make a public account such a contact. The logic is ExternalAccess.js. -->
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="create" noun="AccessCapability" allow-remote="false">
+        <description>A capability over one record for its outside party: an issued customer invoice (Invoice, scope
+            InvoicePay; RECEIVABLE_EDIT) or a purchase order (Order, scopes BillUpload and OrderAcknowledgement;
+            PAYABLE_EDIT), in the record's organization. The token is answered once and only its digest kept; it expires
+            after validDays (60 by default, at most 366) or at thruDate.</description>
+        <in-parameters>
+            <parameter name="recordType" required="true"/>
+            <parameter name="recordId" required="true"/>
+            <parameter name="scopes" required="true"><description>Comma separated, or a list.</description></parameter>
+            <parameter name="validDays" type="Integer"/>
+            <parameter name="thruDate" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="capabilityId"/>
+            <parameter name="token"/>
+            <parameter name="thruDate" type="Timestamp"/>
+        </out-parameters>
+        <actions>
+            <set field="access" from="ec.resource.script('component://mr-mantle/service/mantle/party/ExternalAccess.js')"/>
+            <script>access.requireIssuer(recordType, recordId)</script>
+            <set field="created" from="access.create({recordType:recordType, recordId:recordId, scopes:scopes,
+                validDays:validDays, thruDate:thruDate})"/>
+            <set field="capabilityId" from="created.capabilityId"/>
+            <set field="token" from="created.token"/>
+            <set field="thruDate" from="created.thruDate"/>
+        </actions>
+    </service>
+    <service verb="check" noun="AccessCapability" authenticate="anonymous-all" allow-remote="false">
+        <description>What a public page may reach: the record a token names, within the scope (the token is checked by
+            check#AccessToken's rules), or with no token a record whose outside party the signed-in user is a contact of.
+            organizationPartyId, when given, must be the record's organization (the app mount's target). Anything else is
+            NotFound with no detail.</description>
+        <in-parameters>
+            <parameter name="token"/>
+            <parameter name="scope" required="true"/>
+            <parameter name="recordType" required="true"/>
+            <parameter name="recordId"/>
+            <parameter name="organizationPartyId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="via"/>
+            <parameter name="capabilityId"/>
+            <parameter name="recordId"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="partyId"/>
+        </out-parameters>
+        <actions>
+            <set field="access" from="ec.resource.script('component://mr-mantle/service/mantle/party/ExternalAccess.js')"/>
+            <set field="checked" from="access.check({token:token, scope:scope, recordType:recordType, recordId:recordId,
+                organizationPartyId:organizationPartyId})"/>
+            <set field="via" from="checked.via"/>
+            <set field="capabilityId" from="checked.capabilityId"/>
+            <set field="recordId" from="checked.recordId"/>
+            <set field="organizationPartyId" from="checked.organizationPartyId"/>
+            <set field="partyId" from="checked.partyId"/>
+        </actions>
+    </service>
+    <service verb="check" noun="AccessToken" authenticate="anonymous-all" allow-remote="false">
+        <description>Whether a bearer token names a capability in effect (not expired, not revoked), and which record and
+            scopes; valid false otherwise. Misses are limited per requester.</description>
+        <in-parameters><parameter name="token"/></in-parameters>
+        <out-parameters>
+            <parameter name="valid" type="Boolean"/>
+            <parameter name="recordType"/>
+            <parameter name="recordId"/>
+            <parameter name="scopes"/>
+        </out-parameters>
+        <actions>
+            <set field="access" from="ec.resource.script('component://mr-mantle/service/mantle/party/ExternalAccess.js')"/>
+            <set field="row" from="access.tokenCapability(token)"/>
+            <set field="valid" from="row != null"/>
+            <set field="recordType" from="row?.recordType"/>
+            <set field="recordId" from="row?.recordId"/>
+            <set field="scopes" from="row?.scopes"/>
+        </actions>
+    </service>
+    <service verb="revoke" noun="AccessCapability" allow-remote="false">
+        <description>End a capability now, with the permission that issues it in its record's organization.</description>
+        <in-parameters><parameter name="capabilityId" required="true"/></in-parameters>
+        <out-parameters><parameter name="revoked" type="Boolean"/></out-parameters>
+        <actions>
+            <set field="access" from="ec.resource.script('component://mr-mantle/service/mantle/party/ExternalAccess.js')"/>
+            <set field="revoked" from="access.revoke({capabilityId:capabilityId}).revoked"/>
+        </actions>
+    </service>
+    <service verb="find" noun="AccessCapabilities" allow-remote="false">
+        <description>A record's capabilities, newest first, without tokens, with the permission that issues them.</description>
+        <in-parameters>
+            <parameter name="recordType" required="true"/>
+            <parameter name="recordId" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="capabilityList" type="List"/></out-parameters>
+        <actions>
+            <set field="access" from="ec.resource.script('component://mr-mantle/service/mantle/party/ExternalAccess.js')"/>
+            <set field="capabilityList" from="access.list({recordType:recordType, recordId:recordId})"/>
+        </actions>
+    </service>
+    <service verb="invite" noun="Contact" allow-remote="false">
+        <description>Invite an outside organization's contact to an app's pages on the organization's published site (the
+            site whose billing or supplier mount targets it): a PASS invitation for the email address, bound to the app and
+            the party. Needs RECEIVABLE_EDIT for billing and PAYABLE_EDIT for supplier in the organization. Redeeming it
+            makes the account's party a contact (PrtContact) of the party; it gives no user group.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="app" required="true"/>
+            <parameter name="partyId" required="true"/>
+            <parameter name="emailAddress" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invitationId"/>
+            <parameter name="siteId"/>
+            <parameter name="token"/>
+            <parameter name="invitationUrl"/>
+            <parameter name="expiresAt" type="Timestamp"/>
+        </out-parameters>
+        <actions>
+            <set field="access" from="ec.resource.script('component://mr-mantle/service/mantle/party/ExternalAccess.js')"/>
+            <set field="invited" from="access.invite({organizationPartyId:organizationPartyId, app:app, partyId:partyId,
+                emailAddress:emailAddress})"/>
+            <set field="invitationId" from="invited.invitationId"/>
+            <set field="siteId" from="invited.siteId"/>
+            <set field="token" from="invited.token"/>
+            <set field="invitationUrl" from="invited.invitationUrl"/>
+            <set field="expiresAt" from="invited.expiresAt"/>
+        </actions>
+    </service>
+</services>
