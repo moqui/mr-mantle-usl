@@ -3937,7 +3937,8 @@ along with this software (see the LICENSE.md file). If not, see
             customer's billing addresses) gets it through send#EmailTemplate (emailTemplateId, MANTLE_INVOICE_EMAIL by
             default), recorded in InvoiceEmailMessage; a finalized invoice sent to anyone becomes Sent. A bad address is named
             in recipientResults and the others are sent. The same operationKey and request answers the first result. A
-            caller with its own print of the invoice names it in printLocation, which Mantle renders. Refuses a stale
+            caller with its own print of the invoice names it in printLocation, which Mantle renders. When the organization
+            has a published Billing site, the email carries the invoice's pay link (issue#InvoiceAccess). Refuses a stale
             lastUpdatedStamp or sourceVersion, a payable, and a user without RECEIVABLE_EDIT.</description>
         <in-parameters>
             <parameter name="invoiceId" required="true"/>
@@ -4067,9 +4068,24 @@ along with this software (see the LICENSE.md file). If not, see
                     in-map="{partyId:scope.organizationPartyId, emailContactMechPurposeId:'EmailBilling'}"/>
             <set field="emailParameters" from="{invoiceId:invoiceId, subject:subject || ('Invoice ' + invoiceId + ' from ' +
                 output.fromName), fromAddress:issuerContact.emailAddress, fromName:output.fromName}"/>
+            <!-- the pay link: the Billing page of the organization's published site, when it has one; without it the
+                invoice is sent all the same -->
+            <script><![CDATA[
+                payUrl = null
+                try {
+                    const access = ec.service.sync().name('mantle.account.PortalServices.issue#InvoiceAccess')
+                        .parameters({input:{invoiceId}}).call()?.result
+                    if (ec.message.hasError()) throw new Error(ec.message.getErrorsString())
+                    payUrl = access?.issued ? access.url : null
+                } catch (error) {
+                    ec.message.clearErrors()
+                    ec.logger.error('Invoice ' + invoiceId + ' pay link was not issued: ' + String(error.message).split('\n')[0])
+                }
+            ]]></script>
             <set field="body" from="ec.resource.template('component://mr-mantle/template/account/InvoiceEmail.html.fancy',
-                {note:note, printHtml:output.printHtml})"/>
-            <set field="bodyText" from="[note || '', output.summaryText].filter((text) => text).join('\n\n')"/>
+                {note:note, printHtml:output.printHtml, payUrl:payUrl})"/>
+            <set field="bodyText" from="[note || '', payUrl ? 'Pay online: ' + payUrl : '', output.summaryText]
+                .filter((text) => text).join('\n\n')"/>
             <set field="recipientResults" from="[]"/>
             <iterate list="recipientList" entry="recipient">
                 <set field="validAddress" from="/^[^\s&lt;&gt;@,;]+@[^\s&lt;&gt;@,;]+\.[^\s&lt;&gt;@,;]+$/.test(recipient)"/>
