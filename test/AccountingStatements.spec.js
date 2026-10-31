@@ -47,8 +47,8 @@ spec({
     setupSpec() {
         login("john.doe")
         ec.artifactExecution.disableAuthz()
-        f = helper().fixtures("NATIVE_STMT")
-        g = helper().fixtures("NATIVE_STMT_OTHER")
+        f = helper().fixtures("NATIVE_FINST")
+        g = helper().fixtures("NATIVE_FINST_OTHER")
         // the organization keeps no live summaries, so every open figure is summed from its entries (F16, F337)
         svc("update#mantle.ledger.config.PartyAcctgPreference", {organizationPartyId: f.org, realTimeGlSummary: "N"})
         post(f.org, "111100000", "331100000", "1000")
@@ -318,7 +318,7 @@ feature("a parent's report with its children's periods reads only the organizati
     when() {
         login("john.doe")
         // a child and a grandchild: the parent's reader works in its direct children, not their children
-        const h = helper().fixtures("NATIVE_STMT_GRAND")
+        const h = helper().fixtures("NATIVE_FINST_GRAND")
         post(h.org, "121000000", "411000000", "77", h.customer)
         const rollup = (id, from, to) =>
             svc("create#mantle.party.PartyRelationship", {
@@ -330,14 +330,14 @@ feature("a parent's report with its children's periods reads only the organizati
                 relationshipTypeEnumId: "PrtOrgRollup",
                 fromDate: 0
             })
-        rollup("NATIVE_STMT_ROLLUP", g.org, f.org)
-        rollup("NATIVE_STMT_ROLLUP2", h.org, g.org)
+        rollup("NATIVE_FINST_ROLLUP", g.org, f.org)
+        rollup("NATIVE_FINST_ROLLUP2", h.org, g.org)
         const p = {organizationPartyId: f.org, timePeriodIdList: [month], childOrgPeriods: true}
         const admin = svc(ledger("get#ReportBasicInfo"), p)
         login(f.users.read)
         const reader = svc(ledger("get#ReportBasicInfo"), p)
         login("john.doe")
-        for (const id of ["NATIVE_STMT_ROLLUP2", "NATIVE_STMT_ROLLUP"])
+        for (const id of ["NATIVE_FINST_ROLLUP2", "NATIVE_FINST_ROLLUP"])
             svc("delete#mantle.party.PartyRelationship", {partyRelationshipId: id})
         return {admin, reader, grandchild: h.org}
     },
