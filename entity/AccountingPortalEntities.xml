@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<!-- Accounting's customer and supplier pages (mantle.account.PortalServices): a supplier's bill submissions, the
+    organization's gateway for invoice payment, and a hosted gateway page's address. -->
+<entities xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/entity-definition-3.xsd">
+    <entity entity-name="SupplierBillSubmission" package="mantle.account.invoice" cache="never">
+        <description>A supplier's bill submitted from a public page (submit#SupplierBill): its order, reference and the
+            incoming draft bill it made or found. A repeat of the operation, or of the supplier's reference, answers this
+            row. The file is scanned before the bill is made, and its name and size are kept here.</description>
+        <field name="submissionId" type="id" is-pk="true"/>
+        <field name="organizationPartyId" type="id"/>
+        <field name="supplierPartyId" type="id"/>
+        <field name="orderId" type="id"/>
+        <field name="capabilityId" type="id"/>
+        <field name="operationId" type="text-short"/>
+        <field name="referenceNumber" type="text-medium"/>
+        <field name="invoiceId" type="id"/>
+        <field name="attached" type="text-indicator"/>
+        <field name="filename" type="text-medium"/>
+        <field name="byteSize" type="number-integer"/>
+        <field name="receivedDate" type="date-time"/>
+        <field name="submittedByUserId" type="id"/>
+        <relationship type="one" related="mantle.account.invoice.Invoice"/>
+        <relationship type="one" related="mantle.order.OrderHeader"/>
+        <relationship type="one" related="mantle.party.ExternalAccessCapability"/>
+        <index name="SUPP_BILL_SUB_REF"><index-field name="organizationPartyId"/><index-field name="supplierPartyId"/>
+            <index-field name="referenceNumber"/></index>
+        <index name="SUPP_BILL_SUB_OP"><index-field name="operationId"/></index>
+    </entity>
+    <entity entity-name="PortalPaymentAttempt" package="mantle.account.payment" cache="never">
+        <description>A payment started from a Billing page (start#InvoicePayment): its invoice, the site and the link or
+            contact it came from, and the digest of the reference the gateway's return carries. The pages show, refresh
+            and capture only these payments, never one made in Accounting for the same invoice.</description>
+        <field name="paymentId" type="id" is-pk="true"/>
+        <field name="invoiceId" type="id"/>
+        <field name="siteId" type="id"/>
+        <field name="capabilityId" type="id"/>
+        <field name="contactPartyId" type="id"/>
+        <field name="returnKeyDigest" type="text-medium"/>
+        <field name="createdDate" type="date-time"/>
+        <field name="settledDate" type="date-time"><description>When the payment stopped being pending; the return
+            reference reads the attempt for a day after it.</description></field>
+        <relationship type="one" related="mantle.account.payment.Payment"/>
+        <relationship type="one" related="mantle.account.invoice.Invoice"/>
+        <index name="PORTAL_PAY_INVOICE"><index-field name="invoiceId"/></index>
+        <index name="PORTAL_PAY_OPEN"><index-field name="settledDate"/><index-field name="createdDate"/></index>
+    </entity>
+    <extend-entity entity-name="PartyAcctgPreference" package="mantle.ledger.config">
+        <field name="invoicePayGatewayConfigId" type="id" enable-audit-log="update">
+            <description>The gateway a customer pays an invoice through on the organization's Billing pages; one of its
+                PaymentGatewayOrganization bindings. Empty, the pages offer no payment.</description></field>
+    </extend-entity>
+    <extend-entity entity-name="PaymentGatewayResponse" package="mantle.account.method">
+        <field name="redirectUrl" type="text-medium">
+            <description>Where a hosted gateway takes the payer to pay (its own page), when the authorization is
+                pending there.</description></field>
+    </extend-entity>
+</entities>
