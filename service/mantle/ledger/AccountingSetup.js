@@ -68,7 +68,8 @@ const mappings = {
             "profitGlAccountId",
             "lossGlAccountId",
             "shrinkageGlAccountId",
-            "foundGlAccountId"
+            "foundGlAccountId",
+            "scrapGlAccountId"
         ]
     ],
     financialType: ["FinancialAccountTypeGlAccount", ["finAccountTypeId"], ["glAccountId"]],

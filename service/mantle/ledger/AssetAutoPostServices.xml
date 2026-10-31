@@ -857,8 +857,26 @@ along with this software (see the LICENSE.md file). If not, see
                 <set field="assetGlAccountTypeEnumId" value="GatFixedAsset"/>
             </else></if>
 
-            <!-- determine varianceGlAccountId (credit) -->
-            <set field="varianceGlAccountId" from="isFound ? assetTypeGlAccount?.foundGlAccountId : assetTypeGlAccount?.shrinkageGlAccountId"/>
+            <!-- determine varianceGlAccountId: the organization's account for the variance reason, then for a scrap
+                reason (enumCode scrap) the asset type's scrap account, else found or shrinkage by sign -->
+            <set field="varianceGlAccountId" from="null"/>
+            <if condition="assetDetail.varianceReasonEnumId">
+                <entity-find-one entity-name="mantle.ledger.config.VarianceReasonGlAccount" value-field="reasonGlAccount">
+                    <field-map field-name="varianceReasonEnumId" from="assetDetail.varianceReasonEnumId"/>
+                    <field-map field-name="organizationPartyId"/>
+                </entity-find-one>
+                <set field="varianceGlAccountId" from="reasonGlAccount?.glAccountId"/>
+                <if condition="!varianceGlAccountId">
+                    <entity-find-one entity-name="moqui.basic.Enumeration" value-field="varianceReason" cache="true">
+                        <field-map field-name="enumId" from="assetDetail.varianceReasonEnumId"/>
+                    </entity-find-one>
+                    <if condition="varianceReason?.enumCode == 'scrap'">
+                        <set field="varianceGlAccountId" from="assetTypeGlAccount?.scrapGlAccountId"/></if>
+                </if>
+            </if>
+            <if condition="!varianceGlAccountId">
+                <set field="varianceGlAccountId"
+                        from="isFound ? assetTypeGlAccount?.foundGlAccountId : assetTypeGlAccount?.shrinkageGlAccountId"/></if>
             <if condition="!varianceGlAccountId">
                 <service-call name="mantle.ledger.LedgerServices.get#DefaultGlAccountByType" out-map="creditGlAccountOut"
                         in-map="{glAccountTypeEnumId:varianceGlAccountTypeEnumId, acctgTransTypeEnumId:acctgTransTypeEnumId,

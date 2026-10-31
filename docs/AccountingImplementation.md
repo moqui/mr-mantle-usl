@@ -528,6 +528,57 @@ first release has local sales tax and the US 1099 data.
   its format version and records the export; a sales tax statement whose invoices changed since is refused, and an
   exported statement is not deleted (`delete#TaxStatement`). `simulate#SalesTax` explains a sample sale.
 
+## Valuation and landed costs (P13)
+
+`InventoryReportServices` (logic in `product/InventoryValuation.js`) values stock for Accounting, and
+`AssetBookServices` (logic in `ledger/AssetCosts.js`, beside Products P9's revaluation in `ledger/AssetBooks.js`) posts
+landed costs and repairs cost data. Every read checks Accounting's report read in the organization.
+
+- **Valuation.** `run#InventoryValuation`: the organization's inventory through a day, by asset (up to 5,000; else
+  incomplete), at each asset's cost on that day (its current cost, back to the cost before each later revaluation or
+  landed cost), by product, beside the posted net of its inventory accounts (the `GatInventory` default and
+  every inventory `AssetTypeGlAccount` of the organization chain) for that product, with the totals of stock, inventory
+  and WIP accounts and their difference; entries without a product are a row of their own. The exceptions are receipts,
+  issues and count variances whose posting result is `AtrNoAcquireCost`, `AtrNoAcctgPreference` or `AtrPostingFailed`,
+  zero-cost receipts, and stock postings unposted in the error journal; open WIP by run is the stock issued to a work
+  effort less what its receipts took out, at current cost. A revaluation or landed cost moves the stock and the inventory
+  account by the same amount, so they still agree after one.
+- **Stock transactions.** `run#StockTransactions`: a fiscal period's (the organization's own) or dates' receipts, issues
+  and count variances with their source, cost, value and posting result, and each kind's totals; up to `listLimit` of
+  each kind, else reported incomplete.
+- **Product360.** `get#ProductAccounting`: a product the organization owns or holds, its stock and value beside its
+  inventory balance, its approved standard costs and book events, recent movements, current prices only with
+  `PRICE_VIEW`, and its `ProductGlAccount` and `ProductCategoryGlAccount` rows; the mappings are written by
+  `SetupServices.store#PostingDefault` (finance administration).
+- **Landed costs.** `get#LandedCostSources`, `preview#LandedCost` and `post#LandedCost` (`ACCOUNTING_GL_POST`). A charge
+  is a posted bill's line of the `EngItemsLandedCost` group (`ItemShipping`, `ItemFee`, `ItemMiscCharge`) without a
+  product, credited to the account the bill's posting debited for it. It is spread over posted inventory receipts of
+  the organization by quantity, value (at the receipt date's cost), weight (`Weight`, else `ShippingWeight`) or volume;
+  each share splits by the receipt's stock still on hand (also in the assets a revaluation split it into, a move put it
+  in, or a transfer shipment received at another facility of the organization; each asset once), which raises that
+  asset's cost from the accounting date (an `AbeLandedCost` book event; the shares of one asset summed), and what already
+  left, which goes by issue kind to the asset type's issuance account (cost of goods sold) or `GatProductionVariance`
+  (issued to work). The inventory posts quantity × the unit change at the cost's four decimals; the rest of the share
+  goes to cost of goods sold, so the stock and the account move alike. The preview's
+  `inputFingerprint` covers the line, receipts, stock and accounts; the post locks the organization, the bill and the
+  assets, refuses a stale preview, findings, a line already allocated (`ALREADY_ALLOCATED`, checked after the operation
+  key's earlier answer) and an account not active for the organization, posts one `AttLandedCost` transaction and keeps
+  a `LandedCostAllocation` row per receipt.
+- **Cost data repair.** `repair#ProductAcquireCost` (`ACCOUNTING_ADMIN`; reason; operation key): the organization's
+  inventory assets of a product (and facility) get the cost through `AssetServices.update#AssetAcquireCost`, which
+  reposts their history, only when every posted transaction of those assets is in an open period and they have no
+  revaluation or landed cost events (`BOOK_EVENTS`, naming the transactions to reverse first); each change is an
+  `AbeCostDataRepair` event. Mantle's `update#ProductAcquireCost` is not organization-scoped and is not called.
+- **Scrap by reason.** `post#PhysicalInventoryVariance` posts a count variance to the organization's
+  `VarianceReasonGlAccount` for its reason, then, for a scrap reason (`enumCode` scrap: `InVrScrap`, `InVrExpired`), to
+  the asset type's `scrapGlAccountId`, and otherwise to found or shrinkage by sign as before.
+- **Close.** `check#ValuationClose` adds two non-blocking `PeriodCloseCheck` rows: receipts of the period without a cost
+  basis (`PccReceiptCostBasis`; no acquire cost or posted at zero; `PccStockPostings` no longer lists those receipts),
+  and the difference between stock and the inventory accounts at the period's end for each organization of the close
+  (`PccValuationTieOut`).
+- **Manufacturing's cost close** has its GL account types seeded: `GatLaborApplied`, `GatOverheadApplied`,
+  `GatOutsideProcessAccrued` and `GatProductionVariance` (no DefaultSettings default: each organization maps them).
+
 ## Budgets (P15)
 
 `mantle.other.BudgetServices` and `BudgetReportServices`, with `other/Budgets.js`; the records are Mantle's `Budget`,
@@ -732,6 +783,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingBankReconciliation,BankFileServices
 ./moq test mr-mantle --spec AccountingPeriodClose,AccountingProjectCost
 ./moq test mr-mantle --spec AccountingTax,TaxStatementServices
+./moq test mr-mantle --spec AccountingValuation,ProductStandardCosts
 ./moq test mr-mantle --spec AccountingBudgets,BudgetServices
 ./moq test mr-mantle --spec AccountingReturns,ReturnToResponseBasicFlow,OrderToCashBasicFlow
 ./moq test mr-mantle --spec AccountingPortals

@@ -360,14 +360,35 @@ const checks = {
         const failed = ["AtrNoAcquireCost", "AtrNoAcctgPreference", "AtrPostingFailed"]
         const found = []
         let count = 0
-        for (const [entity, idField, dateField, label] of [
-            ["mantle.product.receipt.AssetReceiptAndOwner", "assetReceiptId", "receivedDate", "Receipt"],
-            ["mantle.product.issuance.AssetIssuanceAndOwner", "assetIssuanceId", "issuedDate", "Issue"]
+        const cf = ec.entity.conditionFactory
+        // an inventory receipt without a cost is PccReceiptCostBasis's; another kind's (supplies, fixed assets) is here
+        const receiptResults = cf.makeCondition(
+            [
+                cf.makeCondition("acctgTransResultEnumId", "in", failed.slice(1)),
+                cf.makeCondition(
+                    [
+                        cf.makeCondition("acctgTransResultEnumId", "equals", "AtrNoAcquireCost"),
+                        cf.makeCondition("assetTypeEnumId", "not-equals", "AstTpInventory")
+                    ],
+                    "and"
+                )
+            ],
+            "or"
+        )
+        for (const [entity, idField, dateField, label, results] of [
+            ["mantle.product.receipt.AssetReceiptValuation", "assetReceiptId", "receivedDate", "Receipt", receiptResults],
+            [
+                "mantle.product.issuance.AssetIssuanceAndOwner",
+                "assetIssuanceId",
+                "issuedDate",
+                "Issue",
+                cf.makeCondition("acctgTransResultEnumId", "in", failed)
+            ]
         ]) {
             const query = () =>
                 find(entity)
                     .condition("ownerPartyId", "in", c.organizations)
-                    .condition("acctgTransResultEnumId", "in", failed)
+                    .condition(results)
                     .condition(stampInPeriod(c, dateField))
             count += query().count()
             for (const movement of query().orderBy(idField).limit(ITEM_LIMIT).list())
@@ -823,5 +844,7 @@ const operations = {checklist, standardCheck, close, reopen}
         if (!operations[op]) throw new Error("Unknown period close operation " + op)
         return operations[op](parameters)
     },
-    checks
+    checks,
+    periodScope,
+    stampInPeriod
 })
