@@ -508,13 +508,13 @@ party (`TimePeriod.partyId`); its other parties are `BudgetParty` rows (`store#B
   `asOfDate`. Each approval and revision stores its PDF (`template/other/Budget.print.html.fancy`) as `BudgetContent`;
   a PDF that cannot be made is logged and the revision stands.
 - **Control.** `BudgetControlPolicy` rows are effective-dated with audit-logged key fields (`store#Policy`,
-  `ACCOUNTING_ADMIN`, the `store#Rate` pattern): the organization, optionally a budget, an account and a stage
-  (request, purchase order, expense), the action (Ignore, Warn, Stop) and a threshold percent. Spending of an account
-  on a day counts against the approved budget's item for the sub period holding the day, else for its whole period. The
-  decision compares the actual (posted debits less credits) and committed (open reserved commitments by
-  `commitmentDate`) after the spending with the threshold: no policy or Ignore is not controlled, Warn reserves with a
-  warning, Stop refuses (`BUDGET_EXCEEDED`) unless a user holding `BUDGET_OVERRIDE` gives an override reason.
-  `check#Budget` previews it.
+  `ACCOUNTING_ADMIN`, the `store#Rate` pattern): the organization, optionally a budget, an account and a stage (request,
+  purchase order, expense), the action (Ignore, Warn, Stop) and a threshold percent. Spending of an account on a day
+  counts against the approved budget's item for the sub period holding the day, else for its whole period. The decision
+  compares the actual (posted debits less credits, without a period close's closing entries) and committed (open
+  reserved commitments by `commitmentDate`) after the spending with the threshold: no policy or Ignore is not
+  controlled, Warn reserves with a warning, Stop refuses (`BUDGET_EXCEEDED`) unless a user holding `BUDGET_OVERRIDE`
+  gives an override reason. `check#Budget` previews it.
 - **Commitments.** `reserve#Commitment` (request or order line), `convert#Commitment` (to the next stage; with
   `invoiceId`, a bill's posted debit lines) and `release#Commitment`, each idempotent per source line, revision and
   stage (a different amount or account under the same key is `SOURCE_REVISION_REUSED`); a new revision of a source line

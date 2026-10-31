@@ -493,9 +493,19 @@ function actualAmount(organizationPartyId, glAccountIds, fromDay, thruDay) {
         fromDay,
         thruDay: afterDay
     })
+    // a period close's closing entries move the balance to retained earnings; they are not spending
+    const conditions = ec.entity.conditionFactory
+    const notClosing = conditions.makeCondition(
+        [
+            conditions.makeCondition("acctgTransTypeEnumId", "is-null", null),
+            conditions.makeCondition("acctgTransTypeEnumId", "not-in", ["AttPeriodClosing", "AttNetIncomeClosing"])
+        ],
+        "or"
+    )
     const query = find("mantle.ledger.transaction.AcctgTransAndEntrySummary", {organizationPartyId, isPosted: "Y"})
         .condition("glAccountId", "in", glAccountIds)
         .condition(dates)
+        .condition(notClosing)
         .selectField("glAccountId")
         .selectField("debitCreditFlag")
         .selectField("amount")
