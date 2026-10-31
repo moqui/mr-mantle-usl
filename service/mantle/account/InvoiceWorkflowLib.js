@@ -75,6 +75,50 @@ function readInvoice(p) {
         denied("PERMISSION_DENIED", "Invoice view authority is required")
     return out
 }
+// Projects' billing: the editor of an invoice's side (RECEIVABLE_EDIT or PAYABLE_EDIT, never a client) who sees one of the
+// projects it bills (WorkEffortInvoice, or time billed on it: TimeEntry.invoiceId or vendorInvoiceId), as Projects'
+// get#InvoiceProjects scopes them (IronStone Accounting P21, F438).
+// memo: an object kept over several calls (a search's hits), which holds the user's visible projects once found.
+function projectEditor(p, memo = {}) {
+    const found = invoice(p)
+    if (!has(found.permission)) return false
+    const rootOf = workEffortId => {
+        const row = workEffortId && one("mantle.work.effort.WorkEffort", {workEffortId})
+        return row ? (row.workEffortTypeEnumId === "WetProject" ? row.workEffortId : row.rootWorkEffortId || null) : null
+    }
+    const linked = rows("mantle.work.effort.WorkEffortInvoice", {invoiceId: p.invoiceId})
+    const projectIds = new Set(linked.map(row => rootOf(row.workEffortId)))
+    for (const field of ["invoiceId", "vendorInvoiceId"]) {
+        const timeRows = find("mantle.work.time.TimeEntry", {[field]: p.invoiceId}).selectField("workEffortId").list()
+        for (const row of Array.from(timeRows)) projectIds.add(rootOf(row.workEffortId))
+    }
+    projectIds.delete(null)
+    if (!projectIds.size) return false
+    if (!memo.projects) {
+        const visible = call("mantle.work.ProjectServices.get#VisibleProjectInfo")
+        memo.projects = {all: !!visible.allProjects, ids: Array.from(visible.visibleProjectIds || [])}
+    }
+    return memo.projects.all || [...projectIds].some(id => memo.projects.ids.includes(id))
+}
+// Whether the user reads an invoice outside the finance screens (record mounts, search): its reader (readInvoice) or a
+// project's billing editor (projectEditor). Answers false, never an error: a lookup that fails leaves no message behind.
+function readable(invoiceId, memo = {}) {
+    ec.message.pushErrors()
+    try {
+        try {
+            readInvoice({invoiceId})
+            return true
+        } catch (error) {
+            ec.message.clearErrors()
+            return projectEditor({invoiceId}, memo) && !ec.message.hasError()
+        }
+    } catch (other) {
+        return false
+    } finally {
+        ec.message.clearErrors()
+        ec.message.popErrors()
+    }
+}
 function writeInvoice(p, lock = true) {
     const initial = invoice(p)
     requirePermission(initial.permission)
@@ -246,6 +290,8 @@ function escapeHtml(value) {
     organization,
     invoice,
     readInvoice,
+    projectEditor,
+    readable,
     writeInvoice,
     revision,
     fingerprint,
