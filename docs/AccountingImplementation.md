@@ -257,6 +257,99 @@ then, an exception for an ambiguous line, and each line keeps the policy row in 
 batch at a time with the matched ones left out (`afterInvoiceId`; the preview answers `lastInvoiceId`). Each bill runs
 in its own transaction (`apply#LegacyMatch`); a failure is named and the others go on. No hold is placed.
 
+## Payment terms and payment runs (P8)
+
+**Payment terms.** `mantle.account.invoice.SettlementTermLine` keeps a term's portions as effective-dated rows with
+audit-logged fields: the share of the total due (`portionPercent`), its days after the invoice date (`daysBasis`) and an
+early-payment discount (`discountPercent` within `discountDays`). `mantle.ledger.SetupServices.store#SettlementTerm`
+(`ACCOUNTING_ADMIN`) takes `lines`: portions adding up to 100, a discount ending on or before its portion is due; the
+lines in effect end and the new ones start, and the term is due in its last portion's days. The seeded
+`Net30Disc2Pct10` and `Net45Disc2Pct15` terms have their discount as a line. `get#Context` returns the lines in effect
+(`termLines`).
+
+**The due schedule (the contract aging, the workbenches, runs and settlement read).**
+`mantle.account.invoice.InvoiceDueSchedule`, keyed by `invoiceId` and `scheduleSeqId` (`01`, `02`, ...), one row per
+portion: `dueDate`, `amount` (rounded to the currency; the last portion takes what rounding leaves), `discountDate` (the
+last day the discount may be taken) and `discountAmount` (empty without a discount); the dates are calendar days (type
+date), the invoice's book day plus the line's days, compared day to day whatever the server's or the user's zone, with the `settlementTermId` and `settlementTermLineId` it came from. The
+rows are not audit-logged: they are written once at issue and removed only on Resume Changes, both in the invoice's status
+audit log, and Mantle's flow specs check the audit log's sequence.
+- It is written once, when the invoice is issued: the `InvoiceIssuedDueSchedule` SECA calls `store#InvoiceDueSchedule`
+  when an invoice becomes Finalized or a bill Approved. No row is written for a credit memo, an invoice without a date
+  or with no total, or one that has its schedule. A term without lines in effect on the invoice date gives one row, the
+  invoice's `dueDate` and total. A later term change never changes a written schedule. An issued invoice changed back
+  for edits (Resume Changes) loses its schedule (`InvoiceResumedDueSchedule`, `clear#InvoiceDueSchedule`), and issuing it
+  again writes the schedule of what it then is.
+- `get#InvoiceDueSchedule` (a read of the invoice: its side's view permission or `ACCOUNTING_VIEW`) returns the rows with
+  their day texts in the user's zone, whether each discount is open on a day (`onDate`, today by default; a discount is
+  open through `discountDate`; `nextDueDate` is the next portion due on or after that day), and `discountAvailable`: the open discounts less prompt-payment
+  credits already issued for the invoice (`creditForInvoiceId` with an `ItemPromptDiscount` line), at most its unpaid
+  total. An invoice issued before P8, or not yet issued, gets the schedule its term gives, not stored.
+- Readers in Mantle use `account/PaymentTerms.js` (`schedule`, `schedules`): `find#OpenItems` adds `discountAvailable`
+  and `discountDateText` to invoice rows; payment runs select and pay by it.
+
+**A discount taken within its date.** In `apply#Settlement` a prompt-payment discount (`ItemPromptDiscount`) with no
+account, on an invoice whose schedule offers at least that amount on the accounting date, posts to the organization's
+prompt-payment discount account: the `ItemPromptDiscount` item type account (`get#InvoiceItemGlAccount`), outgoing for
+a customer invoice (521000000 by default), incoming for a bill (864000000). More than the schedule offers is refused
+(`DISCOUNT_NOT_AVAILABLE`). Such a discount is issued by `create#InvoiceCreditMemo` with `linkToOriginal` and
+`promptDiscount`: within the schedule on its date and today (the bill locked first), on the side's discount account only
+(another account is `DISCOUNT_ACCOUNT_FIXED`; in a settlement it is a write-off), and within the original's credit cap, finalized as the organization's own credit with no
+approval step, for the side's edit permission or `PAYMENT_EDIT`. Any other discount or write-off is P5's adjustment on an
+explicit account; on a bill its credit is approved, so a user without `INVOICE_APPROVE` is refused at preview
+(`ADJUSTMENT_APPROVAL_REQUIRED`). A payment run takes a bill's discount the same way (below).
+
+**Payment runs.** `mantle.account.payment.PaymentRun` (organization, the bank account paid from, ACH or check, currency,
+due-through and pay dates, status `PrunDraft` → `PrunApproved` → `PrunExecuted`, or `PrunCancelled`; the approval's
+total, version and approver; the execution's operation key; the bank file) and `PaymentRunItem` (a bill, its supplier
+and the supplier's bank account, due and discount dates, open, discount and payment amounts, in the run or left out with
+a `PaymentRunExclusion` reason, and at execution its payment and `PaymentRunResult`). `mantle.account.PaymentRunServices`
+(logic in `account/PaymentRuns.js`):
+- `create#Run` and `select#Bills` (`PAYABLE_EDIT`): the organization's approved bills open in the base currency, due
+  through the date or with a discount open on the pay date, at most 500. A held bill (`PrxHeld`, naming its holds), one
+  in another open run (`PrxInOtherRun`) and, for ACH, one whose supplier has no current bank account
+  (`PrxNoBankAccount`) are left out; a bill the user left out (`store#RunItem`, `PrxUser`) stays out. Selecting again or
+  changing an item of an approved run sends it back to proposed.
+- `request#RunApproval` (`PAYABLE_EDIT`): the PaymentRunApproval notification to the organization's users holding
+  `PAYMENT_RUN_APPROVE`. `approve#Run` (`PAYMENT_RUN_APPROVE`): the revision, no held bill, and not the run's creator
+  unless `allowAccountingSelfApproval`; it records the total and a version of the selection (bank, pay date, instrument,
+  each bill's supplier account and amounts) and marks the notifications read.
+- `execute#Run` (`PAYMENT_EDIT`, an operation key): a completed execution under the key is answered first from its
+  `PostingOperation` (type `PaymentRunExecute`); another key is refused while the run's claim (`executeOperationKey`)
+  holds it, and the same key resumes an execution that stopped. A pay date in the past is refused. `claim#RunExecution`
+  checks the approved version in its own transaction. Each supplier is then paid in its own transaction
+  (`pay#RunSupplier`, the run locked first, so a supplier is never paid twice): its bills locked, holds, approval, open
+  amounts, discounts and the supplier's bank account read again; one payment through `create#Payment`
+  (`PtInvoicePayment`) is the supplier's instruction identity. The run is executed only when every payment it made is
+  applied; otherwise it stays approved with `executionMessage`, and `get#Run` offers the claim's key to resume
+  (`canResume`). Until applied, a run's payment holds its bills out of other runs: selecting, putting a bill back
+  (`store#RunItem`) and paying it are refused while another run holds it (`RUN_ITEM_IN_OTHER_RUN`); a supplier that
+  failed in an unfinished run releases its bills. An ACH run's bank account needs its
+  NACHA fields (`BANK_ACCOUNT_NACHA_MISSING`). A check is numbered (`assign#BankAccountCheckNumber`), delivered and applied; an ACH
+  payment is authorized. A supplier that fails has its reason on its bills, and the others keep their payments.
+  `generate#RunFile` then writes the bank file once in its own transaction (`write#RunFile`): `generate#NachaFile` for
+  ACH, which delivers the payments, or `generate#PositivePayFile` for checks when the bank account has a format, each
+  with `paymentIdList` so the file holds the run's payments only; the delivered ACH payments are applied, each on its own
+  (`apply#RunPayment`). Asking again (`generate#RunFile`, `get#RunFile`) gives the same file. A run never locks its
+  organization: the postings and applications its payments make lock it in their own transactions.
+- A run's discount is a prompt-payment credit (`create#InvoiceCreditMemo` `promptDiscount`, above), applied to the bill
+  (`apply#InvoiceToInvoice`) before the payment.
+- `void#RunApproval`: SECAs on `update#BankAccount`, `create#BankAccount` and `delete#PaymentMethod`. Mantle copies a
+  changed outside party's bank account to a new payment method, so the change is found by the supplier: when an account
+  of the supplier was ended, or an open ACH run pays it into an account that is no longer its newest current one, every
+  open run paying the supplier takes its current bank account, and an approved one goes back to proposed with the reason
+  (D26).
+- `import#RunReturn` (`PAYMENT_EDIT`): the bank's NACHA return file through `import#NachaReturn`, which skips a payment
+  already declined. Whatever imports a return, a delivered run payment that becomes Declined has its bills marked Returned
+  with the bank's reason and the run's discount credits on them cancelled (the `RunPaymentReturned` SECA,
+  `mark#RunPaymentReturned`, once).
+- `get#Run` (`PAYABLE_VIEW`, `PAYMENT_VIEW` or `ACCOUNTING_VIEW`): the run and its bills with display text and masked bank
+  accounts, and what the user may do. `cancel#Run` (`PAYABLE_EDIT`) cancels one not executed.
+
+**Bank returns (F32).** A delivered payment that becomes Declined (a NACHA return) is unapplied (`PaymentUnDeliverCleanup`,
+now before the reversal) and its posting reversed (`PaymentUndeliverReverGlPost`), as an undelivered one is;
+`void#Payment` leaves a declined payment declined.
+
 ## Banking (P9)
 
 `ReconciliationServices` holds the bank side, on the existing bank lines (`PaymentMethodTrans`): a statement session
@@ -451,7 +544,7 @@ landed costs and repairs cost data. Every read checks Accounting's report read i
 - `ledger/PostingGuard.js`: the posting choke point. It decides an automatic posting from the transaction's source
   fields, and asks `ACCOUNTING_GL_POST` of a manual or reversal posting unless its caller passes `reviewed`.
 - `account/InvoiceWorkflowLib.js`: an invoice's scope for a read or a write, and the hold guard. `Payables.js`,
-  `InvoiceMatch.js`, `InvoiceWorkflow.js`,
+  `InvoiceMatch.js`, `InvoiceWorkflow.js`, `PaymentTerms.js`, `PaymentRuns.js`,
   `InvoiceAttachments.js`, `PaymentWorkflow.js`, `PaymentLifecycle.js`, `PaymentSettlement.js`, `PaymentOutput.js` and
   `BankReconciliation.js` hold the logic too involved for XML Actions; the other services are inline XML Actions.
 
@@ -476,6 +569,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingPaymentLifecycle,AccountingPaymentCorrections,AccountingPaymentOutput,AccountingPaymentNotifications
 ./moq test mr-mantle --spec AccountingPaymentGateway,AccountingPaymentRefunds,AccountingInternalTransfers
 ./moq test mr-mantle --spec AccountingPayables,AccountingMatching
+./moq test mr-mantle --spec AccountingPaymentRuns,AccountingPaymentRunControls,BankOutputFiles
 ./moq test mr-mantle --spec AccountingBankReconciliation,BankFileServices
 ./moq test mr-mantle --spec AccountingPeriodClose,AccountingProjectCost
 ./moq test mr-mantle --spec AccountingTax,TaxStatementServices

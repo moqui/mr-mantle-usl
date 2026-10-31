@@ -180,6 +180,21 @@ function project(scope, kind, records, asOfDate = null) {
     const held = invoice ? lib.openHolds(records.map(row => row.invoiceId)) : {}
     const invoiceTotals = invoice ? lib.totalsMany(records) : {},
         names = lib.partyNames([scope.partyId])
+    // the due schedule's discount open today (PaymentTerms.js), for invoices and bills, not credits
+    const dueSchedules =
+        kind === "invoice"
+            ? ec.resource.script("component://mr-mantle/service/mantle/account/PaymentTerms.js").schedules(
+                  Array.from(
+                      find(I)
+                          .condition(
+                              "invoiceId",
+                              "in",
+                              records.map(row => row.invoiceId)
+                          )
+                          .list()
+                  )
+              )
+            : {}
     return records.map(record => {
         const id = invoice ? record.invoiceId : record.paymentId
         const evidence = applied.filter(row =>
@@ -227,6 +242,8 @@ function project(scope, kind, records, asOfDate = null) {
             accountingDateText,
             dueDate: invoice ? record.dueDate : record.dueDate,
             dueDateText: lib.policy.dateText(record.dueDate),
+            discountAvailable: dueSchedules[id]?.discountAvailable ?? null,
+            discountDateText: dueSchedules[id]?.discountDateText ?? null,
             original,
             remaining,
             availableAmount: remaining,
