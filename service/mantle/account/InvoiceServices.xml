@@ -4436,24 +4436,8 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="invoiceLib" value="component://mr-mantle/service/mantle/account/InvoiceWorkflowLib.js"/>
             <set field="scope" from="ec.resource.script(invoiceLib).invoice({invoiceId:invoiceId,
                 organizationPartyId:organizationPartyId}, 'INVOICE_HOLD', true)"/>
-            <if condition="scope.receivable"><return error="true" message="PAYABLE_ONLY: Only a bill is held"/></if>
-            <if condition="['InvoiceCancelled', 'InvoicePmtSent'].includes(scope.record.statusId)">
-                <return error="true" message="HOLD_STATE_INVALID: A cancelled or paid bill is not held"/></if>
-            <entity-find-one entity-name="moqui.basic.Enumeration" value-field="holdReason" cache="true" disable-authz="true">
-                <field-map field-name="enumId" from="holdReasonEnumId"/></entity-find-one>
-            <if condition="holdReason?.enumTypeId != 'InvoiceHoldReason'">
-                <return error="true" message="HOLD_REASON_INVALID: Choose a hold reason"/></if>
-            <entity-find-count entity-name="mantle.account.invoice.InvoiceHold" count-field="sameHoldCount" disable-authz="true">
-                <econdition field-name="invoiceId"/><econdition field-name="holdReasonEnumId"/>
-                <econdition field-name="releasedDate" from="null"/>
-            </entity-find-count>
-            <if condition="sameHoldCount">
-                <return error="true" message="HOLD_EXISTS: Bill ${invoiceId} is already on hold for ${holdReason.description}"/>
-            </if>
-            <service-call name="create#mantle.account.invoice.InvoiceHold" out-map="created" disable-authz="true"
-                    in-map="{invoiceId:invoiceId, holdReasonEnumId:holdReasonEnumId, holdComment:holdComment,
-                        reviewDate:reviewDate, placedByUserId:ec.user.userId, placedDate:ec.user.nowTimestamp}"/>
-            <set field="invoiceHoldId" from="created.invoiceHoldId"/>
+            <set field="invoiceHoldId" from="ec.resource.script(invoiceLib).placeHold(scope, holdReasonEnumId, holdComment,
+                {reviewDate:reviewDate}).invoiceHoldId"/>
         </actions>
     </service>
     <service verb="request" noun="HoldRelease" allow-remote="false">

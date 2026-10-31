@@ -204,6 +204,59 @@ freight line, so the rule is a flag; BOSS's demo organization turns it on.
 **Cost centers (AC-22).** `OrderItem.costCenterId` and `InvoiceItem.costCenterId`: a bill or invoice line made from an
 order line takes its cost center, and the invoice postings (`post#Invoice`, `post#InvoiceAdjustment`) carry the line's.
 
+## Matching (P7)
+
+**Policy.** `mantle.account.invoice.InvoiceMatchPolicy`: an organization's match policy as effective-dated rows with
+audit-logged fields, for the organization (no product and no category), a product category or a product; a product row
+wins over a category row, which wins over the organization's. A row has the bill basis (`ImbReceived`, accepted receipts,
+three-way; `ImbOrdered`, two-way), receipt required on the ordered basis, a quantity and a price tolerance (each the
+larger of a percent and a fixed allowance), the variance action (`ImaHold`, `ImaWarn`) and the self-billing default that a
+supplier's first `SupplierProfile` row takes. With no row in effect: received basis, no tolerance, hold.
+`InvoiceMatchServices.store#MatchPolicy` (`ACCOUNTING_ADMIN`) ends the row in effect for the scope and starts the next
+(`POLICY_OVERLAP` before a later row), `end#MatchPolicy` ends a category or product row, `get#MatchPolicies` reads them.
+
+**Match.** `mantle.account.invoice.InvoiceMatch` (one applied, `ImApplied`, per bill; `ImUnapplied` when undone) and
+`InvoiceMatchLine`: each allocation of a bill line to an order line, and on the received basis to one receipt, with its
+snapshot (bill and order quantity and price, accepted, held and earlier billed quantity), the policy row it applied, its
+exception, and the billing link it wrote with that link's quantity before. Logic in `account/InvoiceMatch.js`:
+- `evaluate#InvoiceMatch` (`INVOICE_MATCH`, `PAYABLE_VIEW` or `ACCOUNTING_VIEW`), read only: an applied match checked
+  against its sources now, else the allocations given or the proposal (the line's billing links, else the approved order
+  lines of the product from the supplier, oldest first, on the policy's basis).
+- `apply#InvoiceMatch` (`INVOICE_MATCH`): the allocations checked again under lock (organization, bill, order lines in
+  order) and refused when the source does not allow them (`SOURCE_INVALID`, also for an order in another currency;
+  `ALREADY_BILLED`, `MISSING_RECEIPT`, `QUANTITY_EXCESS`). Other bills' billing, this bill's earlier allocations (a
+  running total per order line and per receipt) and the allocation together may not pass the source's base (accepted
+  less held, or ordered) plus the tolerance, the larger of the policy's percent of the base and its fixed quantity. It
+  writes or updates `OrderItemBilling`; a receipt with no invoice gets the bill line once links with a quantity cover its
+  accepted quantity, as `apply#InvoiceItemToOrder` does. An exception that holds by its policy (price outside tolerance,
+  quantity not matched, no source, no receipt where required) places the `IhrMatchException` hold naming the rule,
+  through `InvoiceWorkflowLib.placeHold`, the hold creation `hold#Invoice` uses after its own `INVOICE_HOLD` check: a
+  match operator need not hold `INVOICE_HOLD`, and an approver who did not apply the match releases it with
+  `release#InvoiceHold`. Each line keeps every exception code (`exceptionCodes`). A retried operation key answers first.
+- `unapply#InvoiceMatch` (`INVOICE_MATCH`): links back to their quantity before (zero when the match made them); a
+  receipt that names the bill names another bill still linked to it, or none; the hold stays.
+- Quantity in quarantine (an accepted receipt whose asset is `AstQuarantine`) is held and left out (D21). There is no
+  inspection record yet (CX-QUALITY), so the inspection check is reported unavailable, never passed (F50). Service lines
+  are not matched until Purchasing's acceptance exists.
+
+**Re-evaluation.** The `AssetReceiptQueueMatchReevaluation` EECA (a receipt created or removed, or its accepted
+quantity, order line or asset changed; not a write of its invoice) and `InvoiceItemQueueMatchReevaluation` call
+`queue#MatchReevaluation`, which reads the match lines by index and marks the applied matches of the receipt, order line
+or bill stale. The `run_MatchReevaluation` job (`run#MatchReevaluation`, every five minutes) evaluates each stale match in
+its own transaction (`reevaluate#InvoiceMatch`, the bill locked before the match) with the policy rows its lines applied
+and names each bill's result. It holds a bill whose source no longer allows its match (`MeSourceChanged`), or for an
+exception that holds and that the match's lines did not record, and records it; a legacy match only for a source change.
+A failure is recorded on the match and its stale date moved to now, so the others go first. No hold is released by the
+match or the job.
+
+**Legacy backfill.** `preview#LegacyMatches` and `apply#LegacyMatches` (`INVOICE_MATCH`): the organization's bills with no
+applied match, linked only from unambiguous evidence: a line's billing links, else its receipts on one order line. Links
+or receipts of another party, product or several order lines are ambiguous and recorded as `MeAmbiguous` exception lines;
+a line with no evidence is not linked, and what the evidence does not explain stays unmatched; the match is partly matched
+then, an exception for an ambiguous line, and each line keeps the policy row in effect. Bills are read in invoice order a
+batch at a time with the matched ones left out (`afterInvoiceId`; the preview answers `lastInvoiceId`). Each bill runs
+in its own transaction (`apply#LegacyMatch`); a failure is named and the others go on. No hold is placed.
+
 ## Banking (P9)
 
 `ReconciliationServices` holds the bank side, on the existing bank lines (`PaymentMethodTrans`): a statement session
@@ -298,8 +351,8 @@ first release has local sales tax and the US 1099 data.
 - `ledger/PostingGuard.js`: the posting choke point. It decides an automatic posting from the transaction's source
   fields, and asks `ACCOUNTING_GL_POST` of a manual or reversal posting unless its caller passes `reviewed`.
 - `account/InvoiceWorkflowLib.js`: an invoice's scope for a read or a write, and the hold guard. `Payables.js`,
-  `InvoiceWorkflow.js`,
-  `InvoiceAttachments.js`, `PaymentWorkflow.js`, `PaymentLifecycle.js`, `PaymentSettlement.js` and `PaymentOutput.js` and
+  `InvoiceMatch.js`, `InvoiceWorkflow.js`,
+  `InvoiceAttachments.js`, `PaymentWorkflow.js`, `PaymentLifecycle.js`, `PaymentSettlement.js`, `PaymentOutput.js` and
   `BankReconciliation.js` hold the logic too involved for XML Actions; the other services are inline XML Actions.
 
 ## The posting guard flag
@@ -322,7 +375,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingSettlement,AccountingSettlementConcurrency,AccountingApplicationRules
 ./moq test mr-mantle --spec AccountingPaymentLifecycle,AccountingPaymentCorrections,AccountingPaymentOutput,AccountingPaymentNotifications
 ./moq test mr-mantle --spec AccountingPaymentGateway,AccountingPaymentRefunds,AccountingInternalTransfers
-./moq test mr-mantle --spec AccountingPayables
+./moq test mr-mantle --spec AccountingPayables,AccountingMatching
 ./moq test mr-mantle --spec AccountingBankReconciliation,BankFileServices
 ./moq test mr-mantle --spec AccountingTax,TaxStatementServices
 ```

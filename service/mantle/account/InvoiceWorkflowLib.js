@@ -190,6 +190,34 @@ function requireNotHeld(invoiceId) {
     const reason = one("moqui.basic.Enumeration", {enumId: held[0].holdReasonEnumId})
     denied("INVOICE_HELD", "Bill " + invoiceId + " is on hold (" + (reason?.description || held[0].holdReasonEnumId) + ")")
 }
+// Place a hold on a bill whose scope the caller has checked: refuses a receivable, a cancelled or paid bill, a reason that
+// is not an InvoiceHoldReason and, unless existingOk, a second open hold for the same reason (an existing one is then
+// answered). hold#Invoice calls it after its INVOICE_HOLD check, the bill match after its INVOICE_MATCH check, and the
+// match re-evaluation job, which has no user, for the match exception.
+function placeHold(scope, holdReasonEnumId, holdComment, options = {}) {
+    if (scope.receivable) denied("PAYABLE_ONLY", "Only a bill is held")
+    if (["InvoiceCancelled", "InvoicePmtSent"].includes(scope.record.statusId))
+        denied("HOLD_STATE_INVALID", "A cancelled or paid bill is not held")
+    const reason = one("moqui.basic.Enumeration", {enumId: holdReasonEnumId})
+    if (reason?.enumTypeId !== "InvoiceHoldReason") denied("HOLD_REASON_INVALID", "Choose a hold reason")
+    const invoiceId = scope.record.invoiceId
+    const open = find("mantle.account.invoice.InvoiceHold", {invoiceId, holdReasonEnumId})
+        .condition("releasedDate", "is-null", null)
+        .one()
+    if (open) {
+        if (options.existingOk) return {invoiceHoldId: open.invoiceHoldId, placed: false}
+        denied("HOLD_EXISTS", "Bill " + invoiceId + " is already on hold for " + reason.description)
+    }
+    const created = call("create#mantle.account.invoice.InvoiceHold", {
+        invoiceId,
+        holdReasonEnumId,
+        holdComment: holdComment == null ? null : String(holdComment).slice(0, 4000),
+        reviewDate: options.reviewDate ?? null,
+        placedByUserId: ec.user.userId || null,
+        placedDate: ec.user.nowTimestamp
+    })
+    return {invoiceHoldId: created.invoiceHoldId, placed: true}
+}
 function escapeHtml(value) {
     const entities = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}
     return String(value ?? "").replace(/[&<>"']/g, character => entities[character])
@@ -233,5 +261,6 @@ function escapeHtml(value) {
     probe,
     openHolds,
     requireNotHeld,
+    placeHold,
     escapeHtml
 })
