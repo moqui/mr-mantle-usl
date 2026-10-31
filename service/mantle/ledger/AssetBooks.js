@@ -148,9 +148,23 @@ function calculate(p, lock = false) {
                     asset.acquireCostUomId,
                     date
                 ),
-                previousUnit = toDecimal(asset.acquireCost),
-                delta = policy().convertCurrency(forward.amount.subtract(previousUnit), asset.acquireCostUomId, currency, date),
-                amount = delta.amount.multiply(qty).setScale(digits, "HALF_UP")
+                previousUnit = toDecimal(asset.acquireCost)
+            // a cost in another currency than the base changes at the rate the asset's postings use (its receipt's,
+            // kept on the asset), so the issues that relieve it later clear the inventory account (impl-accounting F417)
+            let delta
+            if (asset.acquireCostUomId === currency) delta = {amount: forward.amount.subtract(previousUnit), source: null}
+            else {
+                const keptRate = ec.resource
+                    .script("component://mr-mantle/service/mantle/ledger/Currencies.js")
+                    .assetKeptRate(asset, currency)
+                if (!keptRate)
+                    throw new Error("ASSET_RATE_MISSING: The asset's cost has no kept exchange rate; post its receipt first")
+                delta = {
+                    amount: forward.amount.subtract(previousUnit).multiply(keptRate),
+                    source: {exchangeRate: asset.exchangeRate, exchangeRateDate: asset.exchangeRateDate}
+                }
+            }
+            const amount = delta.amount.multiply(qty).setScale(digits, "HALF_UP")
             evidence.push({
                 asset: map(asset),
                 costConversion: converted.source,

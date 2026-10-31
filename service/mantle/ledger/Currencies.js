@@ -97,7 +97,7 @@ function hasDependents(kind, id, org, exceptTxId) {
 // depends on it, or when it was chosen (no rate date) or taken for the document's book day; otherwise (a re-post after
 // its postings were reversed, its book day changed) and when the base currency changed, the rate of the book day is
 // taken again (F421). A later rate change affects later documents only.
-function documentRate(kind, id, organizationPartyId, exceptTxId = null) {
+function documentRate(kind, id, organizationPartyId, exceptTxId = null, keep = true) {
     const base = lib.preference(organizationPartyId).baseCurrencyUomId
     const invoice = kind === "invoice"
     const entity = invoice ? "mantle.account.invoice.Invoice" : "mantle.account.payment.Payment"
@@ -122,7 +122,7 @@ function documentRate(kind, id, organizationPartyId, exceptTxId = null) {
     const found = rateOn(currency, base, day)
     if (!found) return kept || null
     const out = {exchangeRate: rateText(found.rate), exchangeRateDate: found.rateDate, exchangeRateSource: found.rateSource}
-    if (!kept || kept.exchangeRate !== out.exchangeRate || record.exchangeRateSource !== out.exchangeRateSource)
+    if (keep && (!kept || kept.exchangeRate !== out.exchangeRate || record.exchangeRateSource !== out.exchangeRateSource))
         call("update#" + entity, Object.assign({[key]: id, exchangeRateToUomId: base}, out))
     return out
 }
@@ -212,6 +212,11 @@ function convertible(p) {
     const tx = one(T, {acctgTransId: p.acctgTransId})
     const base = tx && lib.preference(tx.organizationPartyId).baseCurrencyUomId
     if (!tx || !base || !tx.amountUomId || tx.amountUomId === base) return {missing: false}
+    // an application's posting is checked as convertApplication converts it: its shape, documents' rates, accounts
+    if (APPLICATION_TYPES.includes(tx.acctgTransTypeEnumId) && tx.paymentApplicationId && !tx.reverseOfAcctgTransId) {
+        const checked = convertApplication({acctgTransId: tx.acctgTransId, verifyOnly: true})
+        return checked.missing ? {missing: true, message: checked.message} : {missing: false}
+    }
     const found = transactionRate(tx, base, null, false)
     return found.missing ? found : {missing: false}
 }
@@ -229,7 +234,8 @@ function convert(p) {
     find("mantle.party.Party", {partyId: initial.organizationPartyId}).forUpdate(true).one()
     const tx = find(T, {acctgTransId: p.acctgTransId}).forUpdate(true).one()
     if (tx.isPosted === "Y" || tx.amountUomId === base) return {converted: false}
-    // an application's posting held in the error journal and posted again books its realized difference (F418)
+    // an application's posting held in the error journal and posted again books its realized difference (F418); the
+    // organization and the transaction are locked above, before the hand-off
     if (APPLICATION_TYPES.includes(tx.acctgTransTypeEnumId) && tx.paymentApplicationId && !tx.reverseOfAcctgTransId)
         return convertApplication({acctgTransId: tx.acctgTransId})
     const lines = Array.from(find(E, {acctgTransId: tx.acctgTransId}).orderBy("acctgTransEntrySeqId").list())
@@ -346,7 +352,9 @@ function cleared(kind, id, tx) {
 // documents' lines is the realized exchange difference, booked to GatForExGain (a credit) or GatForExLoss (a debit).
 // Answers missing (with the reason) when a document has no rate or the exchange account is not mapped; the caller
 // then refuses or sends the posting to the error journal.
+// With p.verifyOnly it answers the same refusals and writes nothing (post#AcctgTrans verifyOnly and the guard).
 function convertApplication(p) {
+    const keep = !p.verifyOnly
     const tx = one(T, {acctgTransId: p.acctgTransId})
     if (!tx || tx.isPosted === "Y") return {converted: false}
     const org = tx.organizationPartyId,
@@ -356,7 +364,7 @@ function convertApplication(p) {
     if (lines.length !== 2)
         return {converted: false, missing: true, code: "APPLICATION_SHAPE", message: "An application posting needs two lines"}
     const documents = applicationDocuments(tx)
-    const rates = documents.map(([kind, id]) => documentRate(kind, id, org, tx.acctgTransId))
+    const rates = documents.map(([kind, id]) => documentRate(kind, id, org, tx.acctgTransId, keep))
     const missingIndex = rates.findIndex(rate => !rate)
     if (missingIndex >= 0) {
         const [kind, id] = documents[missingIndex]
@@ -394,6 +402,7 @@ function convertApplication(p) {
             }
         exchange = {glAccountTypeEnumId, glAccountId, debitCreditFlag: gain ? "C" : "D", amount: net.abs()}
     }
+    if (!keep) return {converted: false, missing: false}
     writeLines(converted)
     if (exchange)
         call("mantle.ledger.LedgerServices.create#AcctgTransEntry", {
@@ -647,6 +656,8 @@ function ratesAdmin() {
     const domain = ec.resource.script("component://mr-mantle/service/mantle/product/ProductAccess.js")
     if (!(domain.systemAdmin() || lib.capabilities().admin))
         denied("PERMISSION_DENIED", "Exchange rates are shared by every organization: finance administration is required")
+    // ACCOUNTING_ADMIN covers every internal organization today, so this cannot fail yet; it guards a future
+    // organization-limited finance administrator, who must not set the rates every organization posts at
     const internal = find("mantle.party.PartyRole", {roleTypeId: "OrgInternal"}).count()
     if (!domain.systemAdmin() && lib.access("admin").organizationPartyIds.length < internal)
         denied("PERMISSION_DENIED", "Exchange rates need finance administration of every organization")
@@ -732,6 +743,8 @@ const operations = {
     documentRate,
     missingText,
     ratesAdmin,
+    // the rate an asset's cost keeps (F417), for a revaluation of that cost
+    assetKeptRate: (asset, base) => (asset.exchangeRateToUomId === base ? positiveRate(asset.exchangeRate) : null),
     execute: (op, p) => {
         if (!operations[op]) throw new Error("Unknown currency operation " + op)
         return operations[op](p)

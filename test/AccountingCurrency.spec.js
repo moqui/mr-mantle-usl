@@ -621,3 +621,86 @@ feature("only a finance administrator of every organization stores, imports or a
         imported.includes("PERMISSION_DENIED")
     }
 })
+feature("a revaluation of a cost in another currency changes it at the asset's kept rate, so later issues clear (F417)", {
+    when() {
+        login("john.doe")
+        ec.artifactExecution.disableAuthz()
+        call("create#mantle.product.Product", {
+            productId: "NATIVE_FX_REVAL",
+            productName: "Currency spec revalued stock",
+            productTypeEnumId: "PtAsset",
+            assetTypeEnumId: "AstTpInventory",
+            ownerPartyId: f.org,
+            amountUomId: "OTH_ea"
+        })
+        // acquired when the krone was at 1.10; revalued and issued now, at 1.05
+        const assetId = call("create#mantle.product.asset.Asset", {
+            productId: "NATIVE_FX_REVAL",
+            assetTypeEnumId: "AstTpInventory",
+            facilityId: "NATIVE_FX_WH",
+            ownerPartyId: f.org,
+            acquireCost: "10",
+            acquireCostUomId: "DKK",
+            acquiredDate: stamp(-10 * 86400000),
+            quantityOnHandTotal: 0,
+            availableToPromiseTotal: 0
+        }).assetId
+        const received = call("mantle.product.AssetServices.receive#Asset", {
+            assetId,
+            productId: "NATIVE_FX_REVAL",
+            facilityId: "NATIVE_FX_WH",
+            quantity: 2,
+            ownerPartyId: f.org
+        })
+        call("create#mantle.ledger.config.GlAccountTypeDefault", {
+            organizationPartyId: f.org,
+            glAccountTypeEnumId: "GatInventoryRevaluation",
+            glAccountId: "525000000"
+        })
+        call("update#mantle.ledger.config.PartyAcctgPreference", {organizationPartyId: f.org, inventoryRevaluationEnabled: "Y"})
+        call("create#mantle.product.cost.ProductStandardCost", {
+            productStandardCostId: "NATIVE_FX_REVAL_STD",
+            productId: "NATIVE_FX_REVAL",
+            organizationPartyId: f.org,
+            state: "approved",
+            fromDate: "2000-01-01T00:00:00Z",
+            quantity: 1,
+            quantityUomId: "OTH_ea",
+            priceUomId: "DKK",
+            unitCost: 11,
+            totalCost: 11,
+            complete: "Y"
+        })
+        const args = {productStandardCostId: "NATIVE_FX_REVAL_STD", organizationPartyId: f.org, changeReason: "Krone cost rise"}
+        const previewed = call("mantle.ledger.AssetBookServices.preview#Revaluation", args)
+        const reval = call("mantle.ledger.AssetBookServices.post#Revaluation", {
+            previewId: previewed.previewId,
+            inputFingerprint: previewed.inputFingerprint,
+            operationKey: "fx-reval"
+        })
+        const issuance = call("create#mantle.product.issuance.AssetIssuance", {
+            assetId,
+            productId: "NATIVE_FX_REVAL",
+            quantity: 2,
+            issuedDate: ec.user.nowTimestamp
+        })
+        const receipt = rows(T, {assetReceiptId: received.assetReceiptId})[0]
+        const inventory = lines(receipt.acctgTransId).find(line => line.debitCreditFlag == "D").glAccountId
+        let net = toDecimal(0)
+        for (const id of [
+            receipt.acctgTransId,
+            reval.acctgTransId,
+            rows(T, {assetIssuanceId: issuance.assetIssuanceId})[0].acctgTransId
+        ])
+            for (const line of lines(id).filter(
+                line => line.glAccountId == inventory && (!line.assetId || line.assetId == assetId)
+            ))
+                net = line.debitCreditFlag == "D" ? net.add(line.amount) : net.subtract(line.amount)
+        return {receipt, revalLines: lines(reval.acctgTransId), net}
+    },
+    then({receipt, revalLines, net}) {
+        receipt.exchangeRate == "1.1"
+        revalLines.find(line => line.debitCreditFlag == "D").amount.eq("2.2")
+        net.isZero()
+    }
+})

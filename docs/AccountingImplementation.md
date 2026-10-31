@@ -944,6 +944,8 @@ single-currency refusal of P4 and P19 (D18) is gone. The logic is in `ledger/Cur
   must be a positive decimal (F422). A posting of an asset's cost (receipt, issuance, variance, issuance delta) converts
   at the asset's rate (`Asset.exchangeRate`, kept by its first posting at its acquisition day), so its inventory account
   clears; one in another currency than the asset's cost, or holding several assets, is refused (`ASSET_CURRENCY`, F417).
+  A revaluation changes such a cost at the asset's kept rate (`ASSET_RATE_MISSING` without one). `verifyOnly` checks an
+  application posting as `convertApplication` converts it, writing nothing.
   An application posting re-posted from the error journal is converted as an application (F418). An invoice
   adjustment posts its control line cumulatively: the invoice's total after it at the rate, less what its postings put
   there (F419).
