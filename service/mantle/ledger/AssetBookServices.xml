@@ -273,6 +273,8 @@
             <set field="repairedCount" from="out.repairedCount"/>
             <set field="assetIds" from="out.assetIds"/>
             <set field="alreadyApplied" from="!!out.alreadyApplied"/>
+        </actions>
+    </service>
 
     <!-- Fixed asset books (impl-accounting P12, design-accounting §10; logic in FixedAssets.js): class defaults, the book
         events of an asset and depreciation as a kind of period run. The organization is the asset's owner. -->
