@@ -148,6 +148,54 @@ its own `PtDisbursement` payment to an outside party, by default the from bank's
 account (`Payment.overrideTypeGlAccountId`), and points at its transfer (`Payment.feeForPaymentId`). One service
 transaction holds them all, so they post together or not at all.
 
+## Payables (P6)
+
+**Supplier profile.** `mantle.party.supplier.SupplierProfile` keeps an organization's profile of a supplier as
+effective-dated rows with audit-logged fields: the default payment term of its bills (`settlementTermId`) and
+self-billing (`selfBillingIndicator`). `mantle.party.SupplierServices.store#SupplierProfile` ends the row in effect and
+starts the next (`SUPPLIER_TERMS_EDIT` for these finance fields; Purchasing adds the buyer fields under
+`SUPPLIER_PROFILE_EDIT`); `get#SupplierFinance` reads a supplier's bills, payments, open, in-review, held and overdue
+amounts, agreements, profile rows and, by permission, its masked bank accounts, identifications and tax
+registrations. The `CustomerFinanceServices` writers take `side` supplier for a supplier's (its identifications need
+`PAYABLE_EDIT`), and `check#CustomerScope` accepts a purchase order or a supplier profile as the relationship.
+
+**Due date.** `checkSet#InvoiceDueDate` (the `InvoiceSetDueDate` EECA): the invoice's term, else the newest agreement
+term, else for a bill the supplier's term in effect on the invoice date, else for a receivable the organization's.
+
+**Intake and approval.** `mantle.account.InvoiceServices` (logic in `account/Payables.js`):
+- `find#Payables`: a page of an organization's bills by queue (incoming, review, held, approved, due, credits, a
+  person's expenses, all), each with its open holds (`PAYABLE_VIEW` or `ACCOUNTING_VIEW`).
+- `import#Bill` (`PAYABLE_IMPORT`): a draft bill keyed by organization, supplier and the supplier's reference, one line
+  for an amount given and the file as its content; a repeat is refused (`BILL_DUPLICATE`) naming the first. For a
+  receipt (`shipmentId`) with a self-billed draft, the file is attached to that draft instead.
+- `create#InvoiceFromSource` (`PAYABLE_EDIT` for a purchase, `RECEIVABLE_EDIT` for a sale): the ordered basis
+  (`create#EntireOrderPartInvoice`) or, for a purchase, the received basis (`create#PurchaseShipmentInvoices` with
+  `acceptedOnly`); the order's payments are marked for the invoice and apply when it is approved; a source already
+  invoiced is refused (`SOURCE_ALREADY_INVOICED`, keyed on `Invoice.workflowSourceKey`).
+- `request#PayableApproval` (`PAYABLE_EDIT`): an incoming bill is received and the `BillApproval` notification sent.
+- `approve#Payable` (`INVOICE_APPROVE`): a bill's posting day when given, then `change#InvoiceState`'s approval.
+
+**Holds.** `mantle.account.invoice.InvoiceHold`, reasons of enumeration type `InvoiceHoldReason` (match exception, AP
+review, supplier dispute, bank detail change). `hold#Invoice` (`INVOICE_HOLD`; a payable only, one open hold per
+reason), `request#HoldRelease` (`PAYABLE_EDIT`; records the request and sends `BillHoldRelease`), `release#InvoiceHold`
+(`INVOICE_HOLD_RELEASE`; never by the placer, `HOLD_RELEASE_SELF`, with a reason) and `get#InvoiceHolds`. The hold
+guard, `InvoiceWorkflowLib.requireNotHeld` (`INVOICE_HELD`), runs in `change#InvoiceState`'s approval of a bill, in the
+rules every application checks (`PaymentSettlement.checkApplication`, so `apply#InvoicePayment`,
+`apply#InvoiceToInvoice` and `apply#Settlement`), in `create#InvoicePayment`, and in the open items
+(`find#OpenItems` gives a held bill the reason `INVOICE_HELD`). `apply#PaymentForInvoice` and `apply#InvoiceForPayments`,
+which the `PaymentApplyForInvoice` and `InvoiceApplyForPayments` SECAs call, leave a held bill's payments unapplied
+with a `PAYMENT_HELD` warning. There is no flag: no flow spec holds a bill.
+
+**Receipt billing (D2).** `create#PurchaseShipmentInvoices` and `create#SalesShipmentInvoices` take `acceptedOnly`: a
+receipt's accepted quantity only, no leftover line and no charge or service line. With
+`PartyAcctgPreference.receiptInvoiceSelfBilledOnly` Y (off by default), `ShipmentIncomingDeliveredCreateInvoices`
+bills a delivered receipt only for a supplier whose profile in effect is self-billing, and then with `acceptedOnly`;
+otherwise the bill comes from the supplier or the order. OrderProcureToPayBasicFlow asserts the SECA's bill with its
+freight line, so the rule is a flag; BOSS's demo organization turns it on.
+
+**Cost centers (AC-22).** `OrderItem.costCenterId` and `InvoiceItem.costCenterId`; the invoice postings
+(`post#Invoice`, `post#InvoiceAdjustment`) carry an invoice line's cost center, else its order line's.
+
 ## Libraries
 
 - `ledger/EntityLib.js`: the helpers the finance modules share: entity reads without artifact authorization (each
@@ -157,7 +205,8 @@ transaction holds them all, so they post together or not at all.
 - `ledger/AccountingPolicy.js`: permissions, organization scope and record checks; a refusal has a reason code.
 - `ledger/PostingGuard.js`: the posting choke point. It decides an automatic posting from the transaction's source
   fields, and asks `ACCOUNTING_GL_POST` of a manual or reversal posting unless its caller passes `reviewed`.
-- `account/InvoiceWorkflowLib.js`: an invoice's scope for a read or a write. `InvoiceWorkflow.js`,
+- `account/InvoiceWorkflowLib.js`: an invoice's scope for a read or a write, and the hold guard. `Payables.js`,
+  `InvoiceWorkflow.js`,
   `InvoiceAttachments.js`, `PaymentWorkflow.js`, `PaymentLifecycle.js`, `PaymentSettlement.js` and `PaymentOutput.js`
   hold the logic too involved for XML Actions; the other services are inline XML Actions.
 
@@ -181,6 +230,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingSettlement,AccountingSettlementConcurrency,AccountingApplicationRules
 ./moq test mr-mantle --spec AccountingPaymentLifecycle,AccountingPaymentCorrections,AccountingPaymentOutput,AccountingPaymentNotifications
 ./moq test mr-mantle --spec AccountingPaymentGateway,AccountingPaymentRefunds,AccountingInternalTransfers
+./moq test mr-mantle --spec AccountingPayables
 ```
 
 The PDF specs need a Chromium for PDF (`pdf_chromium_path`; see [Run-Deploy](../../../../docs/Run-Deploy.md) and
