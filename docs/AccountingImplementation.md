@@ -148,6 +148,41 @@ its own `PtDisbursement` payment to an outside party, by default the from bank's
 account (`Payment.overrideTypeGlAccountId`), and points at its transfer (`Payment.feeForPaymentId`). One service
 transaction holds them all, so they post together or not at all.
 
+## Banking (P9)
+
+`ReconciliationServices` holds the bank side, on the existing bank lines (`PaymentMethodTrans`): a statement session
+links them, it does not copy them. Each new service checks the bank account's organization and the user's authority
+through `check#BankAccess`: reading bank lines needs `BANK_RECONCILE`, `ACCOUNTING_VIEW` or administration, changing
+them `BANK_RECONCILE`, and a deposit `PAYMENT_EDIT` with `PAYMENT_VIEW`. Callers of the older services
+(`create#`/`update#`/`reconcile#`/`unreconcile#`/`noReconcile#PaymentMethodTrans`, `match#PaymentMethodTransUnmatched`)
+check `check#BankAccess` first; those services keep running for the statement message consumers.
+
+- **Line identity.** A bank line's key (`fitId`) is the bank's FIT id in OFX, and a source-row key in BAI2 and CSV
+  (a hash of the row and its occurrence in the file), so a file imported again adds nothing (F33).
+  `account/BankReconciliation.js` reads the three formats; `import#BaiVersion2` and `import#OfxVersion1` use it and
+  skip known lines.
+- **Statement import.** `preview#CsvStatement` shows a CSV with its column mapping. `review#StatementImport` keeps a
+  `StatementImport` with each row new, a duplicate or rejected with its error, and refuses a file of another account;
+  `get#StatementImport` reads it and `commit#StatementImport` creates the new lines, each in its own transaction, and
+  updates the statement balance. A second commit answers the first.
+- **Matching.** `find#BankLines` pages a bank's lines (or the organization's open ones) with their state, the session
+  that cleared each and, on request, a suggestion. `find#BankLineCandidates` lists the payments, deposits and ledger
+  entries of the same bank, direction and amount near the line's date, and `reconcile#BankLine` reconciles one of them
+  through `reconcile#PaymentMethodTrans`. `match#PaymentMethodTransUnmatched` now reconciles only a line with one
+  possible match. `reconcile#`, `unreconcile#` and `noReconcile#PaymentMethodTrans` refuse a line a finished session
+  cleared (`check#BankLineOpen`); `noReconcile#` records its reason (`noReconcileReason`).
+- **Rules.** `BankMatchRule` matches a line's text, direction and amount and suggests a party's payments.
+  `store#Rule` adds, changes or ends one (audit-logged fields); `test#Rule` previews a stored or draft rule on the open
+  lines; `apply#Rules` reconciles only a line one auto-apply rule matches alone with exactly one payment.
+- **Sessions.** `create#Reconciliation` starts a `BankReconciliation` for a period that overlaps no other session of
+  the bank, opening at the last finished closing balance. `store#Reconciliation` changes its reference and closing
+  balance and clears or unclears lines (`BankReconciliationLine`, keyed by the line, so one session clears a line);
+  a cleared line is in the period and matched, or excluded with a reason. `finish#Reconciliation` needs every line
+  of the period cleared and a zero difference; `get#Reconciliation` gives the figures.
+- **Deposits.** `PaymentServices.find#DepositReceipts` and `create#DepositSlip` group delivered receipts into this bank
+  account into one `PaymentDeposit` (`Payment.paymentDepositId`, under an operation key). The deposit's one bank line
+  reconciles them all (`PaymentMethodTrans.paymentDepositId`), and a second line for it is refused.
+
 ## Libraries
 
 - `ledger/EntityLib.js`: the helpers the finance modules share: entity reads without artifact authorization (each
@@ -158,8 +193,8 @@ transaction holds them all, so they post together or not at all.
 - `ledger/PostingGuard.js`: the posting choke point. It decides an automatic posting from the transaction's source
   fields, and asks `ACCOUNTING_GL_POST` of a manual or reversal posting unless its caller passes `reviewed`.
 - `account/InvoiceWorkflowLib.js`: an invoice's scope for a read or a write. `InvoiceWorkflow.js`,
-  `InvoiceAttachments.js`, `PaymentWorkflow.js`, `PaymentLifecycle.js`, `PaymentSettlement.js` and `PaymentOutput.js`
-  hold the logic too involved for XML Actions; the other services are inline XML Actions.
+  `InvoiceAttachments.js`, `PaymentWorkflow.js`, `PaymentLifecycle.js`, `PaymentSettlement.js`, `PaymentOutput.js` and
+  `BankReconciliation.js` hold the logic too involved for XML Actions; the other services are inline XML Actions.
 
 ## The posting guard flag
 
@@ -181,6 +216,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingSettlement,AccountingSettlementConcurrency,AccountingApplicationRules
 ./moq test mr-mantle --spec AccountingPaymentLifecycle,AccountingPaymentCorrections,AccountingPaymentOutput,AccountingPaymentNotifications
 ./moq test mr-mantle --spec AccountingPaymentGateway,AccountingPaymentRefunds,AccountingInternalTransfers
+./moq test mr-mantle --spec AccountingBankReconciliation,BankFileServices
 ```
 
 The PDF specs need a Chromium for PDF (`pdf_chromium_path`; see [Run-Deploy](../../../../docs/Run-Deploy.md) and

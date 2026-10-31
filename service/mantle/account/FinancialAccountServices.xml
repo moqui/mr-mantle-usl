@@ -70,6 +70,42 @@ along with this software (see the LICENSE.md file). If not, see
     <!-- Financial Account CrUD Services -->
     <!-- =============================== -->
 
+    <service verb="check" noun="FinancialAccountAccess" allow-remote="false">
+        <description>The organization of a financial account (or the organization given) and what the user may do there.
+            Refuses an account or organization the user does not work in, and a user without payment view, accounting view
+            or administration authority; with need edit, a user without payment edit and payment view authority. The
+            financial account services themselves check nothing, since orders and payments call them: a finance screen
+            calls this first.</description>
+        <in-parameters>
+            <parameter name="finAccountId"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="need" default-value="read"><description>read or edit</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="canEdit" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <if condition="finAccountId">
+                <entity-find-one entity-name="mantle.account.financial.FinancialAccount" value-field="finAccount"
+                        disable-authz="true"/>
+                <if condition="finAccount == null
+                        || (organizationPartyId &amp;&amp; finAccount.organizationPartyId != organizationPartyId)">
+                    <return error="true" message="FINANCIAL_ACCOUNT_UNAVAILABLE: The financial account is not available"/></if>
+                <set field="organizationPartyId" from="finAccount.organizationPartyId"/>
+            </if>
+            <if condition="!organizationPartyId">
+                <return error="true" message="ORGANIZATION_REQUIRED: Choose an internal organization"/></if>
+            <set field="policy" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')"/>
+            <set field="capabilities" from="policy.organization({organizationPartyId:organizationPartyId}).capabilities"/>
+            <set field="canEdit"
+                    from="!!(capabilities.systemAdmin || (capabilities.paymentEdit &amp;&amp; capabilities.paymentRead))"/>
+            <if condition="!(canEdit || capabilities.paymentRead || capabilities.reportRead || capabilities.admin)">
+                <return error="true" message="PERMISSION_DENIED: Payment view authority is required"/></if>
+            <if condition="need == 'edit' &amp;&amp; !canEdit">
+                <return error="true" message="PERMISSION_DENIED: Payment edit and payment view authority are required"/></if>
+        </actions>
+    </service>
     <service verb="create" noun="FinancialAccount">
         <in-parameters>
             <auto-parameters entity-name="mantle.account.financial.FinancialAccount" include="nonpk">
