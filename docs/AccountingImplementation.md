@@ -341,6 +341,52 @@ first release has local sales tax and the US 1099 data.
   its format version and records the export; a sales tax statement whose invoices changed since is refused, and an
   exported statement is not deleted (`delete#TaxStatement`). `simulate#SalesTax` explains a sample sale.
 
+## Budgets (P15)
+
+`mantle.other.BudgetServices` and `BudgetReportServices`, with `other/Budgets.js`; the records are Mantle's `Budget`,
+`BudgetItem`, `BudgetRevision`, `BudgetRevisionImpact`, `BudgetReview` and `BudgetParty`, with `BudgetControlPolicy`,
+`BudgetCommitment` and `BudgetContent` (`entity/BudgetControlEntities.xml`). A budget's organization is its period's
+party (`TimePeriod.partyId`); its other parties are `BudgetParty` rows (`store#BudgetParty`, `BUDGET_EDIT`).
+
+- **States.** Draft, Approved, Closed and Cancelled (`StatusFlowTransition`). `create#Budget` makes a draft and records
+  its creator. `change#BudgetState` approves (`BUDGET_APPROVE`; not by the creator unless `allowAccountingSelfApproval`;
+  each account's sub periods must add up to its total), closes an approved budget or cancels a draft (`BUDGET_EDIT`, with
+  a reason). The item writers (`store#BudgetItem`, `store#BudgetItemsSubPeriods`, `store#BudgetItemDetail`,
+  `store#BudgetItemDetailsSubPeriods`) refuse a budget that is not a draft (`BUDGET_NOT_DRAFT`).
+- **Revisions.** Approval is revision `000`: a `BudgetRevision`, a `BudgetReview` and a `BudgetRevisionImpact` holding
+  each item's amount. `revise#Budget` (`BUDGET_EDIT`) changes an approved budget's amounts (lines by item or by account
+  and sub period, or the matrix form `glAccountId` with `amountMain` and `amountPer1`–`12`) as the next revision with its
+  reason; `BudgetItem.amount` is audit-logged with the reason. `get#BudgetAmounts` and `run#BudgetVariance` read the
+  amounts as of a revision (the latest impact of each item at or before it), or of the revision in effect at
+  `asOfDate`. Each approval and revision stores its PDF (`template/other/Budget.print.html.fancy`) as `BudgetContent`;
+  a PDF that cannot be made is logged and the revision stands.
+- **Control.** `BudgetControlPolicy` rows are effective-dated with audit-logged key fields (`store#Policy`,
+  `ACCOUNTING_ADMIN`, the `store#Rate` pattern): the organization, optionally a budget, an account and a stage
+  (request, purchase order, expense), the action (Ignore, Warn, Stop) and a threshold percent. Spending of an account
+  on a day counts against the approved budget's item for the sub period holding the day, else for its whole period. The
+  decision compares the actual (posted debits less credits) and committed (open reserved commitments by
+  `commitmentDate`) after the spending with the threshold: no policy or Ignore is not controlled, Warn reserves with a
+  warning, Stop refuses (`BUDGET_EXCEEDED`) unless a user holding `BUDGET_OVERRIDE` gives an override reason.
+  `check#Budget` previews it.
+- **Commitments.** `reserve#Commitment` (request or order line), `convert#Commitment` (to the next stage; with
+  `invoiceId`, a bill's posted debit lines) and `release#Commitment`, each idempotent per source line, revision and
+  stage (a different amount or account under the same key is `SOURCE_REVISION_REUSED`); a new revision of a source line
+  releases the earlier one's open commitment. A converted commitment's open amount is its amount less what later stages
+  hold, and it is Converted when none is left, so committed and actual never count the same spending. They need
+  `INVOICE_APPROVE`, `PAYABLE_EDIT`, `BUDGET_EDIT` or `ACCOUNTING_ADMIN` in the organization. A refused Stop is kept as a
+  `BcBlocked` commitment, in its own transaction (`record#BlockedCommitment`; the commitment's relationships carry no
+  foreign keys for this), and the `BudgetOverride` notification goes once to the organization's users holding
+  `BUDGET_OVERRIDE`; it is marked read when the source passes.
+- **Bills.** `approve#Payable` (P6) calls `convert#Commitment` with the bill after its posting: each posted debit line
+  converts its purchase order line's open commitment (`OrderItemBilling`) and becomes an actual commitment, keyed by the
+  bill's `approvedSourceVersion`; an account's lines are decided together, and `budgetOverrideReason` passes a Stop.
+  `get#InvoiceFinanceDetail`'s `budgetRows` are the invoice's commitments (F75).
+- **Variance.** `run#BudgetVariance` (`ACCOUNTING_VIEW`) checks the organization and that the period is the budget's own
+  or one of its sub periods (F6), and answers each account's budget as of the revision, committed, actual, remaining,
+  variance and its percent (none for a zero budget). `run#BudgetExpenseReport` and `run#BudgetExpenseDetailReport` stay
+  as they were for their callers.
+- **Spec.** `AccountingBudgets`.
+
 ## Libraries
 
 - `ledger/EntityLib.js`: the helpers the finance modules share: entity reads without artifact authorization (each
@@ -378,6 +424,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingPayables,AccountingMatching
 ./moq test mr-mantle --spec AccountingBankReconciliation,BankFileServices
 ./moq test mr-mantle --spec AccountingTax,TaxStatementServices
+./moq test mr-mantle --spec AccountingBudgets,BudgetServices
 ```
 
 The PDF specs need a Chromium for PDF (`pdf_chromium_path`; see [Run-Deploy](../../../../docs/Run-Deploy.md) and
