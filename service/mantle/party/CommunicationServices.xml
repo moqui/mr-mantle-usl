@@ -2374,6 +2374,46 @@ along with this software (see the LICENSE.md file). If not, see
                 return Array.from(out?.visibleWorkEffortIds || []).concat(Array.from(out?.visibleRequestIds || []),
                         Array.from(out?.visibleCommunicationEventIds || [])).includes(id)
             }
+            // the finance packages, and the finance parts of the asset package, whose records have no record mount of their own
+            const financeEntity = (entityName) => /^mantle\.(account|ledger)\.|^mantle\.other\.(budget|tax)\./.test(entityName)
+                    || ['mantle.product.asset.FixedAssetClass', 'mantle.product.asset.AssetDepreciation',
+                        'mantle.product.asset.AssetGlAppl', 'mantle.product.asset.AssetGlApplAccountOrg'].includes(entityName)
+            const fixedAssetType = (typeEnumId) => typeEnumId === 'AstTpFixed' || !!(typeEnumId && ec.entity
+                    .find('moqui.basic.Enumeration').condition({enumId:typeEnumId, parentEnumId:'AstTpFixed'})
+                    .disableAuthz().one())
+            const bookedAsset = (asset) => fixedAssetType(asset.assetTypeEnumId) && ec.entity
+                    .find('mantle.product.asset.AssetBookEvent').condition('assetId', asset.assetId).disableAuthz().count() > 0
+            const assetBookVisible = (assetId) => {
+                ec.message.pushErrors()
+                try {
+                    ec.service.sync().name('mantle.ledger.AssetBookServices.get#AssetBook').parameters({assetId:assetId})
+                            .disableAuthz().call()
+                    return !ec.message.hasError()
+                } catch (error) { return false }
+                finally { ec.message.clearErrors(); ec.message.popErrors() }
+            }
+            // the organizations the user works in, null for a system administrator (every one)
+            const userOrganizationIds = () => {
+                const access = ec.resource.script('component://mr-mantle/service/mantle/product/ProductAccess.js')
+                if (access.systemAdmin()) return null
+                const info = ec.service.sync().name('mantle.party.PartyServices.get#PartyOrganizationInfo')
+                        .parameters({partyId:ec.user.userAccount?.partyId}).disableAuthz().call() || {}
+                return Array.from(info.userOrgIds || [])
+            }
+            const counterpartyMethodVisible = (ownerPartyId) => {
+                const access = ec.resource.script('component://mr-mantle/service/mantle/product/ProductAccess.js')
+                const payments = ec.resource.script('component://mr-mantle/service/mantle/account/PaymentWorkflow.js')
+                if (!payments.broadRead() && !access.has('RECEIVABLE_VIEW') && !access.has('PAYABLE_VIEW')) return false
+                const orgIds = userOrganizationIds()
+                if (orgIds == null) return true
+                if (!orgIds.length) return false
+                const cf = ec.entity.conditionFactory
+                const side = (ownerField, orgField) => cf.makeCondition([cf.makeCondition(ownerField, 'equals', ownerPartyId),
+                        cf.makeCondition(orgField, 'in', orgIds)])
+                const between = (entity) => ec.entity.find(entity).disableAuthz().condition(cf.makeCondition([
+                        side('fromPartyId', 'toPartyId'), side('toPartyId', 'fromPartyId')], 'or')).count() > 0
+                return between('mantle.account.invoice.Invoice') || between('mantle.account.payment.Payment')
+            }
             visible = (entityName, keyField, id, depth) => {
                 // under the user's entity filters
                 const value = ec.entity.find(entityName).condition(keyField, id).one()
@@ -2384,37 +2424,47 @@ along with this software (see the LICENSE.md file). If not, see
                     const finance = ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')
                     try { finance.record({kind:'journals', recordId:value.acctgTransId}); return true } catch (error) { return false }
                 }
-                // an invoice, a payment and an internal organization's bank account (and their files) follow the documents' own
-                // reads, not only the organization filter: the invoice's reader by its side (readInvoice) or its side's editor
-                // (as Projects' billing), the payment's reader by its side (paymentScope), a bank reader (IronStone Accounting
-                // P21, F430)
-                if (entityName === 'mantle.account.invoice.Invoice' || entityName === 'mantle.account.invoice.InvoiceContent') {
-                    const invoices = ec.resource.script('component://mr-mantle/service/mantle/account/InvoiceWorkflowLib.js')
-                    try { invoices.readInvoice({invoiceId:value.invoiceId}); return true } catch (error) { /* an editor? */ }
-                    try { return ec.user.hasPermission(invoices.invoice({invoiceId:value.invoiceId}).permission) }
-                    catch (error) { return false }
-                }
-                if (entityName === 'mantle.account.payment.Payment' || entityName === 'mantle.account.payment.PaymentContent') {
-                    const payments = ec.resource.script('component://mr-mantle/service/mantle/account/PaymentWorkflow.js')
+                // The finance records (IronStone Accounting P21, F430, F437): an invoice, a payment and a payment method (and
+                // their files) follow the documents' own reads, not only the organization filter; a fixed asset its book's
+                // read; every other record of the finance packages has no record mount and is not seen through one.
+                const account = 'component://mr-mantle/service/mantle/account/'
+                const INVOICE_KINDS = ['mantle.account.invoice.Invoice', 'mantle.account.invoice.InvoiceContent']
+                const PAYMENT_KINDS = ['mantle.account.payment.Payment', 'mantle.account.payment.PaymentContent']
+                if (ec.user.userId && INVOICE_KINDS.includes(entityName))
+                    return ec.resource.script(account + 'InvoiceWorkflowLib.js').readable(value.invoiceId)
+                if (ec.user.userId && PAYMENT_KINDS.includes(entityName)) {
+                    const payments = ec.resource.script(account + 'PaymentWorkflow.js')
                     try { payments.paymentScope({paymentId:value.paymentId}); return true } catch (error) { return false }
                 }
                 const METHOD = 'mantle.account.method.PaymentMethod'
-                if (entityName === METHOD || entityName === 'mantle.account.method.PaymentMethodContent') {
+                if (ec.user.userId && [METHOD, 'mantle.account.method.PaymentMethodContent'].includes(entityName)) {
                     const method = entityName === METHOD ? value
                             : ec.entity.find(METHOD).condition('paymentMethodId', value.paymentMethodId).disableAuthz().one()
-                    if (method == null) return false
-                    const internal = method.ownerPartyId && ec.entity.find('mantle.party.PartyRole')
+                    if (method == null || !method.ownerPartyId) return false
+                    const internal = ec.entity.find('mantle.party.PartyRole')
                             .condition({partyId:method.ownerPartyId, roleTypeId:'OrgInternal'}).disableAuthz().one()
                     if (internal) {
-                        const bank = ec.resource.script('component://mr-mantle/service/mantle/account/BankReconciliation.js')
+                        const bank = ec.resource.script(account + 'BankReconciliation.js')
                         try { bank.execute('bank', {paymentMethodId:method.paymentMethodId, need:'read'}); return true }
                         catch (error) { return false }
                     }
-                    // a customer's or supplier's account: a finance reader who may see its owner
-                    const finance = ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')
-                    if (!finance.capabilities().read || !method.ownerPartyId) return false
-                    return visible(PARTY, 'partyId', method.ownerPartyId, depth)
+                    // a customer's or supplier's method: a payment reader (paymentContext's read) of one of the user's
+                    // organizations that has an invoice or payment with its owner (F440)
+                    return counterpartyMethodVisible(method.ownerPartyId)
                 }
+                // an asset Accounting keeps a book of (a fixed asset with book events): its book's reader (get#AssetBook); an
+                // asset with no book stays its app's record (a calendar's equipment, Products' stock)
+                if (ec.user.userId && entityName === 'mantle.product.asset.Asset' && bookedAsset(value))
+                    return assetBookVisible(value.assetId)
+                // an agreement: of one of the user's organizations, with a party the user may see
+                if (ec.user.userId && entityName === 'mantle.party.agreement.Agreement') {
+                    const orgIds = userOrganizationIds()
+                    const ours = orgIds == null
+                            || [value.organizationPartyId, value.otherPartyId].some(partyId => orgIds.includes(partyId))
+                    if (!ours) return false
+                    return !value.otherPartyId || visible(PARTY, 'partyId', value.otherPartyId, depth)
+                }
+                if (ec.user.userId && financeEntity(entityName)) return false
                 // Catalog record mounts/drive links also enforce owner scope without an active-org filter. A catalog
                 // user's internal file/room callback retains this rule even when artifact authorization is disabled.
                 if (['mantle.product.Product', 'mantle.product.category.ProductCategory', 'mantle.product.feature.ProductFeature', 'mantle.product.feature.ProductFeatureGroup'].includes(entityName)
@@ -2483,6 +2533,19 @@ along with this software (see the LICENSE.md file). If not, see
                     if (depth > 5 || !value.changedEntityName || !value.pkPrimaryValue) return false
                     const sourceKeys = Object.keys(ec.entity.makeValue(value.changedEntityName).getPrimaryKeys())
                     if (sourceKeys.length !== 1 || !visible(value.changedEntityName,sourceKeys[0],value.pkPrimaryValue,depth+1)) return false
+                    // an asset's cost and book fields: its book's reader for an asset Accounting keeps a book of, else its
+                    // product's cost reader (CostPolicy), as its receipts (F437)
+                    if (value.changedEntityName === 'mantle.product.asset.Asset' && ec.user.userId
+                            && /cost|depreciat|salvage|life|value|price/i.test(value.changedFieldName || '')) {
+                        const asset = ec.entity.find('mantle.product.asset.Asset').condition('assetId', value.pkPrimaryValue)
+                                .disableAuthz().one()
+                        if (!asset) return false
+                        if (bookedAsset(asset)) return assetBookVisible(asset.assetId)
+                        try {
+                            ec.resource.script('component://mr-mantle/service/mantle/product/CostPolicy.js')
+                                    .scope({organizationPartyId:asset.ownerPartyId, productId:asset.productId})
+                        } catch (error) { return false }
+                    }
                     if (value.changedEntityName === WORK_EFFORT && /cost|rate|amount/i.test(value.changedFieldName || '')) {
                         const source = ec.entity.find(WORK_EFFORT).condition('workEffortId',value.pkPrimaryValue).disableAuthz().one()
                         if (source && ['WepRouting','WepRoutingTask'].includes(source.purposeEnumId)) ec.resource.script('component://mr-mantle/service/mantle/product/MethodPolicy.js')

@@ -142,6 +142,15 @@ along with this software (see the LICENSE.md file). If not, see
                     const caps = finance.capabilities()
                     if (!caps.reportRead && !caps.glPost && !caps.admin && !(documentId === 'MantlePayment' && (caps.arRead || caps.apRead || caps.paymentRead))) continue
                 }
+                // an invoice: a finance reader, or a side's editor of a project's billing (InvoiceWorkflowLib.readable), never
+                // a client (ProductAccess.has) (IronStone Accounting P21, F439)
+                if (documentId === 'MantleInvoice') {
+                    const policy = 'component://mr-mantle/service/mantle/ledger/AccountingPolicy.js'
+                    const caps = ec.resource.script(policy).capabilities()
+                    const access = ec.resource.script('component://mr-mantle/service/mantle/product/ProductAccess.js')
+                    if (!caps.reportRead && !caps.admin && !caps.arRead && !caps.apRead && !access.has('RECEIVABLE_EDIT')
+                            && !access.has('PAYABLE_EDIT')) continue
+                }
                 const document = ec.entity.find('moqui.entity.document.DataDocument').condition('dataDocumentId', documentId)
                         .useCache(true).one()
                 if (document == null || !ec.artifactExecution.isPermitted(document.primaryEntityName, 'AT_ENTITY', 'view')) continue
@@ -249,6 +258,7 @@ along with this software (see the LICENSE.md file). If not, see
             total = page.total
             totalRelation = page.totalRelation || 'eq'
 
+            let financeDropped = false
             for (const hit of page.hits) {
                 const document = documents[hit.documentId]
                 const body = hit.body || {}
@@ -262,21 +272,17 @@ along with this software (see the LICENSE.md file). If not, see
                 if (current == null) continue
                 // an invoice and a payment by their own reads, of their side (a receivable reader does not find a bill), as
                 // get#RecordLinkInfo has them; the organization limit above does not know the side (IronStone Accounting P21,
-                // F431). An invoice's side editor (Projects' billing) finds it too.
+                // F431, F438). A dropped hit makes the total the page's and the finance counts the page's (F439).
                 if (hit.documentId === 'MantleInvoice' || hit.documentId === 'MantlePayment') {
                     const account = 'component://mr-mantle/service/mantle/account/'
                     let readable = true
-                    if (hit.documentId === 'MantleInvoice') {
-                        const invoices = ec.resource.script(account + 'InvoiceWorkflowLib.js')
-                        try { invoices.readInvoice({invoiceId: current.invoiceId}) } catch (error) {
-                            try { readable = ec.user.hasPermission(invoices.invoice({invoiceId: current.invoiceId}).permission) }
-                            catch (other) { readable = false }
-                        }
-                    } else {
+                    if (hit.documentId === 'MantleInvoice')
+                        readable = ec.resource.script(account + 'InvoiceWorkflowLib.js').readable(current.invoiceId)
+                    else {
                         try { ec.resource.script(account + 'PaymentWorkflow.js').paymentScope({paymentId: current.paymentId}) }
                         catch (error) { readable = false }
                     }
-                    if (!readable) continue
+                    if (!readable) { financeDropped = true; continue }
                 }
                 if (hit.documentId === 'MantleCommunicationEvent' && boundMailboxes.has(current.contactListId)) {
                     const was = ec.artifactExecution.disableAuthz()
@@ -321,22 +327,28 @@ along with this software (see the LICENSE.md file). If not, see
             // The index cannot count current bound-post visibility. Report only the authorized page as the total, and
             // count the communication events from it, never from the index, instead of disclosing stale concealed
             // matches; the other types' facets are the index's, over the authorized match.
-            if (liveMailboxCounts) { total = results.length; totalRelation = 'gte' }
+            // The same for invoices and payments when a hit was dropped by its side (F439): the page is the total, and their
+            // counts are the page's.
+            const liveTypes = (liveMailboxCounts ? ['MantleCommunicationEvent'] : [])
+                    .concat(financeDropped ? ['MantleInvoice', 'MantlePayment'] : [])
+            if (liveTypes.length) { total = results.length; totalRelation = 'gte' }
             // facets over the whole authorized match, not the page
             const facetList = facets ?? []
             if (facetList.length) {
                 const facetFilter = {bool: {all: [request.query === 'match_all' || request.query == null ? 'match_all' : lexicalQuery, filter]}}
                 if (facetList.includes('entityType')) {
-                    const indexed = liveMailboxCounts ? types.filter((type) => type !== 'MantleCommunicationEvent') : types
+                    const indexed = types.filter((type) => !liveTypes.includes(type))
                     const counts = indexed.length ? ec.search.aggregate({documentType: indexed, filter: facetFilter,
                             aggs: {types: {terms: {field: '_document', size: indexed.length}}}}) : null
                     facetCounts.entityType = (counts ? counts.types.buckets : []).map((bucket) =>
                             ({value: bucket.key, label: documents[bucket.key] ? documents[bucket.key].name : bucket.key, count: bucket.doc_count}))
-                    const live = liveMailboxCounts ? results.filter((result) => result.entityType === 'MantleCommunicationEvent').length : 0
-                    if (live) facetCounts.entityType.push({value: 'MantleCommunicationEvent',
-                            label: documents.MantleCommunicationEvent.name, count: live})
+                    for (const type of liveTypes) {
+                        const live = documents[type] ? results.filter((result) => result.entityType === type).length : 0
+                        if (live) facetCounts.entityType.push({value: type, label: documents[type].name, count: live})
+                    }
                 }
-                const categoryField = types.length === 1 && !liveMailboxCounts ? documents[types[0]].roles.category : null
+                const categoryField = types.length === 1 && !liveTypes.includes(types[0])
+                        ? documents[types[0]].roles.category : null
                 if (facetList.includes('category') && categoryField) {
                     const counts = ec.search.aggregate({documentType: types[0], filter: facetFilter, aggs: {categories: {terms: {field: categoryField, size: 50}}}})
                     facetCounts.category = counts.categories.buckets.map((bucket) => ({value: bucket.key, label: bucket.key, count: bucket.doc_count}))

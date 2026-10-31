@@ -3865,6 +3865,8 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="sourceVersion"/>
             <parameter name="contentHash"/>
             <parameter name="contentLocation"/>
+            <parameter name="receivable" type="Boolean"><description>The organization issued it (a receivable); else a
+                payable the vendor issued.</description></parameter>
         </out-parameters>
         <actions>
             <set field="workflow" value="component://mr-mantle/service/mantle/account/InvoiceWorkflow.js"/>
@@ -3877,6 +3879,7 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="templateLocation" from="String(templateLocation || '').endsWith('.html.fancy') ? templateLocation :
                 defaultTemplate"/>
             <!-- the organization issues a receivable, a customer credit too; the vendor issues a payable -->
+            <set field="receivable" from="!!scope.receivable"/>
             <set field="issuerPartyId" from="scope.receivable ? scope.organizationPartyId : scope.invoice.fromPartyId"/>
             <set field="issuerIsFrom" from="issuerPartyId == scope.invoice.fromPartyId"/>
             <set field="fromName" from="issuerIsFrom ? scope.invoice.fromName : scope.invoice.toName"/>

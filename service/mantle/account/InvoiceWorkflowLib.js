@@ -75,6 +75,42 @@ function readInvoice(p) {
         denied("PERMISSION_DENIED", "Invoice view authority is required")
     return out
 }
+// Projects' billing: the editor of an invoice's side (RECEIVABLE_EDIT or PAYABLE_EDIT, never a client) who sees one of the
+// projects it bills (WorkEffortInvoice, or time billed on it: TimeEntry.invoiceId or vendorInvoiceId), as Projects'
+// get#InvoiceProjects scopes them (IronStone Accounting P21, F438).
+function projectEditor(p) {
+    const found = invoice(p)
+    if (!has(found.permission)) return false
+    const rootOf = workEffortId => {
+        const row = workEffortId && one("mantle.work.effort.WorkEffort", {workEffortId})
+        return row ? (row.workEffortTypeEnumId === "WetProject" ? row.workEffortId : row.rootWorkEffortId || null) : null
+    }
+    const linked = rows("mantle.work.effort.WorkEffortInvoice", {invoiceId: p.invoiceId})
+    const projectIds = new Set(linked.map(row => rootOf(row.workEffortId)))
+    for (const field of ["invoiceId", "vendorInvoiceId"]) {
+        const timeRows = find("mantle.work.time.TimeEntry", {[field]: p.invoiceId}).selectField("workEffortId").list()
+        for (const row of Array.from(timeRows)) projectIds.add(rootOf(row.workEffortId))
+    }
+    projectIds.delete(null)
+    if (!projectIds.size) return false
+    const visible = call("mantle.work.ProjectServices.get#VisibleProjectInfo")
+    const visibleIds = Array.from(visible.visibleProjectIds || [])
+    return !!visible.allProjects || [...projectIds].some(id => visibleIds.includes(id))
+}
+// Whether the user reads an invoice outside the finance screens (record mounts, search): its reader (readInvoice) or a
+// project's billing editor (projectEditor). Answers false, never an error.
+function readable(invoiceId) {
+    try {
+        readInvoice({invoiceId})
+        return true
+    } catch (error) {
+        try {
+            return projectEditor({invoiceId})
+        } catch (other) {
+            return false
+        }
+    }
+}
 function writeInvoice(p, lock = true) {
     const initial = invoice(p)
     requirePermission(initial.permission)
@@ -246,6 +282,8 @@ function escapeHtml(value) {
     organization,
     invoice,
     readInvoice,
+    projectEditor,
+    readable,
     writeInvoice,
     revision,
     fingerprint,
