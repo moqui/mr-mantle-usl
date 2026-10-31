@@ -76,6 +76,16 @@ spec({
             accountNumber: "123456789",
             routingNumber: "111000025"
         })
+        f.savingsId = "ACCT_P9_BANK_SAVINGS"
+        call("create#mantle.account.method.PaymentMethod", {
+            paymentMethodId: f.savingsId,
+            ownerPartyId: f.org,
+            paymentMethodTypeEnumId: "PmtBankAccount",
+            currencyUomId: "USD",
+            fromDate: 0,
+            description: "Savings bank",
+            glAccountId: "111100000"
+        })
         f.users.banker = h.user(f, "BANKER", ["BANK_RECONCILE", "PAYMENT_VIEW", "PAYMENT_EDIT"])
         f.users.reader = h.user(f, "BANK_READER", ["ACCOUNTING_VIEW"])
         f.users.payer = h.user(f, "PAYER", ["PAYMENT_VIEW", "PAYMENT_EDIT"])
@@ -157,7 +167,7 @@ feature("the same BAI2 file imported twice adds nothing the second time, through
         other.includes("STATEMENT_FILE_INVALID")
     }
 })
-feature("an OFX line is identified by its FIT id", {
+feature("an OFX line is identified by its FIT id; a day without a time is that day; a wrong account is named masked", {
     when() {
         const ofx = `OFXHEADER:100
 <OFX><BANKMSGSRSV1><STMTTRNRS><STMTRS><CURDEF>USD
@@ -166,15 +176,24 @@ feature("an OFX line is identified by its FIT id", {
 <STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20261020120000<TRNAMT>-25.00<FITID>OFX-P9-1<NAME>Supplier</STMTTRN>
 <STMTTRN><TRNTYPE>DEBIT<DTPOSTED>20261020120000<TRNAMT>-25.00<FITID>OFX-P9-1<NAME>Supplier again</STMTTRN>
 <STMTTRN><TRNTYPE>CREDIT<DTPOSTED>20261020<TRNAMT>abc<FITID>OFX-P9-2</STMTTRN>
+<STMTTRN><TRNTYPE>CREDIT<DTPOSTED>20261021<TRNAMT>5.00<FITID>OFX-P9-3</STMTTRN>
 </BANKTRANLIST></STMTRS></STMTTRNRS></BANKMSGSRSV1></OFX>`
         const review = native("review#StatementImport", {paymentMethodId: f.bankId, formatEnumId: "SifOfx", statementText: ofx})
         const result = native("commit#StatementImport", {statementImportId: review.statementImportId})
-        return {review, result, created: line(f.bankId, "OFX-P9-1")}
+        const wrong = rejected("review#StatementImport", {
+            paymentMethodId: f.bankId,
+            formatEnumId: "SifOfx",
+            statementText: ofx.replace("<BANKID>111000025<ACCTID>123456789", "<BANKID>999999999<ACCTID>555")
+        })
+        return {review, result, created: line(f.bankId, "OFX-P9-1"), dayOnly: line(f.bankId, "OFX-P9-3"), wrong}
     },
-    then({review, result, created}) {
-        review.newCount == 1 && review.duplicateCount == 1 && review.rejectedCount == 1
-        result.committedCount == 1
+    then({review, result, created, dayOnly, wrong}) {
+        review.newCount == 2 && review.duplicateCount == 1 && review.rejectedCount == 1
+        result.committedCount == 2
         created.transName == "Supplier"
+        ec.l10n.format(dayOnly.postedDate, "yyyy-MM-dd") == "2026-10-21"
+        wrong.includes("999999999") && wrong.includes("•••• 6789")
+        !wrong.includes("111000025") && !wrong.includes("123456789")
     }
 })
 feature("a rule applies only an exact unambiguous match; an ambiguous rule suggests and does not apply", {
@@ -228,64 +247,70 @@ feature("a rule applies only an exact unambiguous match; an ambiguous rule sugge
         ended.resultRows.every(row => row.wouldApply == false)
     }
 })
-feature("two sessions cannot clear one line", {
+feature("statements follow one another: one claims a period, a finished one keeps its lines and days", {
     when() {
-        // January and February 2026, months no other feature posts lines in
-        const first = native("create#Reconciliation", {
-            paymentMethodId: f.bankId,
-            statementReference: "Concurrent",
-            statementFromDate: "2026-01-01",
-            statementThruDate: "2026-01-31",
-            openingBalance: 0,
-            closingBalance: 0
-        })
-        const args = {paymentMethodId: f.bankId}
+        const savings = f.savingsId
+        const day = (month, n) => new Date(2026, month - 1, n, 12).getTime()
+        const session = (from, thru, extra = {}) =>
+            Object.assign({paymentMethodId: savings, statementFromDate: from, statementThruDate: thru, closingBalance: -9}, extra)
+        // two sessions started at once for one period: one is refused
         const concurrent = parallel(
             2,
             (thread, args) => {
                 login("john.doe")
                 ec.artifactExecution.disableAuthz()
                 try {
-                    return call("mantle.account.ReconciliationServices.create#Reconciliation", {
-                        paymentMethodId: args.paymentMethodId,
-                        statementFromDate: "2026-02-01",
-                        statementThruDate: "2026-02-28",
-                        openingBalance: 0,
-                        closingBalance: 0
-                    })
+                    return call("mantle.account.ReconciliationServices.create#Reconciliation", args)
                 } catch (error) {
                     ec.message.clearErrors()
                     return {error: error.message}
                 }
             },
-            args,
+            session("2026-01-01", "2026-01-31", {openingBalance: 0}),
             {transaction: false, timeout: 30}
         )
-        const overlap = rejected("create#Reconciliation", {
-            paymentMethodId: f.bankId,
-            statementFromDate: "2026-01-15",
-            statementThruDate: "2026-02-10",
-            openingBalance: 0,
-            closingBalance: 0
-        })
-        // a line cleared in January moved into February is still January's
-        const fitId = bankLine("SESSION-LINE", "-9.00", {postedDate: new Date(2026, 0, 20, 12).getTime(), transType: "PMTT_FEE"})
-        native("noReconcile#PaymentMethodTrans", {paymentMethodId: f.bankId, fitId, noReconcileReason: "Bank fee booked monthly"})
-        native("store#Reconciliation", {bankReconciliationId: first.bankReconciliationId, clearFitIdList: [fitId]})
-        native("update#PaymentMethodTrans", {paymentMethodId: f.bankId, fitId, postedDate: new Date(2026, 1, 20, 12).getTime()})
-        const february = concurrent.find(row => row.bankReconciliationId)
-        const second = rejected("store#Reconciliation", {
-            bankReconciliationId: february.bankReconciliationId,
-            clearFitIdList: [fitId]
-        })
-        return {concurrent, overlap, second}
+        const january = concurrent.find(row => row.bankReconciliationId).bankReconciliationId
+        const fitId = bankLine("SESSION-LINE", "-9.00", {paymentMethodId: savings, postedDate: day(1, 20), transType: "PMTT_FEE"})
+        native("noReconcile#PaymentMethodTrans", {paymentMethodId: savings, fitId, noReconcileReason: "Bank fee booked monthly"})
+        native("store#Reconciliation", {bankReconciliationId: january, clearFitIdList: [fitId]})
+        const previousOpen = rejected("create#Reconciliation", session("2026-02-01", "2026-02-28"))
+        native("finish#Reconciliation", {bankReconciliationId: january})
+        return {
+            concurrent,
+            previousOpen,
+            gap: rejected("create#Reconciliation", session("2026-03-01", "2026-03-31")),
+            order: rejected("create#Reconciliation", session("2025-12-01", "2025-12-31", {openingBalance: 0})),
+            moved: rejected("update#PaymentMethodTrans", {paymentMethodId: savings, fitId, postedDate: day(2, 20)}),
+            added: rejected("create#PaymentMethodTrans", {
+                paymentMethodId: savings,
+                fitId: "LATE",
+                postedDate: day(1, 25),
+                transAmount: "1"
+            }),
+            review: native("review#StatementImport", {
+                paymentMethodId: savings,
+                formatEnumId: "SifCsv",
+                statementText: csv(["2026-01-25,Late fee,-1.00,L1", "2026-02-02,February fee,-2.00,L2"])
+            }),
+            february: native("create#Reconciliation", session("2026-02-01", "2026-02-28"))
+        }
     },
-    then({concurrent, overlap, second}) {
+    then({concurrent, previousOpen, gap, order, moved, added, review, february}) {
         concurrent.filter(row => row.bankReconciliationId).length == 1
-        concurrent.filter(row => row.error).length == 1
         concurrent.find(row => row.error).error.includes("RECONCILIATION_OVERLAP")
-        overlap.includes("RECONCILIATION_OVERLAP")
-        second.includes("BANK_LINE_CLEARED")
+        previousOpen.includes("PREVIOUS_STATEMENT_OPEN")
+        gap.includes("STATEMENT_GAP")
+        order.includes("STATEMENT_ORDER")
+        moved.includes("BANK_LINE_FINISHED")
+        added.includes("BANK_PERIOD_FINISHED")
+        review.newCount == 1 && review.rejectedCount == 1
+        toDecimal(
+            ec.entity
+                .find("mantle.account.method.BankReconciliation")
+                .condition("bankReconciliationId", february.bankReconciliationId)
+                .disableAuthz()
+                .one().openingBalance
+        ).eq(-9)
     }
 })
 feature("a statement with a difference cannot be finished; at zero difference it finishes and its lines stay reconciled", {
@@ -305,6 +330,12 @@ feature("a statement with a difference cannot be finished; at zero difference it
         })
         const id = session.bankReconciliationId
         native("reconcile#BankLine", {paymentMethodId: f.bankId, fitId: income, candidate: "payment:" + paid})
+        const notOpen = rejected("reconcile#BankLine", {paymentMethodId: f.bankId, fitId: income, candidate: "payment:" + paid})
+        const notCandidate = rejected("reconcile#BankLine", {
+            paymentMethodId: f.bankId,
+            fitId: open,
+            candidate: "payment:" + paid
+        })
         const noReason = rejected("store#Reconciliation", {bankReconciliationId: id, clearFitIdList: [fee]})
         native("noReconcile#PaymentMethodTrans", {paymentMethodId: f.bankId, fitId: fee, noReconcileReason: "Monthly fee"})
         const unmatched = rejected("store#Reconciliation", {bankReconciliationId: id, clearFitIdList: [open]})
@@ -318,6 +349,10 @@ feature("a statement with a difference cannot be finished; at zero difference it
         native("finish#Reconciliation", {bankReconciliationId: id})
         const finished = native("get#Reconciliation", {bankReconciliationId: id})
         const reopenLine = rejected("unreconcile#PaymentMethodTrans", {paymentMethodId: f.bankId, fitId: income})
+        // the payment stays on its finished line: another line cannot take it, and voiding it cannot clear it
+        const other = bankLine("MAY-OTHER", "75", {postedDate: new Date(2026, 4, 2, 12).getTime()})
+        const takeover = rejected("reconcile#PaymentMethodTrans", {paymentMethodId: f.bankId, fitId: other, paymentId: paid})
+        const voidClear = rejected("clear#PaymentTrans", {paymentId: paid})
         const nextOpening = rejected("create#Reconciliation", {
             paymentMethodId: f.bankId,
             statementFromDate: "2026-04-01",
@@ -336,9 +371,43 @@ feature("a statement with a difference cannot be finished; at zero difference it
             .condition("bankReconciliationId", next.bankReconciliationId)
             .disableAuthz()
             .one()
-        return {noReason, unmatched, uncleared, difference, figures, finished, reopenLine, nextOpening, nextRow, paid}
+        return {
+            notOpen,
+            notCandidate,
+            noReason,
+            unmatched,
+            uncleared,
+            difference,
+            figures,
+            finished,
+            reopenLine,
+            takeover,
+            voidClear,
+            nextOpening,
+            nextRow,
+            paid
+        }
     },
-    then({noReason, unmatched, uncleared, difference, figures, finished, reopenLine, nextOpening, nextRow, paid}) {
+    then({
+        notOpen,
+        notCandidate,
+        noReason,
+        unmatched,
+        uncleared,
+        difference,
+        figures,
+        finished,
+        reopenLine,
+        takeover,
+        voidClear,
+        nextOpening,
+        nextRow,
+        paid
+    }) {
+        notOpen.includes("BANK_LINE_NOT_OPEN")
+        notCandidate.includes("CANDIDATE_INVALID")
+        takeover.includes("BANK_LINE_FINISHED")
+        voidClear.includes("BANK_LINE_FINISHED")
         noReason.includes("BANK_LINE_UNMATCHED")
         unmatched.includes("BANK_LINE_UNMATCHED")
         uncleared.includes("BANK_LINES_UNCLEARED")
@@ -390,6 +459,25 @@ feature("a deposit's one bank line reconciles its receipts once", {
             fitId: other,
             candidate: "deposit:" + slip.paymentDepositId
         })
+        // the direct service refuses the deposit's second line too
+        const direct = rejected("reconcile#PaymentMethodTrans", {
+            paymentMethodId: f.bankId,
+            fitId: other,
+            paymentDepositId: slip.paymentDepositId
+        })
+        const entryStatus = () =>
+            [a, b]
+                .flatMap(id =>
+                    Array.from(
+                        ec.entity
+                            .find("mantle.ledger.transaction.AcctgTransAndEntry")
+                            .condition({paymentId: id, glAccountId: "111100000"})
+                            .disableAuthz()
+                            .list()
+                    ).map(row => row.reconcileStatusId)
+                )
+                .join()
+        const reconciledEntries = entryStatus()
         const reconciled = [a, b].map(id => payment(id).reconcileStatusId)
         native("unreconcile#PaymentMethodTrans", {paymentMethodId: f.bankId, fitId: one})
         return {
@@ -402,10 +490,30 @@ feature("a deposit's one bank line reconciles its receipts once", {
             second,
             reconciled,
             undone: [a, b].map(id => payment(id).reconcileStatusId),
+            direct,
+            reconciledEntries,
+            undoneEntries: entryStatus(),
             receipts: [a, b, elsewhere]
         }
     },
-    then({offered, slip, retry, twice, outside, candidates, second, reconciled, undone, receipts}) {
+    then({
+        offered,
+        slip,
+        retry,
+        twice,
+        outside,
+        candidates,
+        second,
+        reconciled,
+        undone,
+        receipts,
+        direct,
+        reconciledEntries,
+        undoneEntries
+    }) {
+        direct.includes("DEPOSIT_RECONCILED")
+        reconciledEntries == "AterRec,AterRec"
+        undoneEntries == "AterNot,AterNot"
         offered.receiptRows.some(row => row.paymentId === receipts[0])
         offered.receiptRows.every(row => row.paymentId !== receipts[2])
         toDecimal(slip.totalAmount).eq(100) && slip.paymentCount == 2
@@ -415,7 +523,7 @@ feature("a deposit's one bank line reconciles its receipts once", {
         outside.includes("RECEIPT_INVALID")
         candidates.some(row => row.value === "deposit:" + slip.paymentDepositId)
         candidates.every(row => !row.value.startsWith("payment:" + receipts[0]))
-        second.includes("DEPOSIT_RECONCILED")
+        second.includes("CANDIDATE_INVALID")
         reconciled.join() == "PmtrRec,PmtrRec"
         undone.join() == "PmtrNot,PmtrNot"
     }
@@ -498,5 +606,85 @@ feature("a financial account's movements need payment edit authority in its orga
         reader == f.org
         readerEdit.includes("PERMISSION_DENIED")
         otherOrganization.includes("FINANCIAL_ACCOUNT_UNAVAILABLE")
+    }
+})
+feature("a finance user's own movement that cannot post is refused and changes nothing; an order's movement is not", {
+    when() {
+        const fin = "mantle.account.FinancialAccountServices."
+        const finAccountId = call(fin + "create#FinancialAccount", {
+            finAccountTypeId: "DepositAccount",
+            finAccountName: "Customer deposit",
+            organizationPartyId: f.org,
+            ownerPartyId: f.customer
+        }).finAccountId
+        const balance = () =>
+            toDecimal(
+                ec.entity
+                    .find("mantle.account.financial.FinancialAccount")
+                    .condition("finAccountId", finAccountId)
+                    .disableAuthz()
+                    .one().actualBalance ?? 0
+            )
+        const assignment = glAccountId =>
+            ec.entity
+                .find("mantle.ledger.account.GlAccountOrganization")
+                .condition({glAccountId, organizationPartyId: f.org})
+                .disableAuthz()
+                .one()
+        if (!assignment("258100000"))
+            call("create#mantle.ledger.account.GlAccountOrganization", {
+                glAccountId: "258100000",
+                organizationPartyId: f.org,
+                fromDate: 0
+            })
+        // the deposit liability account is not the organization's, so the posting guard refuses the posting
+        if (assignment("251500000"))
+            call("delete#mantle.ledger.account.GlAccountOrganization", {glAccountId: "251500000", organizationPartyId: f.org})
+        const refused = rejected(fin + "record#FinancialAccountMovement", {finAccountId, movement: "deposit", amount: "30"})
+        const afterRefusal = balance()
+        // the movement services orders and payments call keep their automatic posting: the error journal
+        call(fin + "deposit#FinancialAccount", {finAccountId, amount: "5"})
+        const automatic = balance()
+        call("create#mantle.ledger.account.GlAccountOrganization", {
+            glAccountId: "251500000",
+            organizationPartyId: f.org,
+            fromDate: 0
+        })
+        const recorded = call(fin + "record#FinancialAccountMovement", {finAccountId, movement: "deposit", amount: "30"})
+        const tooMuch = rejected(fin + "record#FinancialAccountMovement", {finAccountId, movement: "withdraw", amount: "500"})
+        return {refused, afterRefusal, automatic, recorded, tooMuch, final: balance()}
+    },
+    then({refused, afterRefusal, automatic, recorded, tooMuch, final}) {
+        refused.includes("ACCOUNT_INACTIVE")
+        afterRefusal.isZero()
+        automatic.eq(5)
+        toDecimal(recorded.postBalance).eq(35)
+        tooMuch.includes("BALANCE_INSUFFICIENT")
+        final.eq(35)
+    }
+})
+feature("a payment two lines match is applied to neither, by the rules and by match#PaymentMethodTransUnmatched", {
+    when() {
+        const paymentId = receipt("330")
+        bankLine("TWIN-A", "330", {transName: "ZETA PAYMENT A"})
+        bankLine("TWIN-B", "330", {transName: "ZETA PAYMENT B"})
+        const rule = native("store#Rule", {
+            organizationPartyId: f.org,
+            matchText: "zeta payment",
+            directionEnumId: "BmdIncoming",
+            partyId: f.customer,
+            autoApply: "Y"
+        })
+        const test = native("test#Rule", {organizationPartyId: f.org, bankMatchRuleId: rule.bankMatchRuleId})
+        const applied = native("apply#Rules", {organizationPartyId: f.org, paymentMethodId: f.bankId})
+        native("store#Rule", {organizationPartyId: f.org, bankMatchRuleId: rule.bankMatchRuleId, ended: "Y"})
+        native("match#PaymentMethodTransUnmatched", {paymentMethodId: f.bankId, lookBackDays: 10})
+        return {test, applied, paymentId, lines: ["TWIN-A", "TWIN-B"].map(fitId => line(f.bankId, fitId).paymentId)}
+    },
+    then({test, applied, paymentId, lines}) {
+        test.resultRows.filter(row => row.fitId.startsWith("TWIN-")).every(row => row.ambiguous && !row.wouldApply)
+        applied.appliedRows.every(row => !row.fitId.startsWith("TWIN-"))
+        lines.every(id => id == null)
+        payment(paymentId).reconcileStatusId != "PmtrRec"
     }
 })

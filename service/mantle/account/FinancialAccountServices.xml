@@ -106,6 +106,62 @@ along with this software (see the LICENSE.md file). If not, see
                 <return error="true" message="PERMISSION_DENIED: Payment edit and payment view authority are required"/></if>
         </actions>
     </service>
+    <service verb="record" noun="FinancialAccountMovement" allow-remote="false">
+        <description>A finance user's own deposit, withdrawal or adjustment of a stored-value account: after
+            check#FinancialAccountAccess (edit), through deposit#, withdraw# or adjust#FinancialAccount, whose posting
+            SECA posts it. A finance user's direct post is refused with its reason, not sent to the error journal: when the
+            movement's transaction does not post, or a withdrawal finds too little balance, the movement is refused and
+            nothing changes. Orders, payments and gift cards call the movement services themselves and keep their
+            automatic posting.</description>
+        <in-parameters>
+            <parameter name="finAccountId" required="true"/>
+            <parameter name="movement" required="true"><description>deposit, withdraw or adjust</description></parameter>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="reasonEnumId"/>
+            <parameter name="transactionDate" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="finAccountTransId"/>
+            <parameter name="preBalance" type="BigDecimal"/>
+            <parameter name="postBalance" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <service-call name="mantle.account.FinancialAccountServices.check#FinancialAccountAccess"
+                    in-map="{finAccountId:finAccountId, need:'edit'}"/>
+            <set field="moveParameters" from="Object.fromEntries(Object.entries({finAccountId:finAccountId, amount:amount,
+                    reasonEnumId:reasonEnumId, transactionDate:transactionDate}).filter(([, value]) =&gt; value != null
+                    &amp;&amp; value !== ''))"/>
+            <if condition="movement == 'deposit'">
+                <service-call name="mantle.account.FinancialAccountServices.deposit#FinancialAccount" out-map="moved"
+                        in-map="moveParameters"/>
+                <else-if condition="movement == 'withdraw'">
+                    <service-call name="mantle.account.FinancialAccountServices.withdraw#FinancialAccount" out-map="moved"
+                            in-map="moveParameters"/>
+                </else-if>
+                <else-if condition="movement == 'adjust'">
+                    <service-call name="mantle.account.FinancialAccountServices.adjust#FinancialAccount" out-map="moved"
+                            in-map="moveParameters"/>
+                </else-if>
+                <else>
+                    <return error="true" message="MOVEMENT_INVALID: Choose a deposit, a withdrawal or an adjustment"/>
+                </else>
+            </if>
+            <if condition="moved.responseCode == 'nsf' || !moved.finAccountTransId">
+                <return error="true" message="BALANCE_INSUFFICIENT: The account does not have this amount available"/></if>
+            <set field="finAccountTransId" from="moved.finAccountTransId"/>
+            <set field="preBalance" from="moved.preBalance"/>
+            <set field="postBalance" from="moved.postBalance"/>
+            <entity-find entity-name="mantle.ledger.transaction.AcctgTrans" list="postingList" disable-authz="true">
+                <econdition field-name="finAccountTransId"/>
+            </entity-find>
+            <iterate list="postingList" entry="posting">
+                <if condition="posting.isPosted != 'Y'">
+                    <return error="true" message="${posting.postingFailureCode || 'POSTING_FAILED'}: ${
+                            posting.postingFailureMessage || 'The movement could not be posted'}"/>
+                </if>
+            </iterate>
+        </actions>
+    </service>
     <service verb="create" noun="FinancialAccount">
         <in-parameters>
             <auto-parameters entity-name="mantle.account.financial.FinancialAccount" include="nonpk">

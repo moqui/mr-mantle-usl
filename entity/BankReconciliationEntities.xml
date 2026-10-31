@@ -65,9 +65,13 @@ along with this software (see the LICENSE.md file). If not, see
             <moqui.basic.StatusType description="Statement Import" statusTypeId="StatementImport"/>
             <moqui.basic.StatusItem statusId="SimReview" description="In review" sequenceNum="1"
                     statusTypeId="StatementImport"/>
-            <moqui.basic.StatusItem statusId="SimCommitted" description="Imported" sequenceNum="2"
+            <moqui.basic.StatusItem statusId="SimCommitted" description="Imported" sequenceNum="3"
                     statusTypeId="StatementImport"/>
-            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="SimReview" toStatusId="SimCommitted"
+            <moqui.basic.StatusItem statusId="SimCommitting" description="Importing" sequenceNum="2"
+                    statusTypeId="StatementImport"/>
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="SimReview" toStatusId="SimCommitting"
+                    transitionName="Start import"/>
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="SimCommitting" toStatusId="SimCommitted"
                     transitionName="Import"/>
         </seed-data>
     </entity>

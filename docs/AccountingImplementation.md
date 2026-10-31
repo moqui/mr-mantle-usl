@@ -179,6 +179,13 @@ check `check#BankAccess` first; those services keep running for the statement me
   balance and clears or unclears lines (`BankReconciliationLine`, keyed by the line, so one session clears a line);
   a cleared line is in the period and matched, or excluded with a reason. `finish#Reconciliation` needs every line
   of the period cleared and a zero difference; `get#Reconciliation` gives the figures.
+- **Controls.** `reconcile#BankLine` takes, under the line's lock, only a candidate of an open line; a payment on a
+  finished statement's line stays there. A payment two lines match goes to neither (`apply#Rules`,
+  `match#PaymentMethodTransUnmatched`). Statements follow one another, each starting the day after the previous one
+  once it is finished; no line is added, imported or moved into a finished period (`check#BankLineDay`).
+- **Stored value.** `FinancialAccountServices.record#FinancialAccountMovement` is a finance user's own deposit,
+  withdrawal or adjustment, refused when its transaction does not post; the movement services orders and payments call
+  keep their automatic posting.
 - **Deposits.** `PaymentServices.find#DepositReceipts` and `create#DepositSlip` group delivered receipts into this bank
   account into one `PaymentDeposit` (`Payment.paymentDepositId`, under an operation key). The deposit's one bank line
   reconciles them all (`PaymentMethodTrans.paymentDepositId`), and a second line for it is refused.

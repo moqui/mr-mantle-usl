@@ -34,6 +34,7 @@ along with this software (see the LICENSE.md file). If not, see
                 <econdition field-name="paymentDepositId" from="null"/>
             </entity-find>
 
+            <set field="matchList" from="[]"/>
             <!-- types to ignore for Payment records (still match against AcctgTrans) -->
             <set field="ignoreTypeSet" from="['INT', 'DIV', 'FEE', 'SRVCHG']"/>
 
@@ -151,12 +152,20 @@ along with this software (see the LICENSE.md file). If not, see
                     </if>
                 </if>
                 <if condition="payment || acctgTransAndEntry">
-                    <service-call name="mantle.account.ReconciliationServices.reconcile#PaymentMethodTrans"
-                            in-map="{paymentMethodId:paymentMethodId, fitId:bankAccountTrans.fitId,
-                                bankAccountTrans:bankAccountTrans, paymentId:payment?.paymentId, payment:payment,
-                                acctgTransId:acctgTransAndEntry?.acctgTransId,
-                                acctgTransEntrySeqId:acctgTransAndEntry?.acctgTransEntrySeqId}"/>
+                    <script>matchList.push({paymentMethodId:paymentMethodId, fitId:bankAccountTrans.fitId,
+                        paymentId:payment?.paymentId ?? null, acctgTransId:acctgTransAndEntry?.acctgTransId ?? null,
+                        acctgTransEntrySeqId:acctgTransAndEntry?.acctgTransEntrySeqId ?? null})</script>
                 </if>
+            </iterate>
+            <!-- a payment or ledger entry more than one line matches is reconciled with none of them -->
+            <set field="claimCounts" from="matchList.reduce((counts, row) =&gt; { for (const key of [row.paymentId &amp;&amp;
+                    'p:' + row.paymentId, row.acctgTransId &amp;&amp; 'e:' + row.acctgTransId + ':' + row.acctgTransEntrySeqId])
+                    if (key) counts[key] = (counts[key] || 0) + 1; return counts }, {})"/>
+            <iterate list="matchList" entry="match">
+                <if condition="(match.paymentId &amp;&amp; claimCounts['p:' + match.paymentId] &gt; 1) || (match.acctgTransId
+                        &amp;&amp; claimCounts['e:' + match.acctgTransId + ':' + match.acctgTransEntrySeqId] &gt; 1)">
+                    <continue/></if>
+                <service-call name="mantle.account.ReconciliationServices.reconcile#PaymentMethodTrans" in-map="match"/>
             </iterate>
         </actions>
     </service>
@@ -170,6 +179,8 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <if condition="!fitId">
                 <set field="fitId" from="ec.entity.sequencedIdPrimary('mantle.account.method.PaymentMethodTrans.' + paymentMethodId, 1, 10)"/></if>
+            <service-call name="mantle.account.ReconciliationServices.check#BankLineDay"
+                    in-map="{paymentMethodId:paymentMethodId, postedDate:postedDate}"/>
 
             <!-- update everything except paymentId, acctgTransId, acctgTransEntrySeqId -->
             <set field="createMap" from="Object.assign({}, context)"/>
@@ -189,6 +200,11 @@ along with this software (see the LICENSE.md file). If not, see
             <auto-parameters entity-name="mantle.account.method.PaymentMethodTrans" include="nonpk"/>
         </in-parameters>
         <actions>
+            <!-- a finished statement's line does not change, and no line moves into a finished statement's period -->
+            <service-call name="mantle.account.ReconciliationServices.check#BankLineOpen"
+                    in-map="{paymentMethodId:paymentMethodId, fitId:fitId}"/>
+            <service-call name="mantle.account.ReconciliationServices.check#BankLineDay"
+                    in-map="{paymentMethodId:paymentMethodId, postedDate:postedDate}"/>
             <!-- update everything except paymentId, acctgTransId, acctgTransEntrySeqId -->
             <set field="updateMap" from="Object.assign({}, context)"/>
             <script>delete updateMap.paymentId; delete updateMap.acctgTransId; delete updateMap.acctgTransEntrySeqId; delete updateMap.noReconcile</script>
@@ -219,6 +235,52 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="bankAccountTrans.noReconcile" value="Y"/>
             <set field="bankAccountTrans.noReconcileReason" from="noReconcileReason ? String(noReconcileReason).trim() : null"/>
             <entity-update value-field="bankAccountTrans"/>
+        </actions>
+    </service>
+    <service verb="set" noun="DepositEntriesReconciled" allow-remote="false">
+        <description>Set the reconcile status of the bank account entries (glAccountId) of the posted transactions of a
+            deposit's receipts.</description>
+        <in-parameters>
+            <parameter name="paymentDepositId" required="true"/>
+            <parameter name="glAccountId"/>
+            <parameter name="reconcileStatusId" required="true"/>
+        </in-parameters>
+        <actions>
+            <if condition="!glAccountId"><return/></if>
+            <entity-find entity-name="mantle.account.payment.Payment" list="receiptList">
+                <econdition field-name="paymentDepositId"/>
+                <select-field field-name="paymentId"/>
+            </entity-find>
+            <if condition="!receiptList.length"><return/></if>
+            <entity-find entity-name="mantle.ledger.transaction.AcctgTransAndEntry" list="entryList">
+                <econdition field-name="paymentId" operator="in" from="receiptList.map((row) =&gt; row.paymentId)"/>
+                <econdition field-name="glAccountId"/>
+                <econdition field-name="reversedByAcctgTransId" from="null"/>
+                <econdition field-name="reverseOfAcctgTransId" from="null"/>
+            </entity-find>
+            <iterate list="entryList" entry="entryRow">
+                <entity-find-one entity-name="mantle.ledger.transaction.AcctgTransEntry" value-field="entry">
+                    <field-map field-name="acctgTransId" from="entryRow.acctgTransId"/>
+                    <field-map field-name="acctgTransEntrySeqId" from="entryRow.acctgTransEntrySeqId"/>
+                </entity-find-one>
+                <if condition="entry != null &amp;&amp; entry.reconcileStatusId != reconcileStatusId">
+                    <set field="entry.reconcileStatusId" from="reconcileStatusId"/>
+                    <entity-update value-field="entry"/>
+                </if>
+            </iterate>
+        </actions>
+    </service>
+    <service verb="check" noun="BankLineDay" allow-remote="false">
+        <description>Refuses a bank line posted on a day a finished statement of its bank covers (BANK_PERIOD_FINISHED):
+            the statement's lines are final.</description>
+        <in-parameters>
+            <parameter name="paymentMethodId" required="true"/>
+            <parameter name="postedDate" type="Timestamp"/>
+        </in-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/BankReconciliation.js"/>
+            <script>ec.resource.script(module).execute('lineDay',
+                {paymentMethodId:paymentMethodId, postedDate:postedDate})</script>
         </actions>
     </service>
     <service verb="check" noun="BankLineOpen" allow-remote="false">
@@ -284,7 +346,8 @@ along with this software (see the LICENSE.md file). If not, see
                     in-map="{paymentMethodId:paymentMethodId, fitId:fitId}"/>
 
             <if condition="paymentDepositId">
-                <entity-find-one entity-name="mantle.account.payment.PaymentDeposit" value-field="deposit"/>
+                <!-- the deposit is read under lock, so two lines cannot both take it -->
+                <entity-find-one entity-name="mantle.account.payment.PaymentDeposit" value-field="deposit" for-update="true"/>
                 <if condition="deposit == null || deposit.paymentMethodId != paymentMethodId">
                     <return error="true"
                             message="DEPOSIT_UNAVAILABLE: Deposit ${paymentDepositId} is not of bank account ${paymentMethodId}"/>
@@ -310,6 +373,10 @@ along with this software (see the LICENSE.md file). If not, see
                         <entity-update value-field="depositPayment"/>
                     </if>
                 </iterate>
+                <!-- each receipt's bank entry is reconciled, as a single payment's match does -->
+                <service-call name="mantle.account.ReconciliationServices.set#DepositEntriesReconciled"
+                        in-map="{paymentDepositId:paymentDepositId, glAccountId:paymentMethod.glAccountId,
+                            reconcileStatusId:ateReconcileStatusId}"/>
                 <return/>
             </if>
 
@@ -332,6 +399,9 @@ along with this software (see the LICENSE.md file). If not, see
                     </econditions>
                 </entity-find>
                 <iterate list="existingTransList" entry="existingTrans">
+                    <!-- a line a finished statement cleared keeps its payment: the reconciliation is refused -->
+                    <service-call name="mantle.account.ReconciliationServices.check#BankLineOpen"
+                            in-map="{paymentMethodId:existingTrans.paymentMethodId, fitId:existingTrans.fitId}"/>
                     <set field="existingTrans.paymentId" from="null"/>
                     <entity-update value-field="existingTrans"/>
                 </iterate>
@@ -387,6 +457,8 @@ along with this software (see the LICENSE.md file). If not, see
                     </econditions>
                 </entity-find>
                 <iterate list="existingTransList" entry="existingTrans">
+                    <service-call name="mantle.account.ReconciliationServices.check#BankLineOpen"
+                            in-map="{paymentMethodId:existingTrans.paymentMethodId, fitId:existingTrans.fitId}"/>
                     <set field="existingTrans.acctgTransId" from="null"/>
                     <set field="existingTrans.acctgTransEntrySeqId" from="null"/>
                     <entity-update value-field="existingTrans"/>
@@ -433,6 +505,9 @@ along with this software (see the LICENSE.md file). If not, see
                         <entity-update value-field="depositPayment"/>
                     </if>
                 </iterate>
+                <service-call name="mantle.account.ReconciliationServices.set#DepositEntriesReconciled"
+                        in-map="{paymentDepositId:bankAccountTrans.paymentDepositId, glAccountId:paymentMethod.glAccountId,
+                            reconcileStatusId:'AterNot'}"/>
                 <set field="bankAccountTrans.paymentDepositId" from="null"/>
             </if>
             <if condition="bankAccountTrans.paymentId">
@@ -690,7 +765,9 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
     <service verb="reconcile" noun="BankLine" allow-remote="false">
         <description>Reconcile a bank line with a candidate of find#BankLineCandidates (payment:ID, deposit:ID or
-            entry:TRANS:SEQ), through reconcile#PaymentMethodTrans. Needs BANK_RECONCILE for the bank account.</description>
+            entry:TRANS:SEQ), through reconcile#PaymentMethodTrans. Under the line's lock, refuses a line that is not open
+            (BANK_LINE_NOT_OPEN, BANK_LINE_FINISHED) and a record that is not one of its candidates now (CANDIDATE_INVALID).
+            Needs BANK_RECONCILE for the bank account.</description>
         <in-parameters>
             <parameter name="paymentMethodId" required="true"/>
             <parameter name="fitId" required="true"/>
@@ -699,8 +776,14 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <service-call name="mantle.account.ReconciliationServices.check#BankAccess"
                     in-map="{paymentMethodId:paymentMethodId, need:'reconcile'}"/>
+            <!-- under the line's lock: it is still open, and the candidate is still one of its matches -->
+            <entity-find-one entity-name="mantle.account.method.PaymentMethodTrans" value-field="bankLine" for-update="true"
+                    disable-authz="true"/>
+            <service-call name="mantle.account.ReconciliationServices.check#BankLineOpen"
+                    in-map="{paymentMethodId:paymentMethodId, fitId:fitId}"/>
             <set field="module" value="component://mr-mantle/service/mantle/account/BankReconciliation.js"/>
-            <set field="matchParameters" from="ec.resource.script(module).execute('candidateParameters', context)"/>
+            <set field="matchParameters" from="ec.resource.script(module).execute('checkedCandidate',
+                    {line:bankLine, candidate:candidate})"/>
             <service-call name="mantle.account.ReconciliationServices.reconcile#PaymentMethodTrans" disable-authz="true"
                     in-map="Object.assign({paymentMethodId:paymentMethodId, fitId:fitId}, matchParameters)"/>
         </actions>
@@ -863,6 +946,25 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="canCommit" from="access.canReconcile &amp;&amp; found.statusId == 'SimReview'"/>
         </actions>
     </service>
+    <service verb="claim" noun="StatementImport" allow-remote="false">
+        <description>Mark a reviewed statement import as importing (SimCommitting), under lock; claimed false when another
+            commit has it.</description>
+        <in-parameters>
+            <parameter name="statementImportId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="claimed" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.method.StatementImport" value-field="found" for-update="true"
+                    disable-authz="true"/>
+            <set field="claimed" from="found?.statusId == 'SimReview'"/>
+            <if condition="claimed">
+                <service-call name="update#mantle.account.method.StatementImport" disable-authz="true"
+                        in-map="{statementImportId:statementImportId, statusId:'SimCommitting'}"/>
+            </if>
+        </actions>
+    </service>
     <service verb="commit" noun="StatementImport" allow-remote="false">
         <description>Create the new lines of a reviewed statement import, each in its own transaction: a line another
             import created since the review is counted a duplicate, and a line that fails is named and the others go on.
@@ -887,6 +989,16 @@ along with this software (see the LICENSE.md file). If not, see
             <service-call name="mantle.account.ReconciliationServices.check#BankAccess"
                     in-map="{paymentMethodId:found.paymentMethodId, need:'reconcile'}"/>
             <set field="rows" from="JSON.parse(found.rowsJson || '[]')"/>
+            <if condition="found.statusId == 'SimReview'">
+                <!-- claimed in its own transaction, so a second commit at the same time finds it importing -->
+                <service-call name="mantle.account.ReconciliationServices.claim#StatementImport" out-map="claim"
+                        in-map="{statementImportId:statementImportId}" transaction="force-new"/>
+                <if condition="!claim.claimed">
+                    <return error="true" message="STATEMENT_IMPORT_IN_PROGRESS: The statement is being imported"/></if>
+                <else-if condition="found.statusId == 'SimCommitting'">
+                    <return error="true" message="STATEMENT_IMPORT_IN_PROGRESS: The statement is being imported"/>
+                </else-if>
+            </if>
             <if condition="found.statusId == 'SimCommitted'">
                 <set field="committedCount" from="found.committedCount"/>
                 <set field="duplicateCount" from="found.duplicateCount"/>
@@ -903,7 +1015,8 @@ along with this software (see the LICENSE.md file). If not, see
                         paymentMethodId:found.paymentMethodId, statementImportId:statementImportId})"/>
                 <script><![CDATA[
                     try {
-                        lib.probe("create#mantle.account.method.PaymentMethodTrans", newLine)
+                        // the service refuses a day a statement finished since the review
+                        lib.probe("mantle.account.ReconciliationServices.create#PaymentMethodTrans", newLine)
                         row.status = "imported"
                     } catch (error) {
                         const known = lib.one("mantle.account.method.PaymentMethodTrans",
@@ -938,10 +1051,11 @@ along with this software (see the LICENSE.md file). If not, see
 
     <service verb="create" noun="Reconciliation" allow-remote="false">
         <description>Start a statement session for a bank account: its statement reference, period and balances. The
-            opening balance is the closing balance of the last finished statement before it, and is required only for the
-            first one. Refuses a period that overlaps another session of the bank account, a thru day before the from day,
-            and an opening balance that differs from the last finished closing balance. Needs BANK_RECONCILE for the bank
-            account.</description>
+            opening balance is the closing balance of the statement before it, and is required only for the first one.
+            Statements follow one another: refuses a period that overlaps another session of the bank account or comes
+            before one, a thru day before the from day, a start other than the day after the previous statement, a
+            previous statement not finished, and an opening balance that differs from the previous closing balance. Needs
+            BANK_RECONCILE for the bank account.</description>
         <in-parameters>
             <parameter name="paymentMethodId" required="true"/>
             <parameter name="statementReference"/>
@@ -975,14 +1089,35 @@ along with this software (see the LICENSE.md file). If not, see
                 <return error="true"
                         message="RECONCILIATION_OVERLAP: Statement ${overlapList[0].bankReconciliationId} covers part of it"/>
             </if>
+            <!-- statements follow one another: each starts the day after the one before it ends, once that one is finished,
+                so its opening balance is the previous closing balance -->
+            <entity-find entity-name="mantle.account.method.BankReconciliation" list="laterList" disable-authz="true" limit="1">
+                <econdition field-name="paymentMethodId"/>
+                <econdition field-name="statementFromDate" operator="greater" from="thruDay"/>
+            </entity-find>
+            <if condition="laterList.length">
+                <return error="true"
+                        message="STATEMENT_ORDER: Statement ${laterList[0].bankReconciliationId} comes after this period"/>
+            </if>
             <entity-find entity-name="mantle.account.method.BankReconciliation" list="previousList" disable-authz="true"
                     limit="1">
                 <econdition field-name="paymentMethodId"/>
-                <econdition field-name="statusId" value="BrecFinished"/>
                 <econdition field-name="statementThruDate" operator="less" from="fromDay"/>
                 <order-by field-name="-statementThruDate"/>
             </entity-find>
             <set field="previous" from="previousList[0] || null"/>
+            <if condition="previous &amp;&amp; previous.statusId != 'BrecFinished'">
+                <return error="true"
+                        message="PREVIOUS_STATEMENT_OPEN: Finish statement ${previous.bankReconciliationId} first"/>
+            </if>
+            <set field="module" value="component://mr-mantle/service/mantle/account/BankReconciliation.js"/>
+            <set field="dayAfterPrevious"
+                    from="previous ? ec.resource.script(module).execute('dayAfter',
+                        {day:previous.statementThruDate}).day : null"/>
+            <if condition="previous &amp;&amp; fromDay != dayAfterPrevious">
+                <return error="true"
+                        message="STATEMENT_GAP: Start the statement on ${dayAfterPrevious}, after ${previous.bankReconciliationId}"/>
+            </if>
             <if condition="previous &amp;&amp; openingBalance != null &amp;&amp;
                     toDecimal(openingBalance).compare(toDecimal(previous.closingBalance ?? 0)) != 0">
                 <return error="true"
@@ -1144,8 +1279,9 @@ along with this software (see the LICENSE.md file). If not, see
                 <econdition field-name="bankReconciliationId"/>
             </entity-find>
             <iterate list="clearedLines" entry="clearedLine">
+                <!-- read under lock, after the session as store#Reconciliation does, so no match changes while it finishes -->
                 <entity-find-one entity-name="mantle.account.method.PaymentMethodTrans" value-field="clearedTrans"
-                        disable-authz="true">
+                        for-update="true" disable-authz="true">
                     <field-map field-name="paymentMethodId" from="clearedLine.paymentMethodId"/>
                     <field-map field-name="fitId" from="clearedLine.fitId"/>
                 </entity-find-one>

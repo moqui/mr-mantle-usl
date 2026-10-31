@@ -26,15 +26,23 @@ function bank(p) {
     if (!organizationPartyId) denied("ORGANIZATION_REQUIRED", "Choose an internal organization")
     if (!one("mantle.party.PartyRole", {partyId: organizationPartyId, roleTypeId: "OrgInternal"}))
         denied("BANK_UNAVAILABLE", "The bank account is not an internal organization's")
-    const scope = policy.organization({organizationPartyId})
-    const c = scope.capabilities
+    if (!["read", "reconcile", "deposit"].includes(need)) denied("PERMISSION_DENIED", "Unknown bank authority " + need)
+    // a user who holds only BANK_RECONCILE reads the bank, not the rest of Accounting (bankReconcile is no general read)
+    const c = policy.capabilities()
+    const scope = policy.organization({organizationPartyId}, c.read ? "read" : c.bankReconcile ? "bankReconcile" : "read")
     const canReconcile = !!(c.bankReconcile || c.systemAdmin)
     const canRead = canReconcile || c.reportRead || c.admin
     const canDeposit = !!(c.paymentEdit && c.paymentRead) || c.systemAdmin
     if (need === "deposit" && !canDeposit) denied("PERMISSION_DENIED", "Payment edit and payment view authority are required")
     if (need === "reconcile" ? !canReconcile : need === "read" && !canRead)
         denied("PERMISSION_DENIED", "Bank reconciliation authority is required")
-    return {organizationPartyId, method, canReconcile, canDeposit}
+    return {organizationPartyId, method, canReconcile, canDeposit, label: method ? methodLabel(method) : null}
+}
+// A bank account as people see it: its name and the last digits of its number, never the whole number.
+function methodLabel(method) {
+    return ec.resource
+        .script("component://mr-mantle/service/mantle/account/PaymentWorkflow.js")
+        .execute("maskedMethods", {paymentMethodList: [method]}).methodRows[0].label
 }
 
 // ---------- days ----------
@@ -104,7 +112,7 @@ function parseBai2(text, method, bankAccount) {
     let routingNumber = null,
         accountNumber = null,
         postedDate = null,
-        asOf = null,
+        asOfDay = null,
         lastCode = null,
         pending = null,
         total = toDecimal(0)
@@ -116,7 +124,9 @@ function parseBai2(text, method, bankAccount) {
             const amount = toDecimal(row.transAmount)
             total = total.add(amount.compare(0) < 0 ? amount.multiply(-1) : amount)
         }
-        const parts = [asOf, row.raw]
+        // the as-of day and the bank's reference identify a line; without a reference, its whole record does
+        const parts = [asOfDay, row.transCode, row.transAmount ?? null, row.refNumber || null, row.checkNumber || null]
+        if (!row.refNumber) parts.push(row.raw)
         row.fitId = rowKey("B2", parts.concat([occurrence(seen, parts)]))
         delete row.raw
         result.rows.push(row)
@@ -130,20 +140,20 @@ function parseBai2(text, method, bankAccount) {
             routingNumber = fields[1]
             if (bankAccount && routingNumber !== bankAccount.routingNumber) {
                 result.fileErrors.push(
-                    `BAI originator ID ${routingNumber} does not match the routing number of bank account ${method.paymentMethodId}`
+                    `BAI originator ID ${routingNumber} does not match the routing number of ${methodLabel(method)}`
                 )
                 routingNumber = null
             }
             if (fields[3] !== "1") result.fileErrors.push("Only groups of type Update can be processed")
             if (fields[6]) result.currencyUomId = fields[6]
-            asOf = fields[4] + " " + fields[5]
+            asOfDay = fields[4]
             postedDate = ec.l10n.parseTimestamp(fields[4] + " " + (fields[5] === "9999" ? "2359" : fields[5]), "yyMMdd HHmm")
         }
         if (routingNumber && code === "03") {
             accountNumber = fields[1]
             if (bankAccount && accountNumber !== bankAccount.accountNumber) {
                 result.fileErrors.push(
-                    `Customer account number ${accountNumber} does not match the account number of bank account ${method.paymentMethodId}`
+                    `Customer account number ${accountNumber} does not match the account number of ${methodLabel(method)}`
                 )
                 accountNumber = null
             }
@@ -207,6 +217,8 @@ function parseBai2(text, method, bankAccount) {
 
 // OFX 1 (SGML) and OFX 2 (XML): the statement (STMTRS) of the bank account, each STMTTRN a line keyed by its FITID.
 function parseOfxDateTime(ofxStr) {
+    // a day without a time is that calendar day in the user's zone
+    if (/^\d{8}$/.test(ofxStr)) return String(lib.ms(ec.l10n.parseTimestamp(ofxStr, "yyyyMMdd")))
     let dtStr = ofxStr
     let tzStr = "+00"
     if (ofxStr.length > 18) {
@@ -316,19 +328,17 @@ function parseOfx(text, method, bankAccount) {
         if (from) {
             const bankId = kid(from, "BANKID")?.text
             if (bankAccount.routingNumber !== bankId)
-                result.fileErrors.push(
-                    `OFX BANKID [${bankId}] does not match routing number [${bankAccount.routingNumber}] on Bank Account [${method.paymentMethodId}]`
-                )
+                result.fileErrors.push(`OFX BANKID [${bankId}] does not match routing number of ${methodLabel(method)}`)
             const acctId = kid(from, "ACCTID")?.text || ""
             if (!acctId.includes(bankAccount.accountNumber))
                 result.fileErrors.push(
-                    `OFX ACCTID [${acctId}] does not match (or contain) account number [${bankAccount.accountNumber}] on Bank Account [${method.paymentMethodId}]`
+                    `OFX ACCTID [${acctId}] does not match (or contain) the account number of ${methodLabel(method)}`
                 )
         }
         const curDef = kid(stmtrs, "CURDEF")?.text
         if (curDef && method.currencyUomId && curDef !== method.currencyUomId)
             result.fileErrors.push(
-                `OFX currency (CURDEF) [${curDef}] does not match account currency [${method.currencyUomId}] on Bank Account [${method.paymentMethodId}]`
+                `OFX currency (CURDEF) [${curDef}] does not match the currency ${method.currencyUomId} of ${methodLabel(method)}`
             )
     }
     result.currencyUomId = kid(stmtrs, "CURDEF")?.text || null
@@ -546,11 +556,15 @@ function statement(p) {
             .list())
             known.add(row.fitId)
     }
+    const finished = finishedPeriods(method.paymentMethodId)
     for (const row of result.rows) {
-        row.status = row.error ? "rejected" : known.has(row.fitId) || row.duplicateInFile ? "duplicate" : "new"
-        delete row.duplicateInFile
         if (row.postedDate != null) row.postedDate = String(lib.ms(row.postedDate))
         row.postedDateText = row.postedDate ? dayText(row.postedDate) : ""
+        const closedBy = !row.error && row.postedDateText ? finishedOn(finished, row.postedDateText) : null
+        if (closedBy && !known.has(row.fitId))
+            row.error = "The day " + row.postedDateText + " is in finished statement " + closedBy.bankReconciliationId
+        row.status = row.error ? "rejected" : known.has(row.fitId) || row.duplicateInFile ? "duplicate" : "new"
+        delete row.duplicateInFile
     }
     const days = result.rows
         .map(row => row.postedDateText)
@@ -560,6 +574,32 @@ function statement(p) {
     result.statementThruDate = days[days.length - 1] || null
     if (result.balance.balanceDate != null) result.balance.balanceDate = String(lib.ms(result.balance.balanceDate))
     return result
+}
+// The finished statement periods of a bank, and the one a day is in: no line is added or moved into it.
+function finishedPeriods(paymentMethodId) {
+    return rows("mantle.account.method.BankReconciliation", {paymentMethodId, statusId: "BrecFinished"}).map(rec => ({
+        bankReconciliationId: rec.bankReconciliationId,
+        fromDay: lib.calendarDateText(rec.statementFromDate),
+        thruDay: lib.calendarDateText(rec.statementThruDate)
+    }))
+}
+function finishedOn(periods, day) {
+    return periods.find(period => day >= period.fromDay && day <= period.thruDay) || null
+}
+// The calendar day after a day (yyyy-MM-dd).
+function dayAfter(p) {
+    const [year, month, date] = lib.calendarDateText(p.day).split("-").map(Number)
+    const next = new Date(Date.UTC(year, month - 1, date + 1))
+    const two = n => String(n).padStart(2, "0")
+    return {day: next.getUTCFullYear() + "-" + two(next.getUTCMonth() + 1) + "-" + two(next.getUTCDate())}
+}
+// check#BankLineDay: refuses a bank line posted on a day a finished statement of its bank covers.
+function lineDay(p) {
+    if (!p.postedDate) return {}
+    const day = dayText(p.postedDate)
+    const closedBy = finishedOn(finishedPeriods(p.paymentMethodId), day)
+    if (closedBy) denied("BANK_PERIOD_FINISHED", "The day " + day + " is in finished statement " + closedBy.bankReconciliationId)
+    return {}
 }
 // The fields of a bank line from a statement row.
 const lineFields = [
@@ -740,6 +780,19 @@ function candidateParameters(p) {
     if (kind === "entry" && id && seq) return {acctgTransId: id, acctgTransEntrySeqId: seq}
     denied("CANDIDATE_REQUIRED", "Choose the payment, deposit or ledger entry the line reconciles with")
 }
+// The reconcile#PaymentMethodTrans parameters of a candidate the line (read under lock by the caller) may take: the line
+// is open and the candidate is one of its candidates now (same organization, bank, direction and amount, not
+// reconciled; a deposit of the same total that no line holds).
+function checkedCandidate(p) {
+    const line = p.line
+    if (!line) denied("BANK_LINE_UNAVAILABLE", "The bank line is not available")
+    if (lineState(line) !== "open") denied("BANK_LINE_NOT_OPEN", "Bank line " + line.fitId + " is already matched or excluded")
+    const method = one("mantle.account.method.PaymentMethod", {paymentMethodId: line.paymentMethodId})
+    const value = String(p.candidate || "")
+    if (!candidates(line, method).some(row => row.value === value))
+        denied("CANDIDATE_INVALID", "The chosen record is not a match for bank line " + line.fitId)
+    return candidateParameters({candidate: value})
+}
 function lineCandidates(p) {
     const scope = bank(Object.assign({}, p, {need: "read"}))
     const line = one(TRANS, {paymentMethodId: p.paymentMethodId, fitId: p.fitId})
@@ -849,6 +902,7 @@ function testRule(p) {
     const methods = {}
     const methodOf = id => (methods[id] ??= one("mantle.account.method.PaymentMethod", {paymentMethodId: id}))
     const resultRows = []
+    const claims = new Map()
     for (const line of openLines(scope.organizationPartyId, rule.paymentMethodId, 500)) {
         if (!ruleMatches(rule, line)) continue
         const matching = [rule].concat(others.filter(other => ruleMatches(other, line))).sort(byPriority)
@@ -863,7 +917,16 @@ function testRule(p) {
                 wouldApply: own && suggestion.wouldApply
             })
         )
+        if (own) for (const row of suggestion.candidateRows) claims.set(row.value, (claims.get(row.value) || 0) + 1)
         if (resultRows.length >= (Number(p.limit) || 50)) break
+    }
+    // a payment two lines would take is applied to neither: each stays a suggestion
+    for (const row of resultRows) {
+        if (row.candidateRows.length === 1 && claims.get(row.candidateRows[0].value) > 1) {
+            row.ambiguous = true
+            row.wouldApply = false
+            row.reason = "Another line matches the same payment"
+        }
     }
     return {
         resultRows,
@@ -879,23 +942,27 @@ function ruleApplications(p) {
     const rules = activeRules(scope.organizationPartyId, p.paymentMethodId)
     const methods = {}
     const methodOf = id => (methods[id] ??= one("mantle.account.method.PaymentMethod", {paymentMethodId: id}))
-    const applications = []
-    const claimed = new Set()
+    const planned = []
+    const claims = new Map()
     let suggestedCount = 0
     for (const line of openLines(scope.organizationPartyId, p.paymentMethodId, 1000)) {
         const suggestion = ruleSuggestion(line, rules, methodOf(line.paymentMethodId))
         if (!suggestion) continue
         const candidate = suggestion.candidateRows[0]
-        if (suggestion.wouldApply && !claimed.has(candidate.value)) {
-            claimed.add(candidate.value)
-            applications.push({
+        for (const row of suggestion.candidateRows) claims.set(row.value, (claims.get(row.value) || 0) + 1)
+        if (suggestion.wouldApply)
+            planned.push({
                 paymentMethodId: line.paymentMethodId,
                 fitId: line.fitId,
+                candidate: candidate.value,
                 paymentId: candidate.id,
                 bankMatchRuleId: suggestion.bankMatchRuleId
             })
-        } else suggestedCount++
+        else suggestedCount++
     }
+    // a payment more than one line matches is applied to none of them
+    const applications = planned.filter(row => claims.get(row.candidate) === 1)
+    suggestedCount += planned.length - applications.length
     return {organizationPartyId: scope.organizationPartyId, applications, suggestedCount}
 }
 
@@ -906,10 +973,11 @@ function applyRules(p) {
         errorRows = []
     for (const application of plan.applications) {
         try {
-            lib.probe("mantle.account.ReconciliationServices.reconcile#PaymentMethodTrans", {
+            // reconcile#BankLine reads the line under lock and checks it is still open and the payment still a match
+            lib.probe("mantle.account.ReconciliationServices.reconcile#BankLine", {
                 paymentMethodId: application.paymentMethodId,
                 fitId: application.fitId,
-                paymentId: application.paymentId
+                candidate: application.candidate
             })
             appliedRows.push(application)
         } catch (error) {
@@ -1109,8 +1177,19 @@ function figures(p) {
         computedClosing: decimalText(computed),
         difference: decimalText(closing.subtract(computed)),
         periodCount,
-        unclearedCount
+        unclearedCount,
+        rejectedImports: rejectedImports(rec)
     }
+}
+// The statement imports of the session's bank and period with rejected rows: a row the bank reported that is not a
+// line yet, so a cause of the difference until it is added by hand or the closing balance corrected.
+function rejectedImports(rec) {
+    const from = lib.calendarDateText(rec.statementFromDate),
+        thru = lib.calendarDateText(rec.statementThruDate)
+    return rows("mantle.account.method.StatementImport", {paymentMethodId: rec.paymentMethodId})
+        .filter(row => (row.rejectedCount || 0) > 0 && row.statementFromDate && row.statementThruDate)
+        .filter(row => lib.calendarDateText(row.statementFromDate) <= thru && lib.calendarDateText(row.statementThruDate) >= from)
+        .map(row => ({statementImportId: row.statementImportId, rejectedCount: row.rejectedCount, fileName: row.fileName || ""}))
 }
 // Whether a bank line may be cleared by the session: of its bank, posted in its period, and matched or excluded with a
 // reason.
@@ -1134,6 +1213,10 @@ const operations = {
     lineOf,
     lineCandidates,
     candidateParameters,
+    checkedCandidate,
+    lineDay,
+    dayAfter,
+    methodLabel: p => ({label: methodLabel(p.method)}),
     testRule,
     applyRules,
     bankLines,

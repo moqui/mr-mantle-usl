@@ -55,7 +55,6 @@ function capabilities() {
         out.arRead,
         out.apRead,
         out.paymentRead,
-        out.bankReconcile,
         out.match,
         out.taxEdit,
         out.approve,
@@ -64,9 +63,10 @@ function capabilities() {
     ].some(Boolean)
     return out
 }
-function access() {
+// A scope's organizations. A narrow capability (bankReconcile) opens only the scope that names it, not every read.
+function access(need = "read") {
     const c = capabilities()
-    if (!c.read) denied("ACCESS_DENIED", "Accounting access is required")
+    if (!c.read && !(need === "bankReconcile" && c.bankReconcile)) denied("ACCESS_DENIED", "Accounting access is required")
     let ids, activeId
     if (c.admin) {
         ids = Array.from(find("mantle.party.PartyRole", {roleTypeId: "OrgInternal"}).selectField("partyId").list()).map(
@@ -87,7 +87,7 @@ function access() {
     }
 }
 function scope(p = {}, need = "read") {
-    const a = access()
+    const a = access(need)
     if (!Object.prototype.hasOwnProperty.call(a.capabilities, need) || !a.capabilities[need])
         denied("PERMISSION_DENIED", "Accounting " + need + " authority is required")
     const org =
