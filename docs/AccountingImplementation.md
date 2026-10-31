@@ -204,6 +204,59 @@ freight line, so the rule is a flag; BOSS's demo organization turns it on.
 **Cost centers (AC-22).** `OrderItem.costCenterId` and `InvoiceItem.costCenterId`: a bill or invoice line made from an
 order line takes its cost center, and the invoice postings (`post#Invoice`, `post#InvoiceAdjustment`) carry the line's.
 
+## Matching (P7)
+
+**Policy.** `mantle.account.invoice.InvoiceMatchPolicy`: an organization's match policy as effective-dated rows with
+audit-logged fields, for the organization (no product and no category), a product category or a product; a product row
+wins over a category row, which wins over the organization's. A row has the bill basis (`ImbReceived`, accepted receipts,
+three-way; `ImbOrdered`, two-way), receipt required on the ordered basis, a quantity and a price tolerance (each the
+larger of a percent and a fixed allowance), the variance action (`ImaHold`, `ImaWarn`) and the self-billing default that a
+supplier's first `SupplierProfile` row takes. With no row in effect: received basis, no tolerance, hold.
+`InvoiceMatchServices.store#MatchPolicy` (`ACCOUNTING_ADMIN`) ends the row in effect for the scope and starts the next
+(`POLICY_OVERLAP` before a later row), `end#MatchPolicy` ends a category or product row, `get#MatchPolicies` reads them.
+
+**Match.** `mantle.account.invoice.InvoiceMatch` (one applied, `ImApplied`, per bill; `ImUnapplied` when undone) and
+`InvoiceMatchLine`: each allocation of a bill line to an order line, and on the received basis to one receipt, with its
+snapshot (bill and order quantity and price, accepted, held and earlier billed quantity), the policy row it applied, its
+exception, and the billing link it wrote with that link's quantity before. Logic in `account/InvoiceMatch.js`:
+- `evaluate#InvoiceMatch` (`INVOICE_MATCH`, `PAYABLE_VIEW` or `ACCOUNTING_VIEW`), read only: an applied match checked
+  against its sources now, else the allocations given or the proposal (the line's billing links, else the approved order
+  lines of the product from the supplier, oldest first, on the policy's basis).
+- `apply#InvoiceMatch` (`INVOICE_MATCH`): the allocations checked again under lock (organization, bill, order lines in
+  order) and refused when the source does not allow them (`SOURCE_INVALID`, also for an order in another currency;
+  `ALREADY_BILLED`, `MISSING_RECEIPT`, `QUANTITY_EXCESS`). Other bills' billing, this bill's earlier allocations (a
+  running total per order line and per receipt) and the allocation together may not pass the source's base (accepted
+  less held, or ordered) plus the tolerance, the larger of the policy's percent of the base and its fixed quantity. It
+  writes or updates `OrderItemBilling`; a receipt with no invoice gets the bill line once links with a quantity cover its
+  accepted quantity, as `apply#InvoiceItemToOrder` does. An exception that holds by its policy (price outside tolerance,
+  quantity not matched, no source, no receipt where required) places the `IhrMatchException` hold naming the rule,
+  through `InvoiceWorkflowLib.placeHold`, the hold creation `hold#Invoice` uses after its own `INVOICE_HOLD` check: a
+  match operator need not hold `INVOICE_HOLD`, and an approver who did not apply the match releases it with
+  `release#InvoiceHold`. Each line keeps every exception code (`exceptionCodes`). A retried operation key answers first.
+- `unapply#InvoiceMatch` (`INVOICE_MATCH`): links back to their quantity before (zero when the match made them); a
+  receipt that names the bill names another bill still linked to it, or none; the hold stays.
+- Quantity in quarantine (an accepted receipt whose asset is `AstQuarantine`) is held and left out (D21). There is no
+  inspection record yet (CX-QUALITY), so the inspection check is reported unavailable, never passed (F50). Service lines
+  are not matched until Purchasing's acceptance exists.
+
+**Re-evaluation.** The `AssetReceiptQueueMatchReevaluation` EECA (a receipt created or removed, or its accepted
+quantity, order line or asset changed; not a write of its invoice) and `InvoiceItemQueueMatchReevaluation` call
+`queue#MatchReevaluation`, which reads the match lines by index and marks the applied matches of the receipt, order line
+or bill stale. The `run_MatchReevaluation` job (`run#MatchReevaluation`, every five minutes) evaluates each stale match in
+its own transaction (`reevaluate#InvoiceMatch`, the bill locked before the match) with the policy rows its lines applied
+and names each bill's result. It holds a bill whose source no longer allows its match (`MeSourceChanged`), or for an
+exception that holds and that the match's lines did not record, and records it; a legacy match only for a source change.
+A failure is recorded on the match and its stale date moved to now, so the others go first. No hold is released by the
+match or the job.
+
+**Legacy backfill.** `preview#LegacyMatches` and `apply#LegacyMatches` (`INVOICE_MATCH`): the organization's bills with no
+applied match, linked only from unambiguous evidence: a line's billing links, else its receipts on one order line. Links
+or receipts of another party, product or several order lines are ambiguous and recorded as `MeAmbiguous` exception lines;
+a line with no evidence is not linked, and what the evidence does not explain stays unmatched; the match is partly matched
+then, an exception for an ambiguous line, and each line keeps the policy row in effect. Bills are read in invoice order a
+batch at a time with the matched ones left out (`afterInvoiceId`; the preview answers `lastInvoiceId`). Each bill runs
+in its own transaction (`apply#LegacyMatch`); a failure is named and the others go on. No hold is placed.
+
 ## Payment terms and payment runs (P8)
 
 **Payment terms.** `mantle.account.invoice.SettlementTermLine` keeps a term's portions as effective-dated rows with
@@ -292,6 +345,90 @@ a `PaymentRunExclusion` reason, and at execution its payment and `PaymentRunResu
 now before the reversal) and its posting reversed (`PaymentUndeliverReverGlPost`), as an undelivered one is;
 `void#Payment` leaves a declined payment declined.
 
+## Banking (P9)
+
+`ReconciliationServices` holds the bank side, on the existing bank lines (`PaymentMethodTrans`): a statement session
+links them, it does not copy them. Each new service checks the bank account's organization and the user's authority
+through `check#BankAccess`: reading bank lines needs `BANK_RECONCILE`, `ACCOUNTING_VIEW` or administration, changing
+them `BANK_RECONCILE`, and a deposit `PAYMENT_EDIT` with `PAYMENT_VIEW`. Callers of the older services
+(`create#`/`update#`/`reconcile#`/`unreconcile#`/`noReconcile#PaymentMethodTrans`, `match#PaymentMethodTransUnmatched`)
+check `check#BankAccess` first; those services keep running for the statement message consumers.
+
+- **Line identity.** A bank line's key (`fitId`) is the bank's FIT id in OFX, and a source-row key in BAI2 and CSV
+  (a hash of the row and its occurrence in the file), so a file imported again adds nothing (F33).
+  `account/BankReconciliation.js` reads the three formats; `import#BaiVersion2` and `import#OfxVersion1` use it and
+  skip known lines.
+- **Statement import.** `preview#CsvStatement` shows a CSV with its column mapping. `review#StatementImport` keeps a
+  `StatementImport` with each row new, a duplicate or rejected with its error, and refuses a file of another account;
+  `get#StatementImport` reads it and `commit#StatementImport` creates the new lines, each in its own transaction, and
+  updates the statement balance. A second commit answers the first.
+- **Matching.** `find#BankLines` pages a bank's lines (or the organization's open ones) with their state, the session
+  that cleared each and, on request, a suggestion. `find#BankLineCandidates` lists the payments, deposits and ledger
+  entries of the same bank, direction and amount near the line's date, and `reconcile#BankLine` reconciles one of them
+  through `reconcile#PaymentMethodTrans`. `match#PaymentMethodTransUnmatched` now reconciles only a line with one
+  possible match. `reconcile#`, `unreconcile#` and `noReconcile#PaymentMethodTrans` refuse a line a finished session
+  cleared (`check#BankLineOpen`); `noReconcile#` records its reason (`noReconcileReason`).
+- **Rules.** `BankMatchRule` matches a line's text, direction and amount and suggests a party's payments.
+  `store#Rule` adds, changes or ends one (audit-logged fields); `test#Rule` previews a stored or draft rule on the open
+  lines; `apply#Rules` reconciles only a line one auto-apply rule matches alone with exactly one payment.
+- **Sessions.** `create#Reconciliation` starts a `BankReconciliation` for a period that overlaps no other session of
+  the bank, opening at the last finished closing balance. `store#Reconciliation` changes its reference and closing
+  balance and clears or unclears lines (`BankReconciliationLine`, keyed by the line, so one session clears a line);
+  a cleared line is in the period and matched, or excluded with a reason. `finish#Reconciliation` needs every line
+  of the period cleared and a zero difference; `get#Reconciliation` gives the figures.
+- **Controls.** `reconcile#BankLine` takes, under the line's lock, only a candidate of an open line; a payment on a
+  finished statement's line stays there. A payment two lines match goes to neither (`apply#Rules`,
+  `match#PaymentMethodTransUnmatched`). Statements follow one another, each starting the day after the previous one
+  once it is finished; no line is added, imported or moved into a finished period (`check#BankLineDay`).
+- **Stored value.** `FinancialAccountServices.record#FinancialAccountMovement` is a finance user's own deposit,
+  withdrawal or adjustment, refused when its transaction does not post; the movement services orders and payments call
+  keep their automatic posting.
+- **Deposits.** `PaymentServices.find#DepositReceipts` and `create#DepositSlip` group delivered receipts into this bank
+  account into one `PaymentDeposit` (`Payment.paymentDepositId`, under an operation key). The deposit's one bank line
+  reconciles them all (`PaymentMethodTrans.paymentDepositId`), and a second line for it is refused.
+
+## Tax (P14)
+
+`mantle.other.TaxServices` with `other/SalesTax.js` (the calculation) and `other/TaxStatements.js` (statements). The
+first release has local sales tax and the US 1099 data.
+
+- **Rates.** `TaxAuthorityRate` is active, keyed to `TaxAuthority` by `taxAuthorityId`: a dated row per version, with
+  the rate type (`TarSalesTax`), the collecting organization, an optional store and product category, minimums and
+  whether shipping is taxed. `store#Rate` (`ACCOUNTING_ADMIN`) starts a rate, a new version of one (ending the one it
+  replaces) or its end, and refuses an overlap of the same authority, type and scope. `store#Authority`
+  (`ACCOUNTING_ADMIN`) writes the authority with the organization's tax account (`TaxAuthorityGlAccount`) and nexus and
+  registration (`TaxAuthorityParty.isNexus`, `partyTaxId`); a change of these ends the row in effect and starts a new
+  one. An authority, and a rate for every organization, are shared: only a system administrator changes them
+  (`AUTHORITY_SHARED`, `RATE_SHARED`). The organization's gateway is a preference (`store#Preferences`).
+- **Calculation.** `calculate#SalesTaxLocal`, the `LOCAL` gateway, taxes an item for each authority whose geo is one of
+  the destination's (else the origin's), where the organization (or one it rolls up to) has nexus, at the most specific
+  rate in effect on the tax date (category, then store, then organization). A discount of the whole sale is spread over
+  the taxed lines in proportion to their bases. A product line is taxable unless
+  it or its product says not; another line only when `taxableFlag` is Y; shipping when the rate says so. A customer
+  exempt in the authority (`TaxAuthorityParty.isExempt`) gets an explicit zero with its reason. It refuses a taxed sale
+  without a destination (`TAX_ADDRESS_MISSING`), an authority with nexus and no rate in effect (`TAX_RATE_MISSING`)
+  and two rates of one scope (`TAX_RATE_AMBIGUOUS`). An organization with no sales tax nexus gets no results, so
+  Mantle's order flows are as before. The `calculate#SalesTax` interface gained the store, tax date, currency,
+  destination geos and an item's `taxableFlag`, and its results the rate version, base, rate, unrounded tax, rounding
+  and exemption.
+- **Invoices.** `calculate#InvoiceSalesTax` writes a draft sales invoice's `ItemSalesTax` lines under the taxed items
+  through its store's gateway, else the organization's (`PartyAcctgPreference.taxGatewayConfigId`), each with its
+  authority, rate version (`InvoiceItem.taxAuthorityRateId`), base (`taxableAmount`), rate (`taxPercentage`) and
+  rounding (`taxRoundingAmount`), marked `taxCalculated`; the same results leave the lines as they are. It skips an invoice billed from orders,
+  whose tax came with the order. `change#InvoiceState` runs it before a sales invoice is finalized or approved, so a
+  tax refusal refuses the change, and removes the calculated lines when an invoice goes back to draft. A tax line
+  posts to the organization's account for its authority (`get#InvoiceItemGlAccount` with `taxAuthorityId`), else the
+  item type's.
+- **Statements.** `find#SalesTaxLines` reads an authority's tax lines on the organization's issued sales invoices
+  dated in a period; `create#SalesTaxStatement` (`TAX_STATEMENT_EDIT`) makes a `TaxStatement` on the
+  `LocalSalesTaxReturn` form with the taxable sales, tax and line count. `run#Vendor1099Statements`
+  (`TAX_STATEMENT_EDIT`) makes the 1099-MISC data of a year for each vendor the organization paid who is registered
+  with the authority and not exempt, from the year's payments applied to the vendor's invoices
+  (`create#Vendor1099MiscStatement` with `itemTypeTotals`); a vendor without a taxpayer number or address, or with a
+  statement for the year, is named with its reason. `export#Statement` (`TAX_STATEMENT_EDIT`) gives the CSV data with
+  its format version and records the export; a sales tax statement whose invoices changed since is refused, and an
+  exported statement is not deleted (`delete#TaxStatement`). `simulate#SalesTax` explains a sample sale.
+
 ## Libraries
 
 - `ledger/EntityLib.js`: the helpers the finance modules share: entity reads without artifact authorization (each
@@ -302,9 +439,9 @@ now before the reversal) and its posting reversed (`PaymentUndeliverReverGlPost`
 - `ledger/PostingGuard.js`: the posting choke point. It decides an automatic posting from the transaction's source
   fields, and asks `ACCOUNTING_GL_POST` of a manual or reversal posting unless its caller passes `reviewed`.
 - `account/InvoiceWorkflowLib.js`: an invoice's scope for a read or a write, and the hold guard. `Payables.js`,
-  `InvoiceWorkflow.js`, `PaymentTerms.js`, `PaymentRuns.js`,
-  `InvoiceAttachments.js`, `PaymentWorkflow.js`, `PaymentLifecycle.js`, `PaymentSettlement.js` and `PaymentOutput.js`
-  hold the logic too involved for XML Actions; the other services are inline XML Actions.
+  `InvoiceMatch.js`, `InvoiceWorkflow.js`, `PaymentTerms.js`, `PaymentRuns.js`,
+  `InvoiceAttachments.js`, `PaymentWorkflow.js`, `PaymentLifecycle.js`, `PaymentSettlement.js`, `PaymentOutput.js` and
+  `BankReconciliation.js` hold the logic too involved for XML Actions; the other services are inline XML Actions.
 
 ## The posting guard flag
 
@@ -326,8 +463,10 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingSettlement,AccountingSettlementConcurrency,AccountingApplicationRules
 ./moq test mr-mantle --spec AccountingPaymentLifecycle,AccountingPaymentCorrections,AccountingPaymentOutput,AccountingPaymentNotifications
 ./moq test mr-mantle --spec AccountingPaymentGateway,AccountingPaymentRefunds,AccountingInternalTransfers
-./moq test mr-mantle --spec AccountingPayables
+./moq test mr-mantle --spec AccountingPayables,AccountingMatching
 ./moq test mr-mantle --spec AccountingPaymentRuns,AccountingPaymentRunControls,BankOutputFiles
+./moq test mr-mantle --spec AccountingBankReconciliation,BankFileServices
+./moq test mr-mantle --spec AccountingTax,TaxStatementServices
 ```
 
 The PDF specs need a Chromium for PDF (`pdf_chromium_path`; see [Run-Deploy](../../../../docs/Run-Deploy.md) and

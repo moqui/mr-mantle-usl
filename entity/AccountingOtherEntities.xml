@@ -175,12 +175,12 @@ along with this software (see the LICENSE.md file). If not, see
     <entity entity-name="TaxAuthority" package="mantle.other.tax">
         <description>For tax and other government authorities in any domain (sales/VAT, income, labor, etc)</description>
         <field name="taxAuthorityId" type="id" is-pk="true"/>
-        <field name="taxAuthorityTypeEnumId" type="id"/>
-        <field name="description" type="text-medium"/>
-        <field name="taxAuthGeoId" type="id"/>
-        <field name="taxAuthPartyId" type="id"/>
-        <field name="requireTaxIdForExemption" type="text-indicator"/>
-        <field name="taxIdFormatPattern" type="text-medium"/>
+        <field name="taxAuthorityTypeEnumId" type="id" enable-audit-log="update"/>
+        <field name="description" type="text-medium" enable-audit-log="update"/>
+        <field name="taxAuthGeoId" type="id" enable-audit-log="update"/>
+        <field name="taxAuthPartyId" type="id" enable-audit-log="update"/>
+        <field name="requireTaxIdForExemption" type="text-indicator" enable-audit-log="update"/>
+        <field name="taxIdFormatPattern" type="text-medium" enable-audit-log="update"/>
         <field name="includeTaxInPrice" type="text-indicator"><description>This is mainly for VAT tax authorities</description></field>
         <relationship type="one" title="TaxAuthorityType" related="moqui.basic.Enumeration">
             <key-map field-name="taxAuthorityTypeEnumId"/></relationship>
@@ -225,49 +225,49 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="partyId" type="id" is-pk="true"/>
         <field name="taxAuthorityId" type="id" is-pk="true"/>
         <field name="fromDate" type="date-time" is-pk="true"/>
-        <field name="thruDate" type="date-time"/>
-        <field name="partyTaxId" type="text-short"/>
-        <field name="isExempt" type="text-indicator"/>
-        <field name="isNexus" type="text-indicator">
+        <field name="thruDate" type="date-time" enable-audit-log="update"/>
+        <field name="partyTaxId" type="text-short" enable-audit-log="update"/>
+        <field name="isExempt" type="text-indicator" enable-audit-log="update"/>
+        <field name="isNexus" type="text-indicator" enable-audit-log="update">
             <description>If Party has a sufficient presence in the area to have to charge tax set to Y.</description>
         </field>
         <relationship type="one" related="mantle.party.Party"/>
         <relationship type="one" related="mantle.other.tax.TaxAuthority"/>
     </entity>
-    <!-- Using a Drools Decision Table instead of this (much more flexible):
     <entity entity-name="TaxAuthorityRate" package="mantle.other.tax">
+        <description>A dated rate of a tax authority, the local tax gateway's rule (calculate#SalesTaxLocal). A change starts
+            a new row and ends the one in effect (store#Rate), so a row is a rate version, and an invoice tax line keeps the
+            row it was calculated with. Empty organization, store and category apply to any; the most specific matching
+            row of an authority applies to an item.</description>
         <field name="taxAuthorityRateId" type="id" is-pk="true"/>
-        <field name="taxAuthorityId" type="id"/>
+        <field name="taxAuthorityId" type="id" not-null="true"/>
         <field name="rateTypeEnumId" type="id"/>
+        <field name="organizationPartyId" type="id"><description>The organization that collects at this rate; empty for
+            any organization with nexus in the authority.</description></field>
         <field name="productStoreId" type="id"/>
-        <field name="productCategoryId" type="id"/>
-        <field name="titleTransferEnumId" type="id"/>
+        <field name="productCategoryId" type="id"><description>Only items whose product is in this category.</description></field>
         <field name="minItemPrice" type="currency-amount"/>
         <field name="minPurchase" type="currency-amount"/>
-        <field name="taxShipping" type="text-indicator"/>
-        <field name="taxPercentage" type="number-decimal"/>
-        <field name="taxPromotions" type="text-indicator"/>
-        <field name="fromDate" type="date-time"/>
-        <field name="thruDate" type="date-time"/>
+        <field name="taxShipping" type="text-indicator"><description>Y to tax shipping lines.</description></field>
+        <field name="taxPercentage" type="number-decimal" enable-audit-log="update"/>
+        <field name="fromDate" type="date-time" enable-audit-log="update"/>
+        <field name="thruDate" type="date-time" enable-audit-log="update"/>
         <field name="description" type="text-medium"/>
-        <relationship type="one" related="mantle.other.tax.TaxAuthority">
-            <key-map field-name="taxAuthGeoId"/><key-map field-name="taxAuthPartyId"/></relationship>
+        <relationship type="one" related="mantle.other.tax.TaxAuthority"/>
         <relationship type="one" title="TaxAuthorityRateType" related="moqui.basic.Enumeration">
             <key-map field-name="rateTypeEnumId"/></relationship>
+        <relationship type="one" title="Organization" related="mantle.party.Party">
+            <key-map field-name="organizationPartyId"/></relationship>
         <relationship type="one" related="mantle.product.store.ProductStore"/>
         <relationship type="one" related="mantle.product.category.ProductCategory"/>
+        <index name="TAX_AUTH_RATE_AUTH"><index-field name="taxAuthorityId"/><index-field name="fromDate"/></index>
         <seed-data>
-            <!- - Tax Authority Rate Type - ->
             <moqui.basic.EnumerationType description="Tax Authority Rate Type" enumTypeId="TaxAuthorityRateType"/>
-            <moqui.basic.Enumeration enumId="SALES_TAX" description="Sales Tax" enumTypeId="TaxAuthorityRateType"/>
-            <moqui.basic.Enumeration enumId="USE_TAX" description="Use Tax" enumTypeId="TaxAuthorityRateType"/>
-            <moqui.basic.Enumeration enumId="VAT_TAX" description="Value Added Tax" enumTypeId="TaxAuthorityRateType"/>
-            <moqui.basic.Enumeration enumId="INCOME_TAX" description="Income Tax" enumTypeId="TaxAuthorityRateType"/>
-            <moqui.basic.Enumeration enumId="EXPORT_TAX" description="Export Tax" enumTypeId="TaxAuthorityRateType"/>
-            <moqui.basic.Enumeration enumId="IMPORT_TAX" description="Import Tax" enumTypeId="TaxAuthorityRateType"/>
+            <moqui.basic.Enumeration enumId="TarSalesTax" description="Sales tax" enumTypeId="TaxAuthorityRateType"/>
+            <moqui.basic.Enumeration enumId="TarUseTax" description="Use tax" enumTypeId="TaxAuthorityRateType"/>
+            <moqui.basic.Enumeration enumId="TarVatTax" description="Value added tax" enumTypeId="TaxAuthorityRateType"/>
         </seed-data>
     </entity>
-    -->
 
     <entity entity-name="TaxGatewayConfig" package="mantle.other.tax">
         <field name="taxGatewayConfigId" type="id" is-pk="true"/>
@@ -296,6 +296,15 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="taxAuthorityId" type="id"/>
         <field name="formId" type="id"/>
         <field name="formResponseId" type="id"/>
+        <field name="reportedAmount" type="currency-amount">
+            <description>The taxable sales, or the payments reported.</description></field>
+        <field name="taxAmount" type="currency-amount"/>
+        <field name="lineCount" type="number-integer"/>
+        <field name="createdDate" type="date-time"/>
+        <field name="createdByUserId" type="id"/>
+        <field name="exportedDate" type="date-time" enable-audit-log="update"/>
+        <field name="exportedByUserId" type="id"/>
+        <field name="exportFormat" type="text-short"/>
         <relationship type="one" related="mantle.party.time.TimePeriod"/>
         <relationship type="one" related="mantle.humanres.employment.Employment"/>
         <relationship type="one" related="mantle.other.tax.TaxAuthority"/>

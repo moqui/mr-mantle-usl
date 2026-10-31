@@ -30,6 +30,12 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="organizationPartyId"/>
             <parameter name="originAddressContactMechId"/>
             <parameter name="destinationAddressContactMechId"/>
+            <parameter name="destinationGeoIds" type="List"><description>Destination geos in place of an address, to
+                simulate a sale.</description></parameter>
+            <parameter name="productStoreId"/>
+            <parameter name="taxDate" type="Timestamp">
+                <description>The date whose rates apply, by default now.</description></parameter>
+            <parameter name="currencyUomId"><description>The currency the tax amounts round to.</description></parameter>
             <parameter name="items" type="List"><parameter name="itemEntry" type="Map">
                 <parameter name="itemId"/>
                 <parameter name="itemTypeEnumId"/>
@@ -40,6 +46,9 @@ along with this software (see the LICENSE.md file). If not, see
                 <parameter name="discountTotal" type="BigDecimal"/>
                 <parameter name="productId"/>
                 <parameter name="taxCode"/>
+                <parameter name="taxableFlag"/>
+                <parameter name="parentItemId"><description>For a discount, the item it discounts; a discount with none
+                    is spread over the taxable items.</description></parameter>
                 <!-- discounts will be another item of type ItemDiscount, so don't do this for now:
                 <parameter name="discounts" type="List"><parameter name="discountEntry" type="Map">
                     <parameter name="discountAmount" type="BigDecimal"/>
@@ -58,6 +67,14 @@ along with this software (see the LICENSE.md file). If not, see
                 <parameter name="taxRate" type="BigDecimal"/>
                 <parameter name="taxAuthorityId"/>
                 <parameter name="taxName"/>
+                <parameter name="taxAuthorityRateId">
+                    <description>The rate version applied, from a local rate.</description></parameter>
+                <parameter name="taxableAmount" type="BigDecimal"/>
+                <parameter name="taxPercentage" type="BigDecimal"/>
+                <parameter name="exactTaxAmount" type="BigDecimal"/>
+                <parameter name="taxRoundingAmount" type="BigDecimal"/>
+                <parameter name="exemptReason">
+                    <description>Why the tax is zero: an exemption, or no rate for the item.</description></parameter>
             </parameter></parameter>
         </out-parameters>
     </service>
@@ -110,6 +127,9 @@ along with this software (see the LICENSE.md file). If not, see
                 <set field="organizationPartyId" from="productStore.organizationPartyId"/>
                 <set field="originAddressContactMechId" from="fromFcm?.contactMechId"/>
                 <set field="destinationAddressContactMechId" from="orderPart.postalContactMechId"/>
+                <set field="productStoreId" from="productStore.productStoreId"/>
+                <set field="currencyUomId" from="orderHeader.currencyUomId"/>
+                <set field="taxDate" from="orderHeader.entryDate || ec.user.nowTimestamp"/>
 
                 <entity-find entity-name="mantle.order.OrderItem" list="orderItemList">
                     <econdition field-name="orderId"/><econdition field-name="orderPartSeqId" from="orderPart.orderPartSeqId"/>
@@ -135,6 +155,7 @@ along with this software (see the LICENSE.md file). If not, see
 
                         <set field="unitAmountLessDiscounts" from="itemTotal.add(discountTotal).divide(combinedQuantity).setScale(3, 'HALF_UP')"/>
                         <script>items.push({itemId:orderItem.orderItemSeqId, itemTypeEnumId:orderItem.itemTypeEnumId,
+                                parentItemId:orderItem.parentItemSeqId,
                                 quantity:orderItem.quantity, unitAmount:orderItem.unitAmount, unitAmountLessDiscounts:unitAmountLessDiscounts,
                                 itemTotal:itemTotal, discountTotal:discountTotal,
                                 productId:orderItem.productId, taxCode:product?.taxCode})</script>
@@ -166,9 +187,31 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
     <service verb="calculate" noun="InvoiceSalesTax">
-        <in-parameters><parameter name="invoiceId" required="true"/></in-parameters>
+        <description>Calculate a draft sales invoice's tax lines through its store's tax gateway, else its organization's
+            (PartyAcctgPreference.taxGatewayConfigId): one ItemSalesTax line under each taxed item for each authority, with
+            the authority, rate version, base, rate and rounding. Lines the gateway calculated before are replaced, or kept
+            when the results are the same. Answers a reason code without calculating for an invoice that is not a sales
+            invoice (NOT_APPLICABLE), one billed from orders, whose tax came with the order (ORDER_TAX), and an
+            organization and store with no gateway (NO_GATEWAY). Refuses with its reason a sale whose tax cannot be
+            calculated (TAX_ADDRESS_MISSING, TAX_RATE_MISSING, TAX_RATE_AMBIGUOUS) and an invoice that is not a draft.
+            With clear, only removes the calculated lines.</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="clear" type="Boolean" default="false"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="reasonCode"/>
+            <parameter name="taxTotal" type="BigDecimal"/>
+            <parameter name="lineCount" type="Integer"/>
+            <parameter name="changed" type="Boolean"/>
+        </out-parameters>
         <actions>
-            <!-- TODO: implement this... -->
+            <set field="calculated" from="ec.resource.script('component://mr-mantle/service/mantle/other/SalesTax.js')
+                    .execute('invoice', {invoiceId:invoiceId, clear:clear})"/>
+            <set field="reasonCode" from="calculated.reasonCode"/>
+            <set field="taxTotal" from="calculated.taxTotal"/>
+            <set field="lineCount" from="calculated.lineCount"/>
+            <set field="changed" from="calculated.changed"/>
         </actions>
     </service>
 
@@ -177,32 +220,393 @@ along with this software (see the LICENSE.md file). If not, see
     <!-- ======================= -->
     
     <service verb="calculate" noun="SalesTaxLocal">
+        <description>The local gateway: for each taxable item (a product line not marked non-taxable, a line marked
+            taxable, a shipping line whose rate taxes shipping) and each authority whose geo is one of the destination's,
+            where the organization or one it rolls up to has nexus (TaxAuthorityParty.isNexus) and a sales tax rate, the
+            tax at the most specific TaxAuthorityRate in effect on the tax date (category, then store, then organization),
+            rounded to the currency. A customer exempt in the authority (TaxAuthorityParty.isExempt) gets a zero result
+            with its reason. An organization with no sales tax nexus gets no results. Refuses a taxed sale without a
+            destination (TAX_ADDRESS_MISSING), an authority with no rate in effect (TAX_RATE_MISSING) and two rates of the
+            same scope (TAX_RATE_AMBIGUOUS).</description>
         <implements service="mantle.other.TaxServices.calculate#SalesTax"/>
         <actions>
-            <log level="info" message="Called calculate#SalesTaxLocal (not yet implemented)"/><!-- with context:\n ${context} -->
+            <set field="calculated" from="ec.resource.script('component://mr-mantle/service/mantle/other/SalesTax.js')
+                    .execute('local', context)"/>
+            <set field="taxResults" from="calculated.taxResults"/>
+        </actions>
+    </service>
+    <service verb="simulate" noun="SalesTax" allow-remote="false">
+        <description>Explain what the organization's tax gateway (its store's, else its own) charges for a sample sale on a
+            date: each authority's rate version, base, unrounded and rounded tax, rounding and exemption, or the reason it
+            cannot be calculated (reasonCode and message). The destination is a geo, else the customer's address. Writes
+            nothing. Refuses a user without Accounting read authority in the organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="productStoreId"/>
+            <parameter name="customerPartyId"/>
+            <parameter name="destinationGeoId"/>
+            <parameter name="taxDate" type="Timestamp"/>
+            <parameter name="productId"/>
+            <parameter name="itemTypeEnumId"/>
+            <parameter name="quantity" type="BigDecimal"/>
+            <parameter name="amount" type="BigDecimal"/>
+            <parameter name="shippingAmount" type="BigDecimal"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="gatewayName"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="rows" type="List"/>
+            <parameter name="reasonCode"/>
+            <parameter name="message"/>
+        </out-parameters>
+        <actions>
+            <set field="simulated" from="ec.resource.script('component://mr-mantle/service/mantle/other/SalesTax.js')
+                    .execute('simulate', context)"/>
+            <set field="gatewayName" from="simulated.gatewayName"/>
+            <set field="currencyUomId" from="simulated.currencyUomId"/>
+            <set field="rows" from="simulated.rows"/>
+            <set field="reasonCode" from="simulated.reasonCode"/>
+            <set field="message" from="simulated.message"/>
+        </actions>
+    </service>
 
-            <!-- example code for a simple tax service:
-            <entity-find-one entity-name="mantle.party.contact.PostalAddress" value-field="destinationAddress">
-                <field-map field-name="contactMechId" from="destinationAddressContactMechId"/></entity-find-one>
-            <if condition="destinationAddress == null || destinationAddress.stateProvinceGeoId != 'USA_NV'"><return/></if>
-            <!- - simple 7% tax rate; lookup or calculate as needed - ->
-            <set field="taxRate" from="0.07"/>
-            <set field="taxAuthorityId" value="SETME"/>
-            <set field="taxResults" from="[]"/>
-            <iterate list="items" entry="item">
-                <if condition="item.itemTypeEnumId != 'ItemProduct'"><continue/></if>
-                <if condition="!item.unitAmount"><continue/></if>
-                <set field="taxAmount" from="taxRate * (item.quantity || 1.0) * item.unitAmount"/>
-                <script>taxResults.add([itemId:item.itemId, taxAmount:taxAmount, taxRate:taxRate,
-                    taxAuthorityId:taxAuthorityId, taxName:'Sales Tax'])</script>
-            </iterate>
-            -->
+    <!-- ====================== -->
+    <!-- Tax Authorities and Rates -->
+    <!-- ====================== -->
+
+    <service verb="store" noun="Authority" allow-remote="false">
+        <description>Create or change a tax authority, and the organization's links to it: its tax account
+            (TaxAuthorityGlAccount, where the organization's tax lines of the authority post) and its nexus and registration
+            (TaxAuthorityParty). An authority is shared by every organization, so changing an existing one's name, level,
+            region, party or registration rules needs system administration; its changes are audit-logged. A nexus or
+            registration change ends the organization's current TaxAuthorityParty row and starts a new one (an empty
+            partyTaxId clears the number). Refuses a user without finance administration in the organization, a missing
+            name, an unknown geo or authority party, an account not assigned to the organization, a shared change
+            without system administration (AUTHORITY_SHARED) and a missing change reason.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="taxAuthorityId"/>
+            <parameter name="description"/>
+            <parameter name="taxAuthorityTypeEnumId"/>
+            <parameter name="taxAuthGeoId"/>
+            <parameter name="taxAuthPartyId"/>
+            <parameter name="taxIdFormatPattern"/>
+            <parameter name="requireTaxIdForExemption"/>
+            <parameter name="glAccountId"/>
+            <parameter name="isNexus"/>
+            <parameter name="partyTaxId"/>
+            <parameter name="changeReason"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="taxAuthorityId"/>
+        </out-parameters>
+        <actions>
+            <set field="policy" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')"/>
+            <set field="organizationPartyId" from="policy.organization(context, 'admin').organizationPartyId"/>
+            <set field="changeReason" from="policy.reason(context)"/>
+            <if condition="!String(description || '').trim()">
+                <return error="true" message="AUTHORITY_NAME_REQUIRED: Give the authority a name"/></if>
+            <if condition="taxAuthGeoId">
+                <entity-find-one entity-name="moqui.basic.Geo" value-field="geo" disable-authz="true">
+                    <field-map field-name="geoId" from="taxAuthGeoId"/></entity-find-one>
+                <if condition="geo == null"><return error="true" message="GEO_UNAVAILABLE: Choose the authority's region"/></if>
+            </if>
+            <if condition="taxAuthPartyId">
+                <entity-find-one entity-name="mantle.party.Party" value-field="authorityParty" disable-authz="true">
+                    <field-map field-name="partyId" from="taxAuthPartyId"/></entity-find-one>
+                <if condition="authorityParty == null">
+                    <return error="true" message="PARTY_UNAVAILABLE: Choose the authority's party"/></if>
+            </if>
+            <if condition="glAccountId"><script>policy.account(organizationPartyId, glAccountId)</script></if>
+            <if condition="taxAuthorityId">
+                <entity-find-one entity-name="mantle.other.tax.TaxAuthority" value-field="existing" for-update="true"
+                        disable-authz="true"/>
+            </if>
+            <!-- a field not passed keeps its value -->
+            <set field="authorityFields" from="Object.fromEntries(['taxAuthorityTypeEnumId', 'taxAuthGeoId', 'taxAuthPartyId',
+                    'taxIdFormatPattern', 'requireTaxIdForExemption'].map(field =&gt;
+                        [field, (field in context ? context[field] : existing?.[field]) || null]))"/>
+            <set field="authorityFields.description" from="description.trim()"/>
+            <if condition="existing"><then>
+                <set field="headerChanged" from="Object.keys(authorityFields)
+                        .some(field =&gt; String(existing[field] ?? '') !== String(authorityFields[field] ?? ''))"/>
+                <if condition="headerChanged &amp;&amp; !policy.capabilities().systemAdmin">
+                    <return error="true"
+                            message="AUTHORITY_SHARED: The authority is shared; a system administrator changes it"/>
+                </if>
+                <script>policy.audit(Object.keys(authorityFields), changeReason)</script>
+                <service-call name="update#mantle.other.tax.TaxAuthority" disable-authz="true"
+                        in-map="Object.assign({taxAuthorityId:taxAuthorityId}, authorityFields)"/>
+            </then><else>
+                <service-call name="create#mantle.other.tax.TaxAuthority" out-map="createdAuthority" disable-authz="true"
+                        in-map="Object.assign({taxAuthorityId:taxAuthorityId || null}, authorityFields)"/>
+                <set field="taxAuthorityId" from="createdAuthority.taxAuthorityId || taxAuthorityId"/>
+            </else></if>
+            <entity-find-one entity-name="mantle.ledger.config.TaxAuthorityGlAccount" value-field="authorityAccount"
+                    for-update="true" disable-authz="true"/>
+            <if condition="glAccountId &amp;&amp; authorityAccount == null">
+                <service-call name="create#mantle.ledger.config.TaxAuthorityGlAccount" disable-authz="true"
+                        in-map="{taxAuthorityId:taxAuthorityId, organizationPartyId:organizationPartyId,
+                            glAccountId:glAccountId}"/>
+            </if>
+            <if condition="glAccountId &amp;&amp; authorityAccount != null">
+                <service-call name="update#mantle.ledger.config.TaxAuthorityGlAccount" disable-authz="true"
+                        in-map="{taxAuthorityId:taxAuthorityId, organizationPartyId:organizationPartyId,
+                            glAccountId:glAccountId}"/>
+            </if>
+            <if condition="!glAccountId &amp;&amp; authorityAccount != null">
+                <service-call name="delete#mantle.ledger.config.TaxAuthorityGlAccount" disable-authz="true"
+                        in-map="{taxAuthorityId:taxAuthorityId, organizationPartyId:organizationPartyId}"/>
+            </if>
+            <if condition="isNexus || 'partyTaxId' in context">
+                <entity-find entity-name="mantle.other.tax.TaxAuthorityParty" list="registrations" for-update="true"
+                        disable-authz="true">
+                    <date-filter/>
+                    <econdition field-name="partyId" from="organizationPartyId"/>
+                    <econdition field-name="taxAuthorityId"/>
+                </entity-find>
+                <set field="registration" from="Array.from(registrations)[0]"/>
+                <set field="registrationFields" from="{isNexus:isNexus || registration?.isNexus || 'N',
+                        partyTaxId:('partyTaxId' in context ? partyTaxId : registration?.partyTaxId) || null}"/>
+                <set field="registrationChanged" from="!registration ||
+                        registration.isNexus !== registrationFields.isNexus ||
+                        (registration.partyTaxId || null) !== registrationFields.partyTaxId"/>
+                <if condition="registrationChanged">
+                    <!-- changes by effective date: the row in effect ends now and the new one starts -->
+                    <set field="changedAt" from="ec.user.nowTimestamp"/>
+                    <script>policy.audit(['thruDate'], changeReason)</script>
+                    <if condition="registration">
+                        <service-call name="update#mantle.other.tax.TaxAuthorityParty" disable-authz="true"
+                                in-map="{partyId:organizationPartyId, taxAuthorityId:taxAuthorityId,
+                                    fromDate:registration.fromDate, thruDate:changedAt}"/>
+                    </if>
+                    <service-call name="create#mantle.other.tax.TaxAuthorityParty" disable-authz="true"
+                            in-map="Object.assign({partyId:organizationPartyId, taxAuthorityId:taxAuthorityId,
+                                fromDate:changedAt}, registrationFields)"/>
+                </if>
+            </if>
+        </actions>
+    </service>
+    <service verb="store" noun="Rate" allow-remote="false">
+        <description>Start a dated tax rate of an authority for the organization, optionally for a store or product
+            category. Given the rate it replaces (taxAuthorityRateId), the new version starts at fromDate and the old one
+            ends there; given only that rate and a thruDate, it ends the rate. Earlier versions stay, so a tax line keeps
+            the version it was calculated with. Refuses a user without finance administration in the organization, an
+            unknown authority, store or category, a rate outside 0 to 100, an end not after the start, a version that does
+            not start after the one it replaces, another rate of the same authority, type and scope over the same dates,
+            a change to a rate for every organization without system administration (RATE_SHARED), and a missing change
+            reason.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="taxAuthorityRateId"/>
+            <parameter name="taxAuthorityId"/>
+            <parameter name="rateTypeEnumId"/>
+            <parameter name="productStoreId"/>
+            <parameter name="productCategoryId"/>
+            <parameter name="taxPercentage" type="BigDecimal"/>
+            <parameter name="taxShipping"/>
+            <parameter name="minItemPrice" type="BigDecimal"/>
+            <parameter name="minPurchase" type="BigDecimal"/>
+            <parameter name="fromDate" type="Timestamp"/>
+            <parameter name="thruDate" type="Timestamp"/>
+            <parameter name="description"/>
+            <parameter name="changeReason"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="taxAuthorityRateId"/>
+        </out-parameters>
+        <actions>
+            <set field="policy" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')"/>
+            <set field="organizationPartyId" from="policy.organization(context, 'admin').organizationPartyId"/>
+            <set field="changeReason" from="policy.reason(context)"/>
+            <if condition="taxAuthorityRateId">
+                <entity-find-one entity-name="mantle.other.tax.TaxAuthorityRate" value-field="replaced" for-update="true"
+                        disable-authz="true"/>
+                <if condition="replaced == null || (replaced.organizationPartyId &amp;&amp;
+                        replaced.organizationPartyId != organizationPartyId)">
+                    <return error="true" message="RATE_UNAVAILABLE: Tax rate is not available"/></if>
+                <!-- a rate for any organization is shared: only a system administrator replaces or ends it -->
+                <if condition="!replaced.organizationPartyId &amp;&amp; !policy.capabilities().systemAdmin">
+                    <return error="true"
+                            message="RATE_SHARED: The rate is shared; a system administrator changes it"/></if>
+                <if condition="taxPercentage == null">
+                    <set field="endDate" from="thruDate || ec.user.nowTimestamp"/>
+                    <if condition="policy.ms(endDate) &lt;= policy.ms(replaced.fromDate)">
+                        <return error="true" message="RATE_DATES_INVALID: A rate must end after it starts"/></if>
+                    <script>policy.audit(['thruDate'], changeReason)</script>
+                    <service-call name="update#mantle.other.tax.TaxAuthorityRate" disable-authz="true"
+                            in-map="{taxAuthorityRateId:taxAuthorityRateId, thruDate:endDate}"/>
+                    <return/>
+                </if>
+            </if>
+            <set field="taxAuthorityId" from="taxAuthorityId || replaced?.taxAuthorityId"/>
+            <entity-find-one entity-name="mantle.other.tax.TaxAuthority" value-field="authority" disable-authz="true"/>
+            <if condition="authority == null"><return error="true" message="AUTHORITY_UNAVAILABLE: Choose a tax authority"/></if>
+            <set field="rateFields" from="{taxAuthorityId:taxAuthorityId,
+                    rateTypeEnumId:rateTypeEnumId || replaced?.rateTypeEnumId || 'TarSalesTax',
+                    organizationPartyId:organizationPartyId,
+                    productStoreId:(replaced ? replaced.productStoreId : productStoreId) || null,
+                    productCategoryId:(replaced ? replaced.productCategoryId : productCategoryId) || null,
+                    taxPercentage:taxPercentage, taxShipping:taxShipping || replaced?.taxShipping || 'N',
+                    minItemPrice:minItemPrice ?? replaced?.minItemPrice ?? null,
+                    minPurchase:minPurchase ?? replaced?.minPurchase ?? null,
+                    fromDate:fromDate || ec.user.nowTimestamp, thruDate:thruDate || null,
+                    description:description || replaced?.description || null}"/>
+            <if condition="rateFields.productStoreId">
+                <entity-find-one entity-name="mantle.product.store.ProductStore" value-field="store" disable-authz="true">
+                    <field-map field-name="productStoreId" from="rateFields.productStoreId"/></entity-find-one>
+                <if condition="store == null"><return error="true" message="STORE_UNAVAILABLE: Choose a store"/></if>
+            </if>
+            <if condition="rateFields.productCategoryId">
+                <entity-find-one entity-name="mantle.product.category.ProductCategory" value-field="category"
+                        disable-authz="true">
+                    <field-map field-name="productCategoryId" from="rateFields.productCategoryId"/></entity-find-one>
+                <if condition="category == null"><return error="true" message="CATEGORY_UNAVAILABLE: Choose a category"/></if>
+            </if>
+            <if condition="taxPercentage == null || toDecimal(taxPercentage).compare(0) &lt; 0 ||
+                    toDecimal(taxPercentage).compare(100) &gt; 0">
+                <return error="true" message="RATE_INVALID: Enter a rate from 0 to 100 percent"/></if>
+            <if condition="rateFields.thruDate &amp;&amp; policy.ms(rateFields.thruDate) &lt;= policy.ms(rateFields.fromDate)">
+                <return error="true" message="RATE_DATES_INVALID: A rate must end after it starts"/></if>
+            <if condition="replaced &amp;&amp; policy.ms(rateFields.fromDate) &lt;= policy.ms(replaced.fromDate)">
+                <return error="true" message="RATE_DATES_INVALID: A new version starts after the one it replaces"/></if>
+            <entity-find entity-name="mantle.other.tax.TaxAuthorityRate" list="authorityRates" for-update="true"
+                    disable-authz="true">
+                <econdition field-name="taxAuthorityId"/>
+            </entity-find>
+            <set field="overlapping" from="Array.from(authorityRates).filter(row =&gt;
+                    row.taxAuthorityRateId !== taxAuthorityRateId &amp;&amp;
+                    (row.rateTypeEnumId || null) === rateFields.rateTypeEnumId &amp;&amp;
+                    (row.organizationPartyId || null) === organizationPartyId &amp;&amp;
+                    (row.productStoreId || null) === rateFields.productStoreId &amp;&amp;
+                    (row.productCategoryId || null) === rateFields.productCategoryId &amp;&amp;
+                    (row.thruDate == null || policy.ms(row.thruDate) &gt; policy.ms(rateFields.fromDate)) &amp;&amp;
+                    (rateFields.thruDate == null || policy.ms(row.fromDate) &lt; policy.ms(rateFields.thruDate)))"/>
+            <if condition="overlapping.length">
+                <return error="true"
+                        message="RATE_OVERLAP: Another rate of this authority and scope covers these dates; replace or end it"/>
+            </if>
+            <script>policy.audit(['taxPercentage', 'fromDate', 'thruDate'], changeReason)</script>
+            <if condition="replaced &amp;&amp; (replaced.thruDate == null ||
+                    policy.ms(replaced.thruDate) &gt; policy.ms(rateFields.fromDate))">
+                <service-call name="update#mantle.other.tax.TaxAuthorityRate" disable-authz="true"
+                        in-map="{taxAuthorityRateId:taxAuthorityRateId, thruDate:rateFields.fromDate}"/>
+            </if>
+            <service-call name="create#mantle.other.tax.TaxAuthorityRate" in-map="rateFields" out-map="createdRate"
+                    disable-authz="true"/>
+            <set field="taxAuthorityRateId" from="createdRate.taxAuthorityRateId"/>
         </actions>
     </service>
 
     <!-- ====================== -->
     <!-- Tax Statement Services -->
     <!-- ====================== -->
+
+    <service verb="find" noun="SalesTaxLines" allow-remote="false">
+        <description>The tax lines of an authority on the organization's issued sales invoices dated in a period, each with
+            its invoice, customer, base, rate and tax, and their totals: those of a statement (taxStatementId), or of an
+            organization, authority and period. Refuses a user without Accounting read authority in the
+            organization.</description>
+        <in-parameters>
+            <parameter name="taxStatementId"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="taxAuthorityId"/>
+            <parameter name="timePeriodId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="lines" type="List"/>
+            <parameter name="lineCount" type="Integer"/>
+            <parameter name="reportedAmount" type="BigDecimal"/>
+            <parameter name="taxAmount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <set field="found" from="ec.resource.script('component://mr-mantle/service/mantle/other/TaxStatements.js')
+                    .execute('salesTaxLines', context)"/>
+            <set field="lines" from="found.lines"/>
+            <set field="lineCount" from="found.lineCount"/>
+            <set field="reportedAmount" from="found.reportedAmount"/>
+            <set field="taxAmount" from="found.taxAmount"/>
+        </actions>
+    </service>
+    <service verb="create" noun="SalesTaxStatement" allow-remote="false">
+        <description>A sales tax statement of an authority for one of the organization's periods, on the
+            LocalSalesTaxReturn form: its taxable sales, tax and line count over find#SalesTaxLines. A later statement
+            of the same period is a revision; the earlier one stays. Refuses a user without TAX_STATEMENT_EDIT in the
+            organization, an unknown authority and a period that is not the organization's.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="taxAuthorityId" required="true"/>
+            <parameter name="timePeriodId" required="true"/>
+            <parameter name="operationKey">
+                <description>A retry with the same key answers the first statement.</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="taxStatementId"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+            <parameter name="lineCount" type="Integer"/>
+            <parameter name="taxAmount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <set field="made" from="ec.resource.script('component://mr-mantle/service/mantle/other/TaxStatements.js')
+                    .execute('createSalesTax', context)"/>
+            <set field="taxStatementId" from="made.taxStatementId"/>
+            <set field="alreadyApplied" from="!!made.alreadyApplied"/>
+            <set field="lineCount" from="made.lineCount"/>
+            <set field="taxAmount" from="made.taxAmount"/>
+        </actions>
+    </service>
+    <service verb="run" noun="Vendor1099Statements" allow-remote="false">
+        <description>The 1099-MISC data of a year for each vendor registered with the authority and not exempt
+            (TaxAuthorityParty) whom the organization paid at least the threshold in the period: amounts by box from
+            the payments of the period applied to the vendor's invoices, through create#Vendor1099MiscStatement. Each
+            vendor is its own step: one without a taxpayer number or payment address is named in failures with its reason
+            and the run goes on; paid vendors under the threshold, not registered, or with a statement for the period
+            already are in skipped, with the reason. Card and third-party network payments are left out
+            (1099-K). Refuses a user without TAX_STATEMENT_EDIT in the organization and
+            a period that is not the organization's.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="timePeriodId" required="true"/>
+            <parameter name="taxAuthorityId" default-value="UsaIrs"/>
+            <parameter name="amountThreshold" type="BigDecimal" default="600"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="created" type="List"/>
+            <parameter name="failures" type="List"/>
+            <parameter name="skipped" type="List"/>
+        </out-parameters>
+        <actions>
+            <set field="run" from="ec.resource.script('component://mr-mantle/service/mantle/other/TaxStatements.js')
+                    .execute('run1099', context)"/>
+            <set field="created" from="run.created"/>
+            <set field="failures" from="run.failures"/>
+            <set field="skipped" from="run.skipped"/>
+        </actions>
+    </service>
+    <service verb="export" noun="Statement" allow-remote="false">
+        <description>A tax statement's data as CSV, with its format version, and who exported it and when: a sales tax
+            statement's lines, refused when its invoices changed since it was made (STATEMENT_STALE); a 1099's form
+            fields, refused without the recipient's taxpayer number or name. Other forms are refused (EXPORT_UNSUPPORTED).
+            The data is not a filing in a form an authority prescribes. Refuses a user without TAX_STATEMENT_EDIT in the
+            statement period's organization.</description>
+        <in-parameters>
+            <parameter name="taxStatementId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="fileName"/>
+            <parameter name="contentType"/>
+            <parameter name="text"/>
+            <parameter name="exportFormat"/>
+        </out-parameters>
+        <actions>
+            <set field="exported" from="ec.resource.script('component://mr-mantle/service/mantle/other/TaxStatements.js')
+                    .execute('exportStatement', context)"/>
+            <set field="fileName" from="exported.fileName"/>
+            <set field="contentType" from="exported.contentType"/>
+            <set field="text" from="exported.text"/>
+            <set field="exportFormat" from="exported.exportFormat"/>
+        </actions>
+    </service>
 
     <service verb="create" noun="TaxStatement">
         <in-parameters>
@@ -235,6 +639,9 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <entity-find-one entity-name="mantle.other.tax.TaxStatement" value-field="taxStatement"/>
             <if condition="taxStatement == null"><return message="Tax Statement ${taxStatementId} not found"/></if>
+            <if condition="taxStatement.exportedDate">
+                <return error="true"
+                        message="STATEMENT_EXPORTED: An exported statement is kept; create a new one to correct it"/></if>
             <entity-delete value-field="taxStatement"/>
             <service-call name="org.moqui.impl.ScreenServices.delete#FormResponse" out-map="context"
                     in-map="{formResponseId:taxStatement.formResponseId}"/>
@@ -282,6 +689,9 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="partyId" required="true"><description>The vendor Party, ie matches Invoice.fromPartyId</description></parameter>
             <parameter name="taxAuthorityId" default-value="UsaIrs"/>
             <parameter name="formId" default-value="UsaIrs1099Misc"/>
+            <parameter name="itemTypeTotals" type="List"><description>The amounts paid by invoice item type
+                ({itemTypeEnumId, itemsTotal}), as run#Vendor1099Statements finds them from the payments of the period;
+                without them the vendor's approved invoices dated in the period.</description></parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="taxStatementId"/>
@@ -302,17 +712,20 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="fromTimestamp" from="periodInfo.fromTimestamp"/>
             <set field="thruTimestamp" from="periodInfo.thruTimestamp"/>
 
-            <entity-find entity-name="mantle.account.invoice.InvoiceItemSummary" list="invoiceItemSummaryList">
-                <econdition field-name="fromPartyId" from="partyId"/>
-                <econdition field-name="toPartyId" from="timePeriod.partyId"/>
-                <!-- NOTE: should ever include InvoiceBilledThrough? -->
-                <econdition field-name="statusId" operator="in" value="InvoiceApproved,InvoicePmtSent"/>
-                <!-- Payroll invoices are handled elsewhere, Tax invoices don't need 1099s -->
-                <econdition field-name="invoiceTypeEnumId" operator="not-in" value="InvoicePayroll,InvoiceTax"/>
-                <econdition field-name="invoiceDate" operator="greater-equals" from="fromTimestamp"/>
-                <econdition field-name="invoiceDate" operator="less-equals" from="thruTimestamp"/>
-                <select-field field-name="itemsTotal"/><select-field field-name="itemTypeEnumId"/>
-            </entity-find>
+            <set field="invoiceItemSummaryList" from="itemTypeTotals"/>
+            <if condition="itemTypeTotals == null">
+                <entity-find entity-name="mantle.account.invoice.InvoiceItemSummary" list="invoiceItemSummaryList">
+                    <econdition field-name="fromPartyId" from="partyId"/>
+                    <econdition field-name="toPartyId" from="timePeriod.partyId"/>
+                    <!-- NOTE: should ever include InvoiceBilledThrough? -->
+                    <econdition field-name="statusId" operator="in" value="InvoiceApproved,InvoicePmtSent"/>
+                    <!-- Payroll invoices are handled elsewhere, Tax invoices don't need 1099s -->
+                    <econdition field-name="invoiceTypeEnumId" operator="not-in" value="InvoicePayroll,InvoiceTax"/>
+                    <econdition field-name="invoiceDate" operator="greater-equals" from="fromTimestamp"/>
+                    <econdition field-name="invoiceDate" operator="less-equals" from="thruTimestamp"/>
+                    <select-field field-name="itemsTotal"/><select-field field-name="itemTypeEnumId"/>
+                </entity-find>
+            </if>
 
             <if condition="!invoiceItemSummaryList?.length"><return message="No invoices found in period ${timePeriodId} for party ${partyId}"/></if>
 
