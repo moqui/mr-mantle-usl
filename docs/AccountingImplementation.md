@@ -148,6 +148,45 @@ its own `PtDisbursement` payment to an outside party, by default the from bank's
 account (`Payment.overrideTypeGlAccountId`), and points at its transfer (`Payment.feeForPaymentId`). One service
 transaction holds them all, so they post together or not at all.
 
+## Tax (P14)
+
+`mantle.other.TaxServices` with `other/SalesTax.js` (the calculation) and `other/TaxStatements.js` (statements). The
+first release has local sales tax and the US 1099 data.
+
+- **Rates.** `TaxAuthorityRate` is active, keyed to `TaxAuthority` by `taxAuthorityId`: a dated row per version, with
+  the rate type (`TarSalesTax`), the collecting organization, an optional store and product category, minimums and
+  whether shipping is taxed. `store#Rate` (`ACCOUNTING_ADMIN`) starts a rate, a new version of one (ending the one it
+  replaces) or its end, and refuses an overlap of the same authority, type and scope. `store#Authority`
+  (`ACCOUNTING_ADMIN`) writes the authority with the organization's tax account (`TaxAuthorityGlAccount`) and nexus and
+  registration (`TaxAuthorityParty.isNexus`, `partyTaxId`).
+- **Calculation.** `calculate#SalesTaxLocal`, the `LOCAL` gateway, taxes an item for each authority whose geo is one of
+  the destination's, where the organization (or one it rolls up to) has nexus and a sales tax rate, at the most
+  specific rate in effect on the tax date (category, then store, then organization). A product line is taxable unless
+  it or its product says not; another line only when `taxableFlag` is Y; shipping when the rate says so. A customer
+  exempt in the authority (`TaxAuthorityParty.isExempt`) gets an explicit zero with its reason. It refuses a taxed sale
+  without a destination (`TAX_ADDRESS_MISSING`), an authority with nexus and no rate in effect (`TAX_RATE_MISSING`)
+  and two rates of one scope (`TAX_RATE_AMBIGUOUS`). An organization with no sales tax nexus gets no results, so
+  Mantle's order flows are as before. The `calculate#SalesTax` interface gained the store, tax date, currency,
+  destination geos and an item's `taxableFlag`, and its results the rate version, base, rate, unrounded tax, rounding
+  and exemption.
+- **Invoices.** `calculate#InvoiceSalesTax` writes a draft sales invoice's `ItemSalesTax` lines under the taxed items
+  through its store's gateway, else the organization's (`PartyAcctgPreference.taxGatewayConfigId`), each with its
+  authority, rate version (`InvoiceItem.taxAuthorityRateId`), base (`taxableAmount`), rate (`taxPercentage`) and
+  rounding (`taxRoundingAmount`); the same results leave the lines as they are. It skips an invoice billed from orders,
+  whose tax came with the order. `change#InvoiceState` runs it before a sales invoice is finalized or approved, so a
+  tax refusal refuses the change, and removes the calculated lines when an invoice goes back to draft. A tax line
+  posts to the organization's account for its authority (`get#InvoiceItemGlAccount` with `taxAuthorityId`), else the
+  item type's.
+- **Statements.** `find#SalesTaxLines` reads an authority's tax lines on the organization's issued sales invoices
+  dated in a period; `create#SalesTaxStatement` (`TAX_STATEMENT_EDIT`) makes a `TaxStatement` on the
+  `LocalSalesTaxReturn` form with the taxable sales, tax and line count. `run#Vendor1099Statements`
+  (`TAX_STATEMENT_EDIT`) makes the 1099-MISC data of a year for each vendor the organization paid who is registered
+  with the authority and not exempt, from the year's payments applied to the vendor's invoices
+  (`create#Vendor1099MiscStatement` with `itemTypeTotals`); a vendor without a taxpayer number or address, or with a
+  statement for the year, is named with its reason. `export#Statement` (`TAX_STATEMENT_EDIT`) gives the CSV data with
+  its format version and records the export; a sales tax statement whose invoices changed since is refused, and an
+  exported statement is not deleted (`delete#TaxStatement`). `simulate#SalesTax` explains a sample sale.
+
 ## Libraries
 
 - `ledger/EntityLib.js`: the helpers the finance modules share: entity reads without artifact authorization (each
@@ -181,6 +220,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingSettlement,AccountingSettlementConcurrency,AccountingApplicationRules
 ./moq test mr-mantle --spec AccountingPaymentLifecycle,AccountingPaymentCorrections,AccountingPaymentOutput,AccountingPaymentNotifications
 ./moq test mr-mantle --spec AccountingPaymentGateway,AccountingPaymentRefunds,AccountingInternalTransfers
+./moq test mr-mantle --spec AccountingTax,TaxStatementServices
 ```
 
 The PDF specs need a Chromium for PDF (`pdf_chromium_path`; see [Run-Deploy](../../../../docs/Run-Deploy.md) and
