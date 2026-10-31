@@ -15,6 +15,11 @@ along with this software (see the LICENSE.md file). If not, see
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
     <service verb="get" noun="ReportBasicInfo">
+        <description>The organization, base currency and fiscal periods of a statement report, with each period's GL summary
+            rows: a closed period's stored rows, an open period's summed from its posted entries (impl-accounting §4).
+            Refuses a user without report read in the organization, and a period that is not the organization's own; with
+            childOrgPeriods the periods of the organizations that roll up to it are added. asOf, complete and
+            incompleteReasons say what the figures rest on.</description>
         <in-parameters>
             <parameter name="organizationPartyId" required="true"/>
             <parameter name="timePeriodIdList" type="List" required="true"><parameter name="timePeriodId"/></parameter>
@@ -27,40 +32,23 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="timePeriodIdList" type="List"><parameter name="timePeriodId"/></parameter>
             <parameter name="timePeriodIdMap" type="Map"/>
             <parameter name="glAccountCodeMask"/>
+            <parameter name="summaryRows" type="List"/>
+            <parameter name="asOf"/>
+            <parameter name="complete" type="Boolean"/>
+            <parameter name="incompleteReasons" type="List"/>
         </out-parameters>
         <actions>
-            <entity-find-one entity-name="mantle.party.Organization" value-field="organization">
+            <set field="periodReport" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FinanceReports.js')
+                    .execute('periodSummaries', {organizationPartyId, timePeriodIdList, childOrgPeriods})"/>
+            <entity-find-one entity-name="mantle.party.Organization" value-field="organization" disable-authz="true">
                 <field-map field-name="partyId" from="organizationPartyId"/></entity-find-one>
             <set field="organizationName" from="organization.organizationName"/>
 
-            <service-call name="mantle.ledger.LedgerServices.find#PartyAcctgPreference" out-map="context"
+            <service-call name="mantle.ledger.LedgerServices.find#PartyAcctgPreference" out-map="context" disable-authz="true"
                     in-map="{organizationPartyId:organizationPartyId}"/>
             <set field="currencyUomId" from="partyAcctgPreference?.baseCurrencyUomId"/>
 
-            <if condition="childOrgPeriods">
-                <service-call name="mantle.ledger.LedgerServices.expand#ChildOrganizationList" out-map="expandResult"
-                        in-map="{organizationPartyId:organizationPartyId}"/>
-                <set field="childOrgIdList" from="Array.from(expandResult.orgPartyIdList ?? []).filter((orgPartyId) =&gt; orgPartyId !== organizationPartyId)"/>
-            </if>
-
-            <set field="timePeriodList" from="[]"/>
-            <iterate list="timePeriodIdList" entry="timePeriodId">
-                <entity-find-one entity-name="mantle.party.time.TimePeriod" value-field="timePeriod">
-                    <field-map field-name="timePeriodId"/></entity-find-one>
-                <if condition="timePeriod == null"><message error="true">Time Period not found with ID ${timePeriodId}</message><continue/></if>
-                <script>timePeriodList.push(timePeriod)</script>
-
-                <if condition="childOrgIdList?.length">
-                    <entity-find entity-name="mantle.party.time.TimePeriod" list="childTimePeriodList">
-                        <econdition field-name="timePeriodTypeId" from="timePeriod.timePeriodTypeId"/>
-                        <econdition field-name="fromDate" from="timePeriod.fromDate"/>
-                        <econdition field-name="partyId" operator="in" from="childOrgIdList"/>
-                    </entity-find>
-                    <script>for (const childTimePeriod of childTimePeriodList) timePeriodList.push(childTimePeriod)</script>
-                </if>
-            </iterate>
-            <check-errors/>
-
+            <set field="timePeriodList" from="Array.from(periodReport.timePeriodList)"/>
             <order-map-list list="timePeriodList"><order-by field-name="periodName"/></order-map-list>
             <set field="timePeriodIdList" from="[]"/>
             <set field="timePeriodIdMap" from="{}"/>
@@ -70,6 +58,10 @@ along with this software (see the LICENSE.md file). If not, see
             </script></iterate>
 
             <set field="glAccountCodeMask" from="partyAcctgPreference?.glAccountCodeMask || ec.user.getPreference('GlAccountCodeMask')"/>
+            <set field="summaryRows" from="periodReport.summaryRows"/>
+            <set field="asOf" from="periodReport.asOf"/>
+            <set field="complete" from="periodReport.complete"/>
+            <set field="incompleteReasons" from="periodReport.incompleteReasons"/>
         </actions>
     </service>
 
@@ -98,6 +90,7 @@ along with this software (see the LICENSE.md file). If not, see
             <iterate list="classIdList" entry="classId">
                 <service-call name="mantle.ledger.LedgerReportServices.get#GlAccountClassReportInfo" out-map="context"
                         in-map="{organizationPartyId:organizationPartyId, timePeriodIdList:timePeriodIdList,
+                            summaryRows:summaryRows,
                             classInfoById:classInfoById, negateDebit:true, glAccountClassEnumId:classId}"/>
             </iterate>
 
@@ -147,17 +140,21 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="classInfoById" from="{}"/>
             <service-call name="mantle.ledger.LedgerReportServices.get#GlAccountClassReportInfo" out-map="context"
                     in-map="{organizationPartyId:organizationPartyId, timePeriodIdList:timePeriodIdList,
-                        classInfoById:classInfoById, glAccountClassEnumId:'ASSET', negateCredit:true}"/>
+                            summaryRows:summaryRows,
+                            classInfoById:classInfoById, glAccountClassEnumId:'ASSET', negateCredit:true}"/>
             <service-call name="mantle.ledger.LedgerReportServices.get#GlAccountClassReportInfo" out-map="context"
                     in-map="{organizationPartyId:organizationPartyId, timePeriodIdList:timePeriodIdList,
-                        classInfoById:classInfoById, glAccountClassEnumId:'LIABILITY', negateDebit:true}"/>
+                            summaryRows:summaryRows,
+                            classInfoById:classInfoById, glAccountClassEnumId:'LIABILITY', negateDebit:true}"/>
             <service-call name="mantle.ledger.LedgerReportServices.get#GlAccountClassReportInfo" out-map="context"
                     in-map="{organizationPartyId:organizationPartyId, timePeriodIdList:timePeriodIdList,
-                        classInfoById:classInfoById, glAccountClassEnumId:'EQUITY', negateDebit:true}"/>
+                            summaryRows:summaryRows,
+                            classInfoById:classInfoById, glAccountClassEnumId:'EQUITY', negateDebit:true}"/>
             <!-- Distribution accounts for extended equity section -->
             <service-call name="mantle.ledger.LedgerReportServices.get#GlAccountClassReportInfo" out-map="context"
                     in-map="{organizationPartyId:organizationPartyId, timePeriodIdList:timePeriodIdList,
-                        classInfoById:classInfoById, glAccountClassEnumId:'DISTRIBUTION', negateDebit:true}"/>
+                            summaryRows:summaryRows,
+                            classInfoById:classInfoById, glAccountClassEnumId:'DISTRIBUTION', negateDebit:true}"/>
 
             <service-call name="mantle.ledger.LedgerReportServices.get#GlAccountClassInfoSums" out-map="netAssetTotalMap"
                     in-map="{classInfoById:classInfoById, classIdList:['ASSET']}"/>
@@ -230,6 +227,7 @@ along with this software (see the LICENSE.md file). If not, see
             <iterate list="classIdList" entry="classId">
                 <service-call name="mantle.ledger.LedgerReportServices.get#GlAccountClassReportInfo" out-map="context"
                         in-map="{organizationPartyId:organizationPartyId, timePeriodIdList:timePeriodIdList,
+                            summaryRows:summaryRows,
                             classInfoById:classInfoById, glAccountClassEnumId:classId, negateDebit:true}"/>
             </iterate>
 
@@ -260,6 +258,7 @@ along with this software (see the LICENSE.md file). If not, see
             <iterate list="classIdList" entry="classId">
                 <service-call name="mantle.ledger.LedgerReportServices.get#GlAccountClassReportInfo" out-map="context"
                         in-map="{organizationPartyId:organizationPartyId, timePeriodIdList:timePeriodIdList,
+                            summaryRows:summaryRows,
                             classInfoById:classInfoById, glAccountClassEnumId:classId, negateDebit:true}"/>
             </iterate>
         </actions>
@@ -308,6 +307,7 @@ along with this software (see the LICENSE.md file). If not, see
             <iterate list="classIdList" entry="classId">
                 <service-call name="mantle.ledger.LedgerReportServices.get#GlAccountClassReportInfo" out-map="context"
                         in-map="{organizationPartyId:organizationPartyId, timePeriodIdList:timePeriodIdList,
+                            summaryRows:summaryRows,
                             classInfoById:classInfoById, negateDebit:true, glAccountClassEnumId:classId}"/>
             </iterate>
 
@@ -502,6 +502,8 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="negateDebit" type="Boolean" default="false"/>
             <parameter name="negateCredit" type="Boolean" default="false"/>
             <parameter name="classInfoById" type="Map"/>
+            <parameter name="summaryRows" type="List"><description>The periods' GL summary rows from get#ReportBasicInfo;
+                without them they are read here, which checks the organization and its periods.</description></parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="classInfoMap" type="Map"/>
@@ -510,7 +512,11 @@ along with this software (see the LICENSE.md file). If not, see
                     A Map passed to a service is a copy, so the caller uses this one.</description></parameter>
         </out-parameters>
         <actions>
-            <entity-find-one entity-name="moqui.basic.Enumeration" value-field="classEnum">
+            <if condition="summaryRows == null">
+                <set field="summaryRows" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FinanceReports.js')
+                        .execute('periodSummaries', {organizationPartyId, timePeriodIdList}).summaryRows"/>
+            </if>
+            <entity-find-one entity-name="moqui.basic.Enumeration" value-field="classEnum" disable-authz="true">
                 <field-map field-name="enumId" from="glAccountClassEnumId"/></entity-find-one>
             <if condition="!classEnum"><return error="true" message="Enumeration not found for ${glAccountClassEnumId}"/></if>
 
@@ -522,14 +528,10 @@ along with this software (see the LICENSE.md file). If not, see
                         (negateCredit &amp;&amp; (rootGlAccountClassEnumId == 'CREDIT' || (rootGlAccountClassEnumId == 'DEBIT' &amp;&amp; isContra == 'Y')))"/>
             </if>
 
-            <!-- lookup accounts, add to glAccountInfoList, sum up classBalance -->
-            <entity-find entity-name="mantle.ledger.report.GlAccountOrgTimePeriodDetail" list="glAccountDetailList">
-                <!-- now one TimePeriod per org, so leave this out to get children too: <econdition field-name="organizationPartyId"/> -->
-                <econdition field-name="timePeriodId" operator="in" from="timePeriodIdList"/>
-                <econdition field-name="glAccountClassEnumId"/>
-                <select-field field-name="timePeriodId,glAccountId,accountCode,accountName,isDebit"/>
-                <select-field field-name="beginningBalance,endingBalance,postedDebitsNoClosing,postedCreditsNoClosing"/>
-            </entity-find>
+            <!-- the class's accounts in the periods' summary rows (the organization's and, for childOrgPeriods, its
+                children's) -->
+            <set field="glAccountDetailList" from="Array.from(summaryRows).filter((row) =&gt;
+                    row.glAccountClassEnumId === glAccountClassEnumId &amp;&amp; timePeriodIdList.includes(row.timePeriodId))"/>
             <set field="balanceByTimePeriod" from="{}"/>
             <set field="postedByTimePeriod" from="{}"/>
             <set field="postedNoClosingByTimePeriod" from="{}"/>
@@ -577,14 +579,15 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="childPostedByTimePeriod" from="{}"/>
             <set field="childPostedNoClosingByTimePeriod" from="{}"/>
             <set field="descendantClassInfoById" from="{}"/>
-            <entity-find entity-name="moqui.basic.Enumeration" list="childEnumList">
+            <entity-find entity-name="moqui.basic.Enumeration" list="childEnumList" disable-authz="true">
                 <econdition field-name="parentEnumId" from="glAccountClassEnumId"/>
                 <order-by field-name="sequenceNum,description"/>
             </entity-find>
             <iterate list="childEnumList" entry="childEnum">
                 <service-call name="mantle.ledger.LedgerReportServices.get#GlAccountClassReportInfo" out-map="childOut"
                         in-map="{organizationPartyId:organizationPartyId, timePeriodIdList:timePeriodIdList,
-                            glAccountClassEnumId:childEnum.enumId, negateDebit:negateDebit, negateCredit:negateCredit}"/>
+                            summaryRows:summaryRows, glAccountClassEnumId:childEnum.enumId, negateDebit:negateDebit,
+                            negateCredit:negateCredit}"/>
                 <script>
                     const addDec = (key, value, map) => { if (value != null) map[key] = map[key] == null ? toDecimal(value) : toDecimal(map[key]).add(value) }
                     const childInfo = childOut.classInfoMap
@@ -639,28 +642,32 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
 
     <service verb="run" noun="PostedAmountSummary">
+        <description>Each account's posted debits, credits and net in one currency (the organization's base currency by
+            default) between two days, by book day, with its balance before and after (design-accounting §13 PostedSummary).
+            Refuses a user without report read in the organization, a fiscal period of another organization and a unit that
+            is not a currency.</description>
         <in-parameters>
             <parameter name="organizationPartyId" required="true"/>
+            <parameter name="timePeriodId"/>
             <parameter name="fromDate" type="Timestamp"/>
             <parameter name="thruDate" type="Timestamp"/>
             <parameter name="amountUomId"/>
         </in-parameters>
         <out-parameters>
             <parameter name="resultList" type="List"><parameter name="resultItem" type="Map"/></parameter>
+            <parameter name="organizationPartyId"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="asOf"/>
+            <parameter name="complete" type="Boolean"/>
         </out-parameters>
         <actions>
-            <service-call name="mantle.ledger.LedgerServices.find#PartyAcctgPreference" out-map="context"
-                    in-map="{organizationPartyId:organizationPartyId}"/>
-            <if condition="!amountUomId"><set field="amountUomId" from="partyAcctgPreference.baseCurrencyUomId"/></if>
-
-            <set field="accountResultMap" from="{}"/>
-            <service-call name="mantle.ledger.LedgerReportServices.get#PostedAmountSummarySide" out-map="context"
-                    in-map="Object.assign({}, context, {debitCreditFlag:'D'})"/>
-            <service-call name="mantle.ledger.LedgerReportServices.get#PostedAmountSummarySide" out-map="context"
-                    in-map="Object.assign({}, context, {debitCreditFlag:'C'})"/>
-
-            <set field="resultList" from="Object.values(accountResultMap)"/>
-            <order-map-list list="resultList"><order-by field-name="accountCode"/></order-map-list>
+            <set field="report" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FinanceReports.js')
+                    .execute('postedSummary', context)"/>
+            <set field="resultList" from="report.resultList"/>
+            <set field="organizationPartyId" from="report.organizationPartyId"/>
+            <set field="currencyUomId" from="report.currencyUomId"/>
+            <set field="asOf" from="report.asOf"/>
+            <set field="complete" from="report.complete"/>
         </actions>
     </service>
     <service verb="get" noun="PostedAmountSummarySide">
@@ -702,6 +709,8 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
 
     <service verb="get" noun="AccountLedgerInfo">
+        <description>An account's posted lines in a fiscal period with running balances. Refuses a user without report read
+            in the organization and a period of another organization.</description>
         <in-parameters>
             <parameter name="glAccountIdList" type="List" required="true"/>
             <parameter name="timePeriodId" required="true"/>
@@ -719,8 +728,12 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="entryInfoList" type="List"><parameter name="entryInfo" type="Map"/></parameter>
         </out-parameters>
         <actions>
-            <service-call name="mantle.party.TimeServices.get#TimePeriodInfo" in-map="{timePeriodId:timePeriodId}" out-map="context"/>
+            <service-call name="mantle.party.TimeServices.get#TimePeriodInfo" in-map="{timePeriodId:timePeriodId}"
+                    out-map="context" disable-authz="true"/>
             <set field="organizationPartyId" from="organizationPartyId || timePeriod.partyId"/>
+            <!-- report read in the organization, and the period its own (F6) -->
+            <script>ec.resource.script('component://mr-mantle/service/mantle/ledger/FinanceReports.js')
+                .execute('periodAccess', {organizationPartyId, timePeriodIdList: [timePeriodId]})</script>
 
             <entity-find-one entity-name="mantle.party.PartyDetail" value-field="orgDetail">
                 <field-map field-name="partyId" from="organizationPartyId"/></entity-find-one>
@@ -831,6 +844,9 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
 
     <service verb="get" noun="PeriodSeriesSummary">
+        <description>Totals of account classes over groups of the organization's fiscal periods, from each period's GL
+            summary rows (a closed period's stored rows, an open period's posted entries). Refuses a user without report
+            read in the organization and a period that is not the organization's own.</description>
         <in-parameters>
             <parameter name="organizationPartyId" required="true"/>
             <parameter name="timePeriodGroups" type="List" required="true"><parameter name="timePeriodIds" type="List">
@@ -865,8 +881,14 @@ along with this software (see the LICENSE.md file). If not, see
                 <parameter name="data" type="List"><parameter name="amount" type="BigDecimal"/></parameter>
             </parameter></parameter>
             <parameter name="datasetsById" type="Map"/>
+            <parameter name="asOf"/>
+            <parameter name="complete" type="Boolean"/>
+            <parameter name="incompleteReasons" type="List"/>
         </out-parameters>
         <actions>
+            <script>ec.resource.script('component://mr-mantle/service/mantle/ledger/FinanceReports.js')
+                .execute('periodAccess', {organizationPartyId,
+                    timePeriodIdList: Array.from(timePeriodGroups).flatMap((ids) =&gt; Array.from(ids))})</script>
             <!-- bootstrap primary: 'rgba(66, 139, 202, 0.5)', -->
             <set field="defaultColors"
                     from="['rgba(92, 184, 92, 0.5)','rgba(91, 192, 222, 0.5)','rgba(240, 173, 78, 0.5)','rgba(217, 83, 79, 0.5)',
@@ -969,14 +991,13 @@ along with this software (see the LICENSE.md file). If not, see
                     <set field="dataset.borderColor" from="defaultColors[dataset_index]?.replaceAll('0.5', '1.0')"/></if>
             </iterate>
 
-            <!-- do single big query grouped by timePeriodId and glAccountClassEnumId -->
-            <entity-find entity-name="mantle.ledger.report.GlAccountOrgTimePeriodSummary" list="periodClassSummaryList">
-                <econdition field-name="organizationPartyId"/>
-                <econdition field-name="timePeriodId" operator="in" from="allPeriods"/>
-                <econdition field-name="glAccountClassEnumId" operator="in" from="allClasses"/>
-                <select-field field-name="timePeriodId,glAccountClassEnumId,isDebit"/>
-                <select-field field-name="postedDebitsNoClosing,postedCreditsNoClosing,beginningBalance,endingBalance"/>
-            </entity-find>
+            <!-- the periods' summary rows totaled by period, class and side; checks the organization and its periods -->
+            <set field="classReport" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FinanceReports.js')
+                    .execute('classSummaries', {organizationPartyId, timePeriodIdList:allPeriods, classIdList:allClasses})"/>
+            <set field="periodClassSummaryList" from="classReport.classRows"/>
+            <set field="asOf" from="classReport.asOf"/>
+            <set field="complete" from="classReport.complete"/>
+            <set field="incompleteReasons" from="classReport.incompleteReasons"/>
 
             <!-- collate results -->
             <set field="datasetsById" from="{}"/>
@@ -1037,6 +1058,38 @@ along with this software (see the LICENSE.md file). If not, see
                     <script>rowsList[amount_index + 1][dataset_index + 1] = amount</script>
                 </iterate>
             </iterate>
+        </actions>
+    </service>
+    <service verb="run" noun="PartnerLedger" allow-remote="false">
+        <description>Each customer's (or supplier's) movements on the organization's receivable (or payable) accounts
+            between two days or in a fiscal period, by book day, with opening, running and closing balances; each line names
+            its invoice, payment or journal entry. More than 5,000 lines are named (complete false, incompleteReason) and
+            their balances unavailable. Refuses a user without report read in the organization, a period of another
+            organization, a party another user keeps private and a unit that is not a currency.</description>
+        <implements service="mantle.ledger.FinanceReportServices.define#ReportOptions"/>
+        <in-parameters>
+            <parameter name="invoiceType" default-value="receivable"><description>receivable or payable</description></parameter>
+            <parameter name="partyId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="reportRows" type="List"/>
+            <parameter name="partyRows" type="List"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="invoiceType"/>
+            <parameter name="asOf"/>
+            <parameter name="complete" type="Boolean"/>
+            <parameter name="incompleteReason"/>
+        </out-parameters>
+        <actions>
+            <set field="report" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FinanceReports.js')
+                    .execute('partnerLedger', context)"/>
+            <set field="reportRows" from="report.reportRows"/>
+            <set field="partyRows" from="report.partyRows"/>
+            <set field="organizationPartyId" from="report.organizationPartyId"/>
+            <set field="invoiceType" from="report.invoiceType"/>
+            <set field="asOf" from="report.asOf"/>
+            <set field="complete" from="report.complete"/>
+            <set field="incompleteReason" from="report.incompleteReason"/>
         </actions>
     </service>
     <service verb="run" noun="InvoiceReconciliation" allow-remote="false">

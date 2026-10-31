@@ -345,6 +345,47 @@ along with this software (see the LICENSE.md file). If not, see
         ]]></script></actions>
     </service>
 
+    <service verb="run" noun="SalesAnalysis" allow-remote="false">
+        <description>An organization's sales between two days or in one of its fiscal periods, by product, customer or
+            customer class (groupBy), each row with what was ordered (its sales orders placed), issued from those orders,
+            invoiced (its issued sales invoices, by book day) and returned, with quantities and values in the document's
+            currency, largest invoiced value first. Every read is the organization's own, so its top products and customer
+            classes hold no other organization's sales (F6). A read over 2,000 documents of a kind is named (complete
+            false). Refuses a user without report read in the organization, a period of another organization and a unit
+            that is not a currency.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="timePeriodId"/>
+            <parameter name="fromDate" type="Timestamp"/>
+            <parameter name="thruDate" type="Timestamp"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="groupBy" default-value="product">
+                <description>product, customer or customerClass</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="analysisRows" type="List"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="groupBy"/>
+            <parameter name="fromDate" type="Timestamp"/>
+            <parameter name="thruDate" type="Timestamp"/>
+            <parameter name="asOf"/>
+            <parameter name="complete" type="Boolean"/>
+            <parameter name="incompleteReason"/>
+        </out-parameters>
+        <actions>
+            <set field="report" from="ec.resource.script('component://mr-mantle/service/mantle/sales/SalesAnalysis.js')
+                    .execute('analysis', context)"/>
+            <set field="analysisRows" from="report.analysisRows"/>
+            <set field="organizationPartyId" from="report.organizationPartyId"/>
+            <set field="groupBy" from="report.groupBy"/>
+            <set field="fromDate" from="report.fromDate"/>
+            <set field="thruDate" from="report.thruDate"/>
+            <set field="asOf" from="report.asOf"/>
+            <set field="complete" from="report.complete"/>
+            <set field="incompleteReason" from="report.incompleteReason"/>
+        </actions>
+    </service>
+
     <service verb="get" noun="SalesTopProduct">
         <in-parameters>
             <parameter name="interval" default-value="M"/><!-- day = d, week = w, month = M, quarter = q, year = y -->
@@ -352,6 +393,8 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="indexName" default-value="mantle_sales"/>
             <parameter name="documentType" default-value="MantleSalesOrderItem"/>
             <parameter name="topLimit" type="Integer" default="10"/>
+            <parameter name="vendorPartyIds" type="List"><description>The selling organizations, so the top products are
+                theirs only (F6)</description><parameter name="vendorPartyId"/></parameter>
             <parameter name="poffset" type="Integer" default="-1"/>
             <parameter name="dateField" default-value="placedDate"/>
             <parameter name="orderByField" default-value="totalSales"/>
@@ -371,10 +414,12 @@ along with this software (see the LICENSE.md file). If not, see
             topProductEnd = curPer[1]
 
             const placedStatuses = ['OrderPlaced', 'OrderProcessing', 'OrderApproved', 'OrderSent', 'OrderCompleted', 'OrderHold']
-            const filter = {bool:{all:[
+            const filterList = [
                     {field: {name: dateField, op: 'range', gte: Number(topProductStart), lt: Number(topProductEnd)}},
                     {field: {name: 'partStatusId', op: 'in', values: placedStatuses}}
-            ]}}
+            ]
+            if (vendorPartyIds?.length) filterList.push({field: {name: 'vendorPartyId', op: 'in', values: vendorPartyIds}})
+            const filter = {bool:{all:filterList}}
 
             if (!ec.search.isAvailable()) { ec.message.addMessage("Search is not configured, no top products", "danger"); return }
             const aggregationsMap = ec.search.aggregate({documentType:documentType, filter:filter, aggs:{
@@ -401,6 +446,8 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="invoiceDocumentType" default-value="MantleSalesInvoice"/>
             <parameter name="itemDocumentType" default-value="MantleSalesInvoiceItem"/>
             <parameter name="topLimit" type="Integer" default="100"/><!-- high limit to show all customer classes -->
+            <parameter name="fromPartyIds" type="List"><description>The invoicing organizations, so the customer classes are
+                theirs only (F6)</description><parameter name="fromPartyId"/></parameter>
             <parameter name="poffset" type="Integer" default="-1"/>
             <parameter name="dateField" default-value="invoiceDate"/>
             <parameter name="orderByField" default-value="-invoiceTotal"/>
@@ -427,10 +474,12 @@ along with this software (see the LICENSE.md file). If not, see
             topCustomerClassStart = curPer[0]
             topCustomerClassEnd = curPer[1]
 
-            const filter = {bool:{all:[
+            const filterList = [
                     {field: {name: dateField, op: 'range', gte: Number(topCustomerClassStart), lt: Number(topCustomerClassEnd)}},
                     {field: {name: 'statusId', op: 'in', values: ['InvoiceFinalized', 'InvoiceSent', 'InvoiceAcked', 'InvoicePmtRecvd']}}
-            ]}}
+            ]
+            if (fromPartyIds?.length) filterList.push({field: {name: 'fromPartyId', op: 'in', values: fromPartyIds}})
+            const filter = {bool:{all:filterList}}
 
             if (!ec.search.isAvailable()) { ec.message.addMessage("Search is not configured, no invoices by customer class", "danger"); return }
             const invAggregationsMap = ec.search.aggregate({documentType:invoiceDocumentType, filter:filter, aggs:{

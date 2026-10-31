@@ -41,6 +41,7 @@ function options(p) {
     out.thruAccountingDate = p.thruDate ? ec.l10n.format(p.thruDate, "yyyy-MM-dd") : null
     delete out.period
     if (p.timePeriodId) {
+        // the organization's own period or one of an organization it rolls up to, whose periods it books in
         const period = lib.record({
             kind: "periods",
             recordId: p.timePeriodId,
@@ -505,10 +506,451 @@ function invoiceReconciliation(p) {
         asOf: ec.l10n.format(ec.user.nowTimestamp, "yyyy-MM-dd HH:mm:ss")
     }
 }
+// The statement reports' figures (impl-accounting §4, F16): each fiscal period's GL summary rows, a closed period's as its
+// close stored them and an open period's summed from its posted entries when the report runs, so no report depends on
+// realTimeGlSummary. Only the organization's own periods are read (F6).
+const DAY = 86400000
+const SUMMARY_FIELDS = [
+    "timePeriodId",
+    "organizationPartyId",
+    "glAccountId",
+    "accountCode",
+    "accountName",
+    "isDebit",
+    "isTemporary",
+    "glAccountClassEnumId",
+    "beginningBalance",
+    "endingBalance",
+    "postedDebits",
+    "postedCredits",
+    "postedDebitsNoClosing",
+    "postedCreditsNoClosing"
+]
+// A fiscal period's days: fromDay and thruDay inclusive, afterDay the day after, and their midnights in the user's zone
+// for postings dated by timestamp.
+function periodDays(period) {
+    const fromDay = lib.calendarDateText(period.fromDate)
+    const thruDay = lib.calendarDateText(period.thruDate)
+    const afterDay = lib.calendarDateText(Date.parse(thruDay) + DAY)
+    return {
+        fromDay,
+        thruDay,
+        afterDay,
+        fromStamp: ec.l10n.parseTimestamp(fromDay, "yyyy-MM-dd"),
+        afterStamp: ec.l10n.parseTimestamp(afterDay, "yyyy-MM-dd")
+    }
+}
+function blankTotal() {
+    return {
+        before: toDecimal(0),
+        debits: toDecimal(0),
+        credits: toDecimal(0),
+        debitsNoClosing: toDecimal(0),
+        creditsNoClosing: toDecimal(0)
+    }
+}
+// Each account's posted totals of an organization for a span of days: all its postings before the first day (debits
+// positive), and the span's debits and credits with and without the net income closing entries; with the currencies of
+// those postings. Period close stores these as the period's summary rows; the statement reports sum an open period here.
+function periodTotals(org, days) {
+    const totals = {},
+        currencies = new Set()
+    const total = id => totals[id] || (totals[id] = blankTotal())
+    const summary = dates =>
+        lib
+            .find(SUMMARY, {organizationPartyId: org, isPosted: "Y"})
+            .condition(dates)
+            .selectField("glAccountId")
+            .selectField("debitCreditFlag")
+            .selectField("acctgTransTypeEnumId")
+            .selectField("amountUomId")
+            .selectField("amount")
+            .list()
+    for (const row of summary(lib.accountingDateCondition({thruDate: days.fromStamp, thruDay: days.fromDay}))) {
+        currencies.add(row.amountUomId)
+        const entry = total(row.glAccountId)
+        entry.before = entry.before.add(toDecimal(row.amount ?? 0).multiply(row.debitCreditFlag === "D" ? 1 : -1))
+    }
+    const span = lib.accountingDateCondition({
+        fromDate: days.fromStamp,
+        thruDate: days.afterStamp,
+        fromDay: days.fromDay,
+        thruDay: days.afterDay
+    })
+    for (const row of summary(span)) {
+        currencies.add(row.amountUomId)
+        const entry = total(row.glAccountId),
+            amount = toDecimal(row.amount ?? 0),
+            side = row.debitCreditFlag === "D" ? "debits" : "credits"
+        entry[side] = entry[side].add(amount)
+        // the columns without closing entries leave out net income closing, as Mantle's recalculation does
+        if (row.acctgTransTypeEnumId !== "AttNetIncomeClosing")
+            entry[side + "NoClosing"] = entry[side + "NoClosing"].add(amount)
+    }
+    return {totals, currencies: [...currencies].filter(Boolean)}
+}
+// The fiscal periods a report names, each with the organization whose figures it holds: refused unless each is the
+// organization's own or one of an organization it rolls up to, whose periods it books in (P11); with childOrgPeriods also
+// the periods of the organizations that roll up to it with the same type and start, each for its own organization.
+function reportPeriods(p) {
+    const s = lib.organization(p, "reportRead")
+    const org = s.organizationPartyId
+    const chain = lib.organizationChain(org)
+    const ids = Array.from(p.timePeriodIdList || []).filter(Boolean)
+    if (!ids.length) lib.denied("PERIOD_REQUIRED", "Choose a fiscal period")
+    const periods = ids.map(id => {
+        const period = lib.one("mantle.party.time.TimePeriod", {timePeriodId: id})
+        if (!period || !chain.includes(period.partyId))
+            lib.denied("PERIOD_UNAVAILABLE", "Choose fiscal periods of this organization")
+        return period
+    })
+    const owners = periods.map(() => org)
+    if (p.childOrgPeriods) {
+        const children = Array.from(
+            lib.call("mantle.ledger.LedgerServices.expand#ChildOrganizationList", {organizationPartyId: org}).orgPartyIdList || []
+        ).filter(id => id !== org)
+        if (children.length)
+            for (const period of periods.slice())
+                for (const child of lib
+                    .find("mantle.party.time.TimePeriod", {timePeriodTypeId: period.timePeriodTypeId, fromDate: period.fromDate})
+                    .condition("partyId", "in", children)
+                    .orderBy("partyId")
+                    .list()) {
+                    periods.push(child)
+                    owners.push(child.partyId)
+                }
+    }
+    return {s, org, periods, owners}
+}
+function summaryRow(period, org, glAccountId, account, entry) {
+    const sign = account?.isDebit === "Y" ? 1 : -1
+    const beginning = entry.before.multiply(sign)
+    return {
+        timePeriodId: period.timePeriodId,
+        organizationPartyId: org,
+        glAccountId,
+        accountCode: account?.accountCode,
+        accountName: account?.accountName,
+        isDebit: account?.isDebit,
+        isTemporary: account?.isTemporary,
+        glAccountClassEnumId: account?.glAccountClassEnumId,
+        beginningBalance: beginning,
+        postedDebits: entry.debits,
+        postedCredits: entry.credits,
+        postedDebitsNoClosing: entry.debitsNoClosing,
+        postedCreditsNoClosing: entry.creditsNoClosing,
+        endingBalance: beginning.add(entry.debits.subtract(entry.credits).multiply(sign)),
+        closedSummary: false
+    }
+}
+// One period's summary rows: a closed period's stored rows, else its posted entries summed. A closed period without stored
+// rows, and postings in another currency than the base, are named in reasons.
+function periodRows(period, org, baseCurrency, reasons) {
+    const name = period.periodName || period.timePeriodId
+    if (period.isClosed === "Y") {
+        const stored = lib.rows("mantle.ledger.report.GlAccountOrgTimePeriodDetail", {
+            organizationPartyId: org,
+            timePeriodId: period.timePeriodId
+        })
+        if (stored.length) return stored.map(row => Object.assign(lib.pick(row, SUMMARY_FIELDS), {closedSummary: true}))
+        reasons.push(name + " is closed without stored summaries; its figures are summed from its posted entries")
+    }
+    const {totals, currencies} = periodTotals(org, periodDays(period))
+    const others = currencies.filter(currency => currency !== baseCurrency)
+    if (others.length) reasons.push(name + " has postings in " + others.join(", ") + ", added without conversion")
+    const ids = Object.keys(totals).sort()
+    if (!ids.length) return []
+    const accounts = new Map(
+        Array.from(lib.find("mantle.ledger.account.GlAccount").condition("glAccountId", "in", ids).list()).map(row => [
+            row.glAccountId,
+            row
+        ])
+    )
+    return ids.map(id => summaryRow(period, org, id, accounts.get(id), totals[id]))
+}
+function periodSummaries(p) {
+    const {org, periods, owners} = reportPeriods(p)
+    const currencyUomId = lib.preference(org).baseCurrencyUomId
+    const incompleteReasons = [],
+        summaryRows = []
+    periods.forEach((period, index) => summaryRows.push(...periodRows(period, owners[index], currencyUomId, incompleteReasons)))
+    return {
+        organizationPartyId: org,
+        timePeriodList: periods,
+        summaryRows,
+        currencyUomId,
+        asOf: ec.l10n.format(ec.user.nowTimestamp, "yyyy-MM-dd HH:mm:ss"),
+        complete: !incompleteReasons.length,
+        incompleteReasons
+    }
+}
+// The summary rows totaled by period, account class and side, as get#PeriodSeriesSummary reads them.
+function classSummaries(p) {
+    const out = periodSummaries(p)
+    const classes = p.classIdList ? new Set(Array.from(p.classIdList)) : null
+    const grouped = new Map()
+    for (const row of out.summaryRows) {
+        if (classes && !classes.has(row.glAccountClassEnumId)) continue
+        const key = row.timePeriodId + ":" + row.glAccountClassEnumId + ":" + row.isDebit
+        if (!grouped.has(key))
+            grouped.set(key, {
+                timePeriodId: row.timePeriodId,
+                glAccountClassEnumId: row.glAccountClassEnumId,
+                isDebit: row.isDebit,
+                postedDebitsNoClosing: toDecimal(0),
+                postedCreditsNoClosing: toDecimal(0),
+                beginningBalance: toDecimal(0),
+                endingBalance: toDecimal(0)
+            })
+        const total = grouped.get(key)
+        for (const field of ["postedDebitsNoClosing", "postedCreditsNoClosing", "beginningBalance", "endingBalance"])
+            total[field] = total[field].add(toDecimal(row[field] ?? 0))
+    }
+    return Object.assign(out, {classRows: [...grouped.values()], summaryRows: null})
+}
+
+// The partner ledger (design-accounting §13 PartnerLedger): each customer's (or supplier's) movements on the
+// organization's receivable (or payable) accounts in a span of days, by book day, with its opening balance, running
+// balance and totals; each line names its invoice, payment or journal entry. More than 5,000 lines are named
+// (complete false) and the balances are then unavailable, never cut silently.
+const PARTNER_LINE_LIMIT = 5000
+function partnerLedger(p) {
+    p = options(p)
+    const s = lib.organization(p, "reportRead")
+    const org = s.organizationPartyId
+    const payable = p.invoiceType === "payable"
+    const accountClass = payable ? "ACCOUNTS_PAYABLE" : "ACCOUNTS_RECEIVABLE"
+    // what the party owes (receivable) or is owed (payable) is positive
+    const sign = payable ? -1 : 1
+    if (p.partyId) lib.counterparty(p.partyId)
+    if (p.amountUomId) lib.currency(p.amountUomId)
+    const query = dates => {
+        let q = lib.find("mantle.ledger.transaction.AcctgTransAndEntryGlaSummary", {
+            organizationPartyId: org,
+            isPosted: "Y",
+            glAccountClassEnumId: accountClass
+        })
+        if (p.partyId) q = q.condition("otherPartyId", p.partyId)
+        if (p.amountUomId) q = q.condition("amountUomId", p.amountUomId)
+        return dates ? q.condition(dates) : q
+    }
+    const signed = row => toDecimal(row.amount ?? 0).multiply(row.debitCreditFlag === "D" ? sign : -sign)
+    const groups = new Map()
+    const group = (partyId, amountUomId) => {
+        const key = (partyId || "") + ":" + amountUomId
+        if (!groups.has(key))
+            groups.set(key, {partyId, amountUomId, opening: toDecimal(0), debits: toDecimal(0), credits: toDecimal(0), lines: []})
+        return groups.get(key)
+    }
+    if (p.fromDate) {
+        const before = lib.accountingDateCondition({thruDate: p.fromDate, thruDay: p.fromAccountingDate})
+        for (const row of query(before)
+            .selectField("otherPartyId")
+            .selectField("amountUomId")
+            .selectField("debitCreditFlag")
+            .selectField("amount")
+            .list()) {
+            const total = group(row.otherPartyId, row.amountUomId)
+            total.opening = total.opening.add(signed(row))
+        }
+    }
+    const span = lib.accountingDateCondition({
+        fromDate: p.fromDate,
+        thruDate: p.thruDate,
+        fromDay: p.fromAccountingDate,
+        thruDay: p.thruAccountingDate
+    })
+    let q = query(span)
+    for (const field of [
+        "acctgTransId",
+        "acctgTransEntrySeqId",
+        "transactionDate",
+        "accountingDate",
+        "otherPartyId",
+        "glAccountId",
+        "accountCode",
+        "accountName",
+        "invoiceId",
+        "paymentId",
+        "debitCreditFlag",
+        "amountUomId",
+        "amount",
+        "txDescription"
+    ])
+        q = q.selectField(field)
+    const ordered = q.orderBy("otherPartyId,transactionDate,acctgTransId,acctgTransEntrySeqId")
+    const selected = Array.from(ordered.limit(PARTNER_LINE_LIMIT + 1).list())
+    const complete = selected.length <= PARTNER_LINE_LIMIT
+    const lines = selected.slice(0, PARTNER_LINE_LIMIT)
+    const day = row => lib.bookDay(row.accountingDate, row.transactionDate)
+    lines.sort(
+        (a, b) =>
+            day(a).localeCompare(day(b)) ||
+            lib.ms(a.transactionDate) - lib.ms(b.transactionDate) ||
+            a.acctgTransId.localeCompare(b.acctgTransId) ||
+            a.acctgTransEntrySeqId.localeCompare(b.acctgTransEntrySeqId)
+    )
+    for (const row of lines) {
+        const total = group(row.otherPartyId, row.amountUomId)
+        const debit = row.debitCreditFlag === "D"
+        total[debit ? "debits" : "credits"] = total[debit ? "debits" : "credits"].add(toDecimal(row.amount ?? 0))
+        total.lines.push(row)
+    }
+    const names = lib.lib.partyNames([...groups.values()].map(row => row.partyId))
+    const nameOf = partyId => (!partyId ? "No party" : names[partyId] || "Private contact")
+    const sorted = [...groups.values()].sort(
+        (a, b) => nameOf(a.partyId).localeCompare(nameOf(b.partyId)) || a.amountUomId.localeCompare(b.amountUomId)
+    )
+    const reportRows = [],
+        partyRows = []
+    for (const total of sorted) {
+        const partyId = total.partyId && names[total.partyId] ? total.partyId : null
+        const partyName = nameOf(total.partyId)
+        const head = {partyId, partyName, amountUomId: total.amountUomId}
+        let balance = total.opening
+        reportRows.push(Object.assign({rowType: "opening", description: "Opening balance", balance: total.opening}, head))
+        for (const row of total.lines) {
+            balance = balance.add(signed(row))
+            const sourceKind = row.invoiceId ? (payable ? "bills" : "invoices") : row.paymentId ? "payments" : "journals"
+            reportRows.push(
+                Object.assign({}, head, {
+                    rowType: "entry",
+                    acctgTransId: row.acctgTransId,
+                    bookDay: day(row),
+                    glAccountId: row.glAccountId,
+                    accountName: row.accountName,
+                    sourceKind,
+                    sourceId: row.invoiceId || row.paymentId || row.acctgTransId,
+                    description: row.txDescription || "",
+                    debit: row.debitCreditFlag === "D" ? row.amount : null,
+                    credit: row.debitCreditFlag === "C" ? row.amount : null,
+                    balance: complete ? balance : null
+                })
+            )
+        }
+        const closing = complete ? balance : null
+        reportRows.push(
+            Object.assign({rowType: "closing", description: "Closing balance", debit: total.debits, credit: total.credits},
+                head, {balance: closing})
+        )
+        partyRows.push(
+            Object.assign({}, head, {
+                opening: total.opening,
+                debits: complete ? total.debits : null,
+                credits: complete ? total.credits : null,
+                closing,
+                lineCount: total.lines.length
+            })
+        )
+    }
+    return {
+        reportRows,
+        partyRows,
+        organizationPartyId: org,
+        invoiceType: payable ? "payable" : "receivable",
+        asOf: ec.l10n.format(ec.user.nowTimestamp, "yyyy-MM-dd HH:mm:ss"),
+        complete,
+        incompleteReason: complete
+            ? null
+            : "More than 5,000 lines match; the first 5,000 are listed and the balances are unavailable. " +
+              "Choose fewer days or one party."
+    }
+}
+
+// Posted amounts by account (design-accounting §13 PostedSummary): each account's posted debits, credits and net in a
+// span of days in one currency, with its balance before and after, by book day.
+function postedSummary(p) {
+    p = options(p)
+    const s = lib.organization(p, "reportRead")
+    const org = s.organizationPartyId
+    const currencyUomId = p.amountUomId || lib.preference(org).baseCurrencyUomId
+    lib.currency(currencyUomId)
+    const sums = dates => {
+        let q = lib.find("mantle.ledger.report.PostedAmountSummary", {
+            organizationPartyId: org,
+            amountUomId: currencyUomId,
+            isPosted: "Y"
+        })
+        if (dates) q = q.condition(dates)
+        for (const field of ["glAccountId", "accountCode", "accountName", "glAccountClassEnumId", "debitCreditFlag", "amount"])
+            q = q.selectField(field)
+        return Array.from(q.list())
+    }
+    const accounts = new Map()
+    const account = row => {
+        if (!accounts.has(row.glAccountId))
+            accounts.set(row.glAccountId, {
+                glAccountId: row.glAccountId,
+                accountCode: row.accountCode,
+                accountName: row.accountName,
+                glAccountClassEnumId: row.glAccountClassEnumId,
+                amountUomId: currencyUomId,
+                beginningBalance: toDecimal(0),
+                debitAmount: toDecimal(0),
+                creditAmount: toDecimal(0)
+            })
+        return accounts.get(row.glAccountId)
+    }
+    if (p.fromDate)
+        for (const row of sums(lib.accountingDateCondition({thruDate: p.fromDate, thruDay: p.fromAccountingDate}))) {
+            const total = account(row)
+            const amount = toDecimal(row.amount ?? 0).multiply(row.debitCreditFlag === "D" ? 1 : -1)
+            total.beginningBalance = total.beginningBalance.add(amount)
+        }
+    const span = lib.accountingDateCondition({
+        fromDate: p.fromDate,
+        thruDate: p.thruDate,
+        fromDay: p.fromAccountingDate,
+        thruDay: p.thruAccountingDate
+    })
+    for (const row of sums(span)) {
+        const total = account(row),
+            field = row.debitCreditFlag === "D" ? "debitAmount" : "creditAmount"
+        total[field] = total[field].add(toDecimal(row.amount ?? 0))
+    }
+    const classIds = [...new Set([...accounts.values()].map(row => row.glAccountClassEnumId).filter(Boolean))]
+    const classNames = Object.fromEntries(
+        classIds.length
+            ? Array.from(lib.find("moqui.basic.Enumeration").condition("enumId", "in", classIds).list()).map(row => [
+                  row.enumId,
+                  row.description
+              ])
+            : []
+    )
+    const resultList = [...accounts.values()]
+        .map(row => {
+            const netAmount = row.debitAmount.subtract(row.creditAmount)
+            return Object.assign(row, {
+                className: classNames[row.glAccountClassEnumId] || row.glAccountClassEnumId || "",
+                netAmount,
+                endingBalance: row.beginningBalance.add(netAmount)
+            })
+        })
+        .sort((a, b) => String(a.accountCode || a.glAccountId).localeCompare(String(b.accountCode || b.glAccountId)))
+    return {
+        resultList,
+        organizationPartyId: org,
+        currencyUomId,
+        asOf: ec.l10n.format(ec.user.nowTimestamp, "yyyy-MM-dd HH:mm:ss"),
+        complete: true
+    }
+}
+const operations = {
+    invoiceReconciliation,
+    periodSummaries,
+    classSummaries,
+    partnerLedger,
+    postedSummary,
+    periodAccess: p => ({organizationPartyId: reportPeriods(p).org}),
+    options
+}
 ;({
     execute: (op, p) => {
-        if (op === "invoiceReconciliation") return invoiceReconciliation(p)
-        if (!["trial", "ledger"].includes(op)) throw new Error("Unknown finance report")
+        if (operations[op]) return operations[op](p)
+        if (!["trial", "ledger"].includes(op)) throw new Error("Unknown finance report " + op)
         return report(op, p)
-    }
+    },
+    periodTotals,
+    periodDays,
+    blankTotal
 })
