@@ -490,6 +490,9 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="glAccountCodeMask" type="text-short"/>
         <field name="settlementTermId" type="id">
             <description>The default SettlementTerm to use on receivable (outgoing) invoices if there is none from agreement, order, etc</description></field>
+        <field name="taxGatewayConfigId" type="id" enable-audit-log="update">
+            <description>The sales tax gateway for the organization's invoices without a store, or whose store has
+                none.</description></field>
         <!-- these should be on a separate entity when used, transactional where the rest is configuration:
         <field name="invoiceLastNumber" type="number-integer"/>
         <field name="invoiceLastRestartDate" type="date-time"/>
@@ -525,6 +528,7 @@ along with this software (see the LICENSE.md file). If not, see
         <relationship type="one" title="OrderSequence" related="moqui.basic.Enumeration">
             <key-map field-name="orderSequenceEnumId"/></relationship>
         <relationship type="one" related="mantle.account.invoice.SettlementTerm"/>
+        <relationship type="one" related="mantle.other.tax.TaxGatewayConfig"/>
 
         <seed-data>
             <!-- Tax Forms -->

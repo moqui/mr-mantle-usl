@@ -679,6 +679,13 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="billThruVendorName" type="text-medium">
             <description>For tracking purposes when there is no associated bill through invoice with InvoiceItemAssoc records</description></field>
         <field name="billThruVendorRef" type="text-short"/>
+        <field name="taxAuthorityRateId" type="id">
+            <description>For a calculated tax line, the rate version applied.</description></field>
+        <field name="taxableAmount" type="currency-precise">
+            <description>For a calculated tax line, its base.</description></field>
+        <field name="taxPercentage" type="number-decimal"><description>For a calculated tax line, its rate.</description></field>
+        <field name="taxRoundingAmount" type="currency-precise"><description>For a calculated tax line, its amount less the
+            unrounded tax.</description></field>
 
         <relationship type="one" related="mantle.account.invoice.Invoice" short-alias="invoice"/>
         <relationship type="one-nofk" title="Parent" related="mantle.account.invoice.InvoiceItem" short-alias="parent">
@@ -700,6 +707,7 @@ along with this software (see the LICENSE.md file). If not, see
             <key-map field-name="quantityUomId"/></relationship>
         <relationship type="one" related="mantle.sales.opportunity.SalesOpportunity" short-alias="salesOpportunity"/>
         <relationship type="one" related="mantle.other.tax.TaxAuthority" short-alias="taxAuthority"/>
+        <relationship type="one" related="mantle.other.tax.TaxAuthorityRate" short-alias="taxAuthorityRate"/>
         <relationship type="one" related="mantle.humanres.employment.PayrollAdjustment" short-alias="payrollAdjustment"/>
         <relationship type="one" related="mantle.account.financial.FinancialAccount" short-alias="financialAccount"/>
         <relationship type="one" related="mantle.account.financial.FinancialAccountTrans" short-alias="financialAccountTrans"/>
