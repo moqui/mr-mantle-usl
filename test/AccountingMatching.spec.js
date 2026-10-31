@@ -651,3 +651,69 @@ feature("the quantity tolerance is a share of the source, across successive bill
         fixed[2].includes("QUANTITY_EXCESS") || fixed[2].includes("ALREADY_BILLED")
     }
 })
+
+feature("a released price hold is placed again when the price changes further, not when nothing changed", {
+    when() {
+        const po = purchase(supplier, 10, 5)
+        const receipt = deliver(po.orderId, 10)
+        const billId = bill("MATCH-REPRICE", 4, "5.50")
+        login(users.matcher)
+        const held = match("apply#InvoiceMatch", {
+            invoiceId: billId,
+            allocationList: [allocation(po, receipt, 4, lineSeq(billId))]
+        })
+        login(users.approver)
+        svc("mantle.account.InvoiceServices.release#InvoiceHold", {
+            invoiceHoldId: held.invoiceHoldId,
+            releaseComment: "Small difference accepted"
+        })
+        login(users.matcher)
+        match("queue#MatchReevaluation", {invoiceId: billId, staleReason: "Checked again"})
+        match("run#MatchReevaluation", {})
+        const unchanged = openHolds(billId).length
+        // AP changes the bill line to nine: the variance grew past the recorded one
+        login("john.doe")
+        svc("mantle.account.InvoiceServices.update#InvoiceItem", {
+            invoiceId: billId,
+            invoiceItemSeqId: lineSeq(billId),
+            amount: 9
+        })
+        login(users.matcher)
+        const ran = match("run#MatchReevaluation", {})
+        const repriced = openHolds(billId)
+        const snapshot = rows("mantle.account.invoice.InvoiceMatchLine", {invoiceId: billId}).find(row => row.orderId)
+        return {held, unchanged, ran, repriced, snapshot, billId}
+    },
+    then({held, unchanged, ran, repriced, snapshot, billId}) {
+        held.invoiceHoldId != null
+        unchanged == 0
+        ran.resultList.some(row => row.invoiceId == billId && row.held)
+        repriced.length == 1
+        repriced[0].holdComment.includes("9.00")
+        toDecimal(snapshot.invoiceUnitAmount).compare(9) == 0
+    }
+})
+
+feature("the legacy backfill reads past bills without evidence until it links one", {
+    when() {
+        const po = purchase(legacySupplier, 3, 5)
+        bill("LEGACY-5", 2, 5, legacySupplier)
+        const evidenced = bill("LEGACY-6", 3, 5, legacySupplier)
+        svc("create#mantle.order.OrderItemBilling", {
+            orderId: po.orderId,
+            orderItemSeqId: po.orderItemSeqId,
+            invoiceId: evidenced,
+            invoiceItemSeqId: lineSeq(evidenced),
+            quantity: 3,
+            amount: 5
+        })
+        login(users.matcher)
+        const applied = match("apply#LegacyMatches", {organizationPartyId: org, supplierPartyId: legacySupplier, limit: 1})
+        return {applied, evidenced}
+    },
+    then({applied, evidenced}) {
+        applied.matchedCount == 1
+        applied.lastInvoiceId == evidenced
+        one("mantle.account.invoice.InvoiceMatch", {invoiceId: evidenced, statusId: "ImApplied"}).resultEnumId == "ImrMatched"
+    }
+})

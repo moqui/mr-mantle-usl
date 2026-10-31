@@ -688,7 +688,9 @@ function coverReceipt(assetReceiptId, invoiceId, invoiceItemSeqId) {
     return "Y"
 }
 // A receipt that names this bill, which no longer links it with a quantity, names another bill still linked to it, or
-// none once no link remains.
+// none once no link remains. Unlike coverReceipt this does not ask for full coverage: a receipt partly billed by another
+// bill keeps naming it, so Mantle's receipt billing (create#InvoiceFromSource, which bills a receipt whole by its invoice)
+// does not bill it again; its unbilled rest is billed by a match.
 function releaseReceipt(assetReceiptId, invoiceId) {
     const receipt = find("mantle.product.receipt.AssetReceipt", {assetReceiptId}).forUpdate(true).one()
     if (!receipt || receipt.invoiceId !== invoiceId) return
@@ -876,6 +878,7 @@ function apply(p) {
             invoiceId: scope.invoiceId,
             invoiceItemSeqId: exception.invoiceItemSeqId,
             invoiceMatchPolicyId: policyOf(lines[exception.invoiceItemSeqId]).invoiceMatchPolicyId,
+            invoiceQuantity: lines[exception.invoiceItemSeqId].quantity,
             exceptionEnumId: exception.exceptionEnumId,
             exceptionCodes: exception.exceptionEnumId,
             exceptionText: exception.text
@@ -975,42 +978,82 @@ function reevaluate(p) {
     for (const row of kept)
         for (const code of [row.exceptionEnumId, ...String(row.exceptionCodes || "").split(",")].filter(Boolean))
             recorded.add(row.invoiceItemSeqId + "|" + code)
-    const fresh = evaluated.exceptions.filter(row => !recorded.has(row.invoiceItemSeqId + "|" + row.exceptionEnumId))
+    const same = (a, b) => a != null && b != null && dec(a).compare(dec(b)) == 0
+    // An exception the lines recorded holds again when it got worse than their snapshot: a price variance whose bill or
+    // order price changed or whose size grew, or a line quantity variance whose bill line grew. The snapshot is updated.
+    const fresh = []
+    for (const source of evaluated.sources) {
+        const line = sourceLines.find(row => sourceKey(row) === source.key)
+        // a source that could not be read has no snapshot to compare; it is a source change
+        if (!line || source.invoiceUnitAmount == null) continue
+        const updates = {}
+        const codes = []
+        for (const exception of source.exceptions) {
+            const known = recorded.has(source.invoiceItemSeqId + "|" + exception.exceptionEnumId)
+            const priceChanged =
+                exception.exceptionEnumId === "MePriceVariance" &&
+                (!same(source.invoiceUnitAmount, line.invoiceUnitAmount) ||
+                    !same(source.orderUnitAmount, line.orderUnitAmount) ||
+                    dec(source.priceVariance).abs().compare(dec(line.priceVariance).abs()) > 0)
+            if (!known || priceChanged) fresh.push(Object.assign({invoiceItemSeqId: source.invoiceItemSeqId}, exception))
+            if (!known) codes.push(exception.exceptionEnumId)
+        }
+        if (codes.length)
+            updates.exceptionCodes = [
+                ...String(line.exceptionCodes || "")
+                    .split(",")
+                    .filter(Boolean),
+                ...codes
+            ].join(",")
+        if (!same(source.invoiceUnitAmount, line.invoiceUnitAmount) || !same(source.orderUnitAmount, line.orderUnitAmount))
+            Object.assign(updates, {
+                invoiceUnitAmount: source.invoiceUnitAmount,
+                orderUnitAmount: source.orderUnitAmount,
+                priceVariance: source.priceVariance
+            })
+        if (Object.keys(updates).length)
+            call(
+                "update#" + L,
+                Object.assign({invoiceMatchId: line.invoiceMatchId, invoiceMatchLineSeqId: line.invoiceMatchLineSeqId}, updates)
+            )
+    }
+    let seq = kept.reduce((top, row) => Math.max(top, Number(row.invoiceMatchLineSeqId) || 0), 0)
+    for (const exception of evaluated.exceptions.filter(row => lineExceptionCodes.includes(row.exceptionEnumId))) {
+        const lineQuantity = evaluated.lines.find(row => row.invoiceItemSeqId === exception.invoiceItemSeqId)?.quantity
+        const recordedLine = kept.find(
+            row => row.invoiceItemSeqId === exception.invoiceItemSeqId && row.exceptionEnumId === exception.exceptionEnumId
+        )
+        if (recordedLine) {
+            // recorded: holds again only when the bill line grew past the quantity it recorded
+            if (recordedLine.invoiceQuantity == null || dec(lineQuantity).compare(dec(recordedLine.invoiceQuantity)) > 0) {
+                fresh.push(exception)
+                call("update#" + L, {
+                    invoiceMatchId: recordedLine.invoiceMatchId,
+                    invoiceMatchLineSeqId: recordedLine.invoiceMatchLineSeqId,
+                    invoiceQuantity: lineQuantity,
+                    exceptionText: exception.text
+                })
+            }
+            continue
+        }
+        fresh.push(exception)
+        call("create#" + L, {
+            invoiceMatchId: match.invoiceMatchId,
+            invoiceMatchLineSeqId: String(++seq).padStart(5, "0"),
+            invoiceId: scope.invoiceId,
+            invoiceItemSeqId: exception.invoiceItemSeqId,
+            invoiceQuantity: lineQuantity,
+            exceptionEnumId: exception.exceptionEnumId,
+            exceptionCodes: exception.exceptionEnumId,
+            exceptionText: exception.text
+        })
+    }
     const legacy = match.isLegacy === "Y"
     const holding = [...changed, ...(legacy ? [] : fresh.filter(row => row.holds))]
     const resultEnumId = changed.length ? "ImrException" : evaluated.resultEnumId
     const resultText = [resultNames[resultEnumId], ...changed.map(row => row.text), ...evaluated.exceptions.map(row => row.text)]
         .filter(Boolean)
         .join(". ")
-    // record the exceptions found now, so the next evaluation does not hold the bill for them again
-    for (const source of evaluated.sources) {
-        const line = sourceLines.find(row => sourceKey(row) === source.key)
-        const codes = source.exceptions
-            .map(row => row.exceptionEnumId)
-            .filter(code => !recorded.has(source.invoiceItemSeqId + "|" + code))
-        if (!line || !codes.length) continue
-        call("update#" + L, {
-            invoiceMatchId: line.invoiceMatchId,
-            invoiceMatchLineSeqId: line.invoiceMatchLineSeqId,
-            exceptionCodes: [
-                ...String(line.exceptionCodes || "")
-                    .split(",")
-                    .filter(Boolean),
-                ...codes
-            ].join(",")
-        })
-    }
-    let seq = kept.reduce((top, row) => Math.max(top, Number(row.invoiceMatchLineSeqId) || 0), 0)
-    for (const exception of fresh.filter(row => lineExceptionCodes.includes(row.exceptionEnumId)))
-        call("create#" + L, {
-            invoiceMatchId: match.invoiceMatchId,
-            invoiceMatchLineSeqId: String(++seq).padStart(5, "0"),
-            invoiceId: scope.invoiceId,
-            invoiceItemSeqId: exception.invoiceItemSeqId,
-            exceptionEnumId: exception.exceptionEnumId,
-            exceptionCodes: exception.exceptionEnumId,
-            exceptionText: exception.text
-        })
     let invoiceHoldId = match.invoiceHoldId
     let placed = false
     if (holding.length) {
@@ -1342,28 +1385,45 @@ function applyLegacyBill(p) {
     call("update#" + M, {invoiceMatchId: match.invoiceMatchId, staleDate: null, staleReason: null})
     return {invoiceId: scope.invoiceId, invoiceMatchId: match.invoiceMatchId, resultEnumId, resultText, linkCount}
 }
-// apply#LegacyMatches: each bill on its own; a bill that fails is named and the others go on.
+// apply#LegacyMatches: each bill on its own; a bill that fails is named and the others go on. Bills without evidence do
+// not count: it keeps reading, in invoice order, until it has linked or tried limit bills with evidence or has read 5000,
+// and answers the last bill it read, where the next run goes on.
 function applyLegacy(p) {
     const organizationPartyId = legacyScope(p)
+    const wanted = Math.max(1, Math.min(200, Number(p.limit) || 100))
     const resultRows = []
     let failedCount = 0
-    for (const record of legacyBills(organizationPartyId, p)) {
-        try {
-            const out = lib.probe("mantle.account.InvoiceMatchServices.apply#LegacyMatch", {
-                invoiceId: record.invoiceId,
-                organizationPartyId
-            })
-            if (!out.skipped) resultRows.push(out)
-        } catch (error) {
-            failedCount++
-            ec.logger.error("Legacy match of bill " + record.invoiceId + " failed: " + error.message)
-            resultRows.push({
-                invoiceId: record.invoiceId,
-                resultText: "Failed: " + String(error.message).replace(/^[A-Z_]+: /, "")
-            })
+    let tried = 0
+    let read = 0
+    let lastInvoiceId = p.afterInvoiceId || null
+    while (tried < wanted && read < 5000) {
+        const bills = legacyBills(organizationPartyId, Object.assign({}, p, {limit: 200, afterInvoiceId: lastInvoiceId}))
+        if (!bills.length) break
+        for (const record of bills) {
+            if (tried >= wanted) break
+            read++
+            lastInvoiceId = record.invoiceId
+            try {
+                const out = lib.probe("mantle.account.InvoiceMatchServices.apply#LegacyMatch", {
+                    invoiceId: record.invoiceId,
+                    organizationPartyId
+                })
+                if (!out.skipped) {
+                    resultRows.push(out)
+                    tried++
+                }
+            } catch (error) {
+                failedCount++
+                tried++
+                ec.logger.error("Legacy match of bill " + record.invoiceId + " failed: " + error.message)
+                resultRows.push({
+                    invoiceId: record.invoiceId,
+                    resultText: "Failed: " + String(error.message).replace(/^[A-Z_]+: /, "")
+                })
+            }
         }
     }
-    return {resultRows, matchedCount: resultRows.filter(row => row.invoiceMatchId).length, failedCount}
+    return {resultRows, matchedCount: resultRows.filter(row => row.invoiceMatchId).length, failedCount, lastInvoiceId}
 }
 
 // ---- policies

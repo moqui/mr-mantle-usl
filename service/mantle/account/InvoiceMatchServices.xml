@@ -98,8 +98,9 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
     <service verb="unapply" noun="InvoiceMatch" allow-remote="false">
         <description>Unapply a bill's applied match: each billing link it wrote goes back to its quantity before (zero when
-            the match created it), a receipt it gave the bill is cleared, and the match is ended (ImUnapplied). A hold it
-            placed stays until an approver releases it. Needs INVOICE_MATCH in the organization.</description>
+            the match created it); a receipt that names the bill names another bill still linked to it with a quantity,
+            even one that bills only part of it, so Mantle's receipt billing does not bill it again, or none when no link
+            remains; the match is ended (ImUnapplied). A hold it placed stays until an approver releases it. Needs INVOICE_MATCH in the organization.</description>
         <in-parameters>
             <parameter name="invoiceId" required="true"/>
             <parameter name="organizationPartyId"/>
@@ -248,18 +249,21 @@ along with this software (see the LICENSE.md file). If not, see
             effect; matched when every product line is linked in full, partly matched when a line has no evidence or a
             quantity its evidence does not explain, an exception when a line is ambiguous. No hold is placed and no
             unexplained balance is matched. A bill that fails is named and the others go on. Bills are read in invoice
-            order a batch at a time, matched ones left out, so a run goes on past them. Needs INVOICE_MATCH in the
-            organization.</description>
+            order a batch at a time, matched ones left out, so a run goes on past them; bills without evidence do not
+            count toward limit, and lastInvoiceId is the last bill read, where the next run continues (afterInvoiceId).
+            Needs INVOICE_MATCH in the organization.</description>
         <implements service="mantle.account.InvoiceMatchServices.define#LegacyMatchParameters"/>
         <in-parameters><parameter name="invoiceIdList" type="List"/></in-parameters>
         <out-parameters>
             <parameter name="resultRows" type="List"/>
             <parameter name="matchedCount" type="Integer"/>
             <parameter name="failedCount" type="Integer"/>
+            <parameter name="lastInvoiceId"/>
         </out-parameters>
         <actions>
             <set field="module" value="component://mr-mantle/service/mantle/account/InvoiceMatch.js"/>
             <set field="applied" from="ec.resource.script(module).execute('applyLegacy', context)"/>
+            <set field="lastInvoiceId" from="applied.lastInvoiceId"/>
             <set field="resultRows" from="applied.resultRows"/>
             <set field="matchedCount" from="applied.matchedCount"/>
             <set field="failedCount" from="applied.failedCount"/>
