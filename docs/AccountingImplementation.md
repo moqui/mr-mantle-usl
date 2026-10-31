@@ -341,6 +341,45 @@ first release has local sales tax and the US 1099 data.
   its format version and records the export; a sales tax statement whose invoices changed since is refused, and an
   exported statement is not deleted (`delete#TaxStatement`). `simulate#SalesTax` explains a sample sale.
 
+## Portals (P18)
+
+Accounting's customer and supplier pages are the PASS Billing and Supplier apps (mr-pass); what they reach is here.
+
+- **External access (CX-PORTALS).** `mantle.party.ExternalAccessCapability` is one record of an organization for its
+  outside party: `recordType` (Invoice or Order) and `recordId`, the revision issued, `scopes` (InvoicePay; BillUpload
+  and OrderAcknowledgement), expiry, revocation and the digest of a bearer token shown once.
+  `mantle.party.ExternalAccessServices` (logic in `party/ExternalAccess.js`): `create#AccessCapability` (an issued
+  customer invoice with `RECEIVABLE_EDIT`, a purchase order with `PAYABLE_EDIT`, in the record's organization; answers
+  the record's page on the organization's site), `revoke#`, `find#AccessCapabilities`, `check#AccessToken` (misses limited
+  per requester) and `check#AccessCapability` (a token's record within its scope, or a record whose outside party the
+  signed-in user is a contact of; anything else NotFound). `invite#Contact` makes a PASS invitation bound to an app and
+  an outside organization; `redeem#Invitation` then makes the account's party a contact (`PrtContact`) of it, with no
+  user group.
+- **Site apps.** `public/PublicApps.js` lists the apps a site may mount; Billing and Supplier take an internal
+  organization as target (`PublicSiteApp.targetId`), which only an operator sets and a core mount save keeps, and add
+  readiness checks (`check#AppReadiness`). `pageUrl` builds a page's address from the canonical host and the mount.
+- **Portal services.** `mantle.account.PortalServices` (logic in `account/Portal.js`), each taking PASS's `input` map,
+  finding the organization the site's app serves and checking the capability or contact first:
+  `issue#InvoiceAccess` (a pay link: `send#Invoice` mails it when the organization has a Billing site; a contact can
+  make one to share), `find#Invoices`, `get#Invoice` (number, dates, lines, total, paid and due only),
+  `start#InvoicePayment`, `get#PaymentResult`, `submit#SupplierBill` and `get#Submission`. Each is an operation in
+  `forum/ForumSchema.js` and `script/PassRoutes.js`, served by `PassApi`, which takes the two token writes from a
+  registered deployment without a session and a file for any operation with one.
+- **Invoice payment.** The organization's gateway is `PartyAcctgPreference.invoicePayGatewayConfigId` (one of its
+  PaymentGatewayOrganization bindings; `store#Preferences`). `start#InvoicePayment` locks the invoice, answers a retried
+  operation, resumes an attempt still pending, else creates a promised card payment for what is due
+  (`forInvoiceId`) and calls `authorize#SinglePayment` with `returnUrl`, the app's return path. A hosted gateway answers
+  pending with its page (`PaymentGatewayResponse.redirectUrl`); `get#PaymentResult` asks the gateway
+  (`get#SinglePaymentGatewayDetails`) and captures an authorization, and `PaymentApplyForInvoice` applies a delivered
+  payment. Nothing the payer's browser brings back is read. Test gateway: `hostedPending#PaymentAuthorization`,
+  `alwaysPending#` and `alwaysDecline#PaymentDetails`.
+- **Supplier bills.** `submit#SupplierBill` answers a repeat of the operation or of the supplier's bill number with the
+  first `SupplierBillSubmission`, stages the file under `pass_media_root/bills` and scans it (`pass_scanner_service`),
+  and makes the incoming draft through `import#Bill`'s core (`Payables.js` `portalBill`, the capability in place of
+  `PAYABLE_IMPORT`), the file becoming its content only when clean. It never approves.
+- **Posting guard.** A source document's own posting by no user or a public account (a customer's payment, a gateway's
+  answer, a job) skips the user's organization check; manual postings and reversals do not (F370).
+
 ## Libraries
 
 - `ledger/EntityLib.js`: the helpers the finance modules share: entity reads without artifact authorization (each
@@ -378,6 +417,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingPayables,AccountingMatching
 ./moq test mr-mantle --spec AccountingBankReconciliation,BankFileServices
 ./moq test mr-mantle --spec AccountingTax,TaxStatementServices
+./moq test mr-mantle --spec AccountingPortals
 ```
 
 The PDF specs need a Chromium for PDF (`pdf_chromium_path`; see [Run-Deploy](../../../../docs/Run-Deploy.md) and
