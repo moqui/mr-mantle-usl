@@ -1,0 +1,424 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<!-- Bill matching (design-crosscut §3.22): a supplier bill's lines matched to purchase order lines and accepted receipts,
+    written as OrderItemBilling; the organization's match policy as effective-dated rows; the re-evaluation of matches
+    a source change made stale; and the legacy backfill. Logic in InvoiceMatch.js. -->
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="evaluate" noun="InvoiceMatch" allow-remote="false">
+        <description>Read only: a bill's lines and their sources, checked against the organization's match policy. With an
+            applied match, its allocations checked against the sources as they are now; else the allocations given, or
+            the proposal: the bill line's existing billing links, else the approved order lines of the product from the
+            supplier (orderId narrows them) on the policy's basis, the accepted receipts less what is in quarantine
+            (held quantity; the inspection check itself is unavailable until there is an inspection record) and what
+            other bills billed. Each source row has its snapshot, the quantity left to bill and its exceptions; a row
+            beyond what its source allows names the refusal apply would give. Needs INVOICE_MATCH, PAYABLE_VIEW or
+            ACCOUNTING_VIEW in the organization; refuses a customer invoice.</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="orderId"/>
+            <parameter name="allocationList" type="List"><description>Maps of invoiceItemSeqId, orderId, orderItemSeqId,
+                assetReceiptId (optional) and quantity.</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="supplierPartyId"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="lineRows" type="List"/>
+            <parameter name="sourceRows" type="List"/>
+            <parameter name="exceptionRows" type="List"/>
+            <parameter name="resultEnumId"/>
+            <parameter name="resultName"/>
+            <parameter name="resultText"/>
+            <parameter name="inspectionCheck"/>
+            <parameter name="currentMatch" type="Map"/>
+            <parameter name="openHoldCount" type="Integer"/>
+            <parameter name="matchCapabilities" type="Map"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/InvoiceMatch.js"/>
+            <set field="evaluated" from="ec.resource.script(module).execute('evaluate', context)"/>
+            <script>for (const field of ['organizationPartyId', 'supplierPartyId', 'currencyUomId', 'lineRows', 'sourceRows',
+                'exceptionRows', 'resultEnumId', 'resultName', 'resultText', 'inspectionCheck', 'currentMatch',
+                'openHoldCount', 'matchCapabilities']) context[field] = evaluated[field]</script>
+        </actions>
+    </service>
+    <service verb="apply" noun="InvoiceMatch" allow-remote="false">
+        <description>Match a bill: each allocation is checked again under lock (the organization, the bill, then its order
+            lines in order) and refused when its source does not allow it: an order line not the organization's from the
+            supplier or not approved, another product, a receipt not of the line (SOURCE_INVALID), quantity already billed
+            (ALREADY_BILLED), no accepted receipt on the received basis (MISSING_RECEIPT), or more than is left beyond the
+            quantity tolerance (QUANTITY_EXCESS). It writes or updates each billing link (OrderItemBilling) and gives a
+            receipt with no invoice the bill line, records the match and its lines with the snapshot and the policy row,
+            and for an exception that holds by its policy (price outside tolerance, quantity not matched, no source, no
+            receipt where one is required) places the match exception hold, naming the rule. Refuses a cancelled or paid
+            bill and a bill already matched (MATCH_EXISTS). Needs INVOICE_MATCH in the organization. The same operationKey
+            and request answers the first result.</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="allocationList" type="List" required="true"/>
+            <parameter name="operationKey"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceMatchId"/>
+            <parameter name="resultEnumId"/>
+            <parameter name="resultText"/>
+            <parameter name="invoiceHoldId"/>
+            <parameter name="exceptionTexts" type="List"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/InvoiceMatch.js"/>
+            <set field="applied" from="ec.resource.script(module).execute('apply', context)"/>
+            <set field="invoiceMatchId" from="applied.invoiceMatchId"/>
+            <set field="resultEnumId" from="applied.resultEnumId"/>
+            <set field="resultText" from="applied.resultText"/>
+            <set field="invoiceHoldId" from="applied.invoiceHoldId"/>
+            <set field="exceptionTexts" from="applied.exceptionTexts ?? []"/>
+            <set field="alreadyApplied" from="!!applied.alreadyApplied"/>
+        </actions>
+    </service>
+    <service verb="unapply" noun="InvoiceMatch" allow-remote="false">
+        <description>Unapply a bill's applied match: each billing link it wrote goes back to its quantity before (zero when
+            the match created it), a receipt it gave the bill is cleared, and the match is ended (ImUnapplied). A hold it
+            placed stays until an approver releases it. Needs INVOICE_MATCH in the organization.</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="invoiceMatchId"/>
+        </in-parameters>
+        <out-parameters><parameter name="invoiceMatchId"/></out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/InvoiceMatch.js"/>
+            <set field="invoiceMatchId" from="ec.resource.script(module).execute('unapply', context).invoiceMatchId"/>
+        </actions>
+    </service>
+    <service verb="queue" noun="MatchReevaluation" authenticate="false" allow-remote="false">
+        <description>Mark the applied matches a change touches stale, for the re-evaluation job: the bill's (invoiceId),
+            those with a line on a receipt (assetReceiptId) or on an order line (orderId, orderItemSeqId). Called by the
+            AssetReceipt and InvoiceItem EECAs, so it only reads the match lines by index and writes nothing when none is
+            found.</description>
+        <in-parameters>
+            <parameter name="invoiceId"/>
+            <parameter name="assetReceiptId"/>
+            <parameter name="orderId"/>
+            <parameter name="orderItemSeqId"/>
+            <parameter name="staleReason"/>
+        </in-parameters>
+        <out-parameters><parameter name="queuedCount" type="Integer"/></out-parameters>
+        <actions>
+            <set field="matchIds" from="new Set()"/>
+            <if condition="invoiceId">
+                <entity-find entity-name="mantle.account.invoice.InvoiceMatch" list="byInvoice" disable-authz="true">
+                    <econdition field-name="invoiceId"/><econdition field-name="statusId" value="ImApplied"/>
+                    <select-field field-name="invoiceMatchId"/>
+                </entity-find>
+                <script>for (const row of byInvoice) matchIds.add(row.invoiceMatchId)</script>
+            </if>
+            <if condition="assetReceiptId">
+                <entity-find entity-name="mantle.account.invoice.InvoiceMatchLine" list="byReceipt" disable-authz="true">
+                    <econdition field-name="assetReceiptId"/><select-field field-name="invoiceMatchId"/></entity-find>
+                <script>for (const row of byReceipt) matchIds.add(row.invoiceMatchId)</script>
+            </if>
+            <if condition="orderId &amp;&amp; orderItemSeqId">
+                <entity-find entity-name="mantle.account.invoice.InvoiceMatchLine" list="byOrderLine" disable-authz="true">
+                    <econdition field-name="orderId"/><econdition field-name="orderItemSeqId"/>
+                    <select-field field-name="invoiceMatchId"/>
+                </entity-find>
+                <script>for (const row of byOrderLine) matchIds.add(row.invoiceMatchId)</script>
+            </if>
+            <set field="queuedCount" from="0"/>
+            <if condition="!matchIds.size"><return/></if>
+            <entity-find entity-name="mantle.account.invoice.InvoiceMatch" list="staleList" for-update="true"
+                    disable-authz="true">
+                <econdition field-name="invoiceMatchId" operator="in" from="[...matchIds]"/>
+                <econdition field-name="statusId" value="ImApplied"/>
+                <econdition field-name="staleDate" from="null"/>
+            </entity-find>
+            <iterate list="staleList" entry="stale">
+                <set field="stale.staleDate" from="ec.user.nowTimestamp"/>
+                <set field="stale.staleReason" from="String(staleReason || 'A source changed').slice(0, 255)"/>
+                <entity-update value-field="stale"/>
+                <set field="queuedCount" from="queuedCount + 1"/>
+            </iterate>
+        </actions>
+    </service>
+    <service verb="reevaluate" noun="InvoiceMatch" authenticate="false" allow-remote="false">
+        <description>Evaluate one stale applied match again with the policy rows its lines applied: a source that no longer
+            allows its matched quantity is a source change. The result is recorded and the match is no longer stale; an
+            exception that holds places the match exception hold when none is open. A hold is never released here. For
+            run#MatchReevaluation, in its own transaction.</description>
+        <in-parameters><parameter name="invoiceMatchId" required="true"/></in-parameters>
+        <out-parameters>
+            <parameter name="skipped" type="Boolean"/>
+            <parameter name="invoiceId"/>
+            <parameter name="resultEnumId"/>
+            <parameter name="resultText"/>
+            <parameter name="held" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/InvoiceMatch.js"/>
+            <set field="evaluated" from="ec.resource.script(module).execute('reevaluate', context)"/>
+            <set field="skipped" from="!!evaluated.skipped"/>
+            <set field="invoiceId" from="evaluated.invoiceId"/>
+            <set field="resultEnumId" from="evaluated.resultEnumId"/>
+            <set field="resultText" from="evaluated.resultText"/>
+            <set field="held" from="!!evaluated.held"/>
+        </actions>
+    </service>
+    <service verb="run" noun="MatchReevaluation" authenticate="false" allow-remote="false" transaction="ignore">
+        <description>The re-evaluation job: the stale applied matches, oldest first (up to limit), each evaluated in its own
+            transaction (reevaluate#InvoiceMatch), with a named result per bill; a bill that fails is logged and the
+            others go on. No hold is released.</description>
+        <in-parameters><parameter name="limit" type="Integer" default="200"/></in-parameters>
+        <out-parameters>
+            <parameter name="evaluatedCount" type="Integer"/>
+            <parameter name="failedCount" type="Integer"/>
+            <parameter name="resultList" type="List"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/InvoiceMatch.js"/>
+            <set field="ran" from="ec.resource.script(module).execute('run', context)"/>
+            <set field="evaluatedCount" from="ran.evaluatedCount"/>
+            <set field="failedCount" from="ran.failedCount"/>
+            <set field="resultList" from="ran.resultList"/>
+        </actions>
+    </service>
+    <service verb="define" noun="LegacyMatchParameters" type="interface">
+        <description>The bills of the legacy backfill: an organization's bills with no applied match, from a supplier and
+            a bill date range when given.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="supplierPartyId"/>
+            <parameter name="fromDate" type="Timestamp"/>
+            <parameter name="thruDate" type="Timestamp"/>
+            <parameter name="limit" type="Integer"/>
+        </in-parameters>
+    </service>
+    <service verb="preview" noun="LegacyMatches" allow-remote="false">
+        <description>Read only: for each product line of the bills, the link its evidence supports (its billing links,
+            else its receipts), or why it is ambiguous (links or receipts of another party, product or order line, links
+            over the line's quantity) or has no evidence; what the evidence does not explain is named and left unmatched.
+            Needs INVOICE_MATCH in the organization.</description>
+        <implements service="mantle.account.InvoiceMatchServices.define#LegacyMatchParameters"/>
+        <out-parameters>
+            <parameter name="previewRows" type="List"/>
+            <parameter name="linkCount" type="Integer"/>
+            <parameter name="ambiguousCount" type="Integer"/>
+            <parameter name="noEvidenceCount" type="Integer"/>
+            <parameter name="unexplainedCount" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/InvoiceMatch.js"/>
+            <set field="previewed" from="ec.resource.script(module).execute('previewLegacy', context)"/>
+            <set field="previewRows" from="previewed.previewRows"/>
+            <set field="linkCount" from="previewed.linkCount"/>
+            <set field="ambiguousCount" from="previewed.ambiguousCount"/>
+            <set field="noEvidenceCount" from="previewed.noEvidenceCount"/>
+            <set field="unexplainedCount" from="previewed.unexplainedCount"/>
+        </actions>
+    </service>
+    <service verb="apply" noun="LegacyMatches" allow-remote="false" transaction="ignore">
+        <description>Link the bills from their evidence, each in its own transaction (apply#LegacyMatch): a legacy match
+            with a line for each link, and each ambiguous line as a match exception line; no hold is placed and no
+            unexplained balance is matched. A bill that fails is named and the others go on. Needs INVOICE_MATCH in the
+            organization.</description>
+        <implements service="mantle.account.InvoiceMatchServices.define#LegacyMatchParameters"/>
+        <in-parameters><parameter name="invoiceIdList" type="List"/></in-parameters>
+        <out-parameters>
+            <parameter name="resultRows" type="List"/>
+            <parameter name="matchedCount" type="Integer"/>
+            <parameter name="failedCount" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/InvoiceMatch.js"/>
+            <set field="applied" from="ec.resource.script(module).execute('applyLegacy', context)"/>
+            <set field="resultRows" from="applied.resultRows"/>
+            <set field="matchedCount" from="applied.matchedCount"/>
+            <set field="failedCount" from="applied.failedCount"/>
+        </actions>
+    </service>
+    <service verb="apply" noun="LegacyMatch" allow-remote="false">
+        <description>One bill of apply#LegacyMatches, its evidence read again under lock. Needs INVOICE_MATCH in the
+            organization.</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="organizationPartyId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceId"/>
+            <parameter name="invoiceMatchId"/>
+            <parameter name="resultEnumId"/>
+            <parameter name="resultText"/>
+            <parameter name="linkCount" type="Integer"/>
+            <parameter name="skipped" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/InvoiceMatch.js"/>
+            <set field="applied" from="ec.resource.script(module).execute('applyLegacyBill', context)"/>
+            <script>for (const field of ['invoiceId', 'invoiceMatchId', 'resultEnumId', 'resultText', 'linkCount'])
+                context[field] = applied[field] ?? null</script>
+            <set field="skipped" from="!!applied.skipped"/>
+        </actions>
+    </service>
+    <service verb="get" noun="MatchPolicies" allow-remote="false">
+        <description>An organization's match policy rows in effect (with includeHistory Y also the ended ones), the
+            organization's row and its category and product overrides, with names and tolerance texts, and whether the
+            user may change them (ACCOUNTING_ADMIN) and run the legacy backfill (INVOICE_MATCH). Needs ACCOUNTING_ADMIN,
+            INVOICE_MATCH, ACCOUNTING_VIEW or PAYABLE_VIEW in the organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="includeHistory"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="policyRows" type="List"/>
+            <parameter name="canEdit" type="Boolean"/>
+            <parameter name="canBackfill" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/InvoiceMatch.js"/>
+            <set field="found" from="ec.resource.script(module).execute('policies', context)"/>
+            <set field="policyRows" from="found.policyRows"/>
+            <set field="canEdit" from="found.canEdit"/>
+            <set field="canBackfill" from="found.canBackfill"/>
+        </actions>
+    </service>
+    <service verb="store" noun="MatchPolicy" allow-remote="false">
+        <description>Change an organization's match policy for its own row, a product category or a product: the row in
+            effect for the same scope ends at fromDate (now by default) and the next starts there with the fields given
+            and the others carried over (defaults: received basis, receipt required, no tolerance, hold); nothing changes
+            when nothing differs. A bill line already matched keeps the row it applied. Refuses both a product and a
+            category, an unknown product, category, basis or action, a negative tolerance, a start before the row in
+            effect and a start before a later row of the scope (POLICY_OVERLAP). Needs ACCOUNTING_ADMIN.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="productId"/>
+            <parameter name="productCategoryId"/>
+            <parameter name="billBasisEnumId"/>
+            <parameter name="receiptRequired"/>
+            <parameter name="quantityTolerancePercent" type="BigDecimal"/>
+            <parameter name="quantityToleranceQuantity" type="BigDecimal"/>
+            <parameter name="priceTolerancePercent" type="BigDecimal"/>
+            <parameter name="priceToleranceAmount" type="BigDecimal"/>
+            <parameter name="varianceActionEnumId"/>
+            <parameter name="selfBillingDefault"/>
+            <parameter name="fromDate" type="Timestamp"/>
+            <parameter name="changeReason"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceMatchPolicyId"/>
+            <parameter name="changed" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="workflow" value="component://mr-mantle/service/mantle/account/InvoiceWorkflow.js"/>
+            <script>ec.resource.script(workflow).execute('organization',
+                {organizationPartyId:organizationPartyId, permission:'ACCOUNTING_ADMIN', lock:true})</script>
+            <set field="productId" from="productId || null"/>
+            <set field="productCategoryId" from="productCategoryId || null"/>
+            <if condition="productId &amp;&amp; productCategoryId">
+                <return error="true" message="POLICY_SCOPE_INVALID: A row is for a product or for a category, not both"/></if>
+            <if condition="productId">
+                <entity-find-one entity-name="mantle.product.Product" value-field="product" disable-authz="true"/>
+                <if condition="product == null"><return error="true" message="PRODUCT_INVALID: Choose an existing product"/></if>
+            </if>
+            <if condition="productCategoryId">
+                <entity-find-one entity-name="mantle.product.category.ProductCategory" value-field="category"
+                        disable-authz="true"/>
+                <if condition="category == null">
+                    <return error="true" message="CATEGORY_INVALID: Choose an existing category"/></if>
+            </if>
+            <set field="fromDate" from="fromDate ?? ec.user.nowTimestamp"/>
+            <entity-find entity-name="mantle.account.invoice.InvoiceMatchPolicy" list="scopeList" for-update="true"
+                    disable-authz="true">
+                <econdition field-name="organizationPartyId"/>
+                <econdition field-name="productId"/><econdition field-name="productCategoryId"/>
+                <order-by field-name="-fromDate"/>
+            </entity-find>
+            <set field="current" from="Array.from(scopeList).find((row) =&gt; Number(row.fromDate) &lt;= Number(fromDate)
+                &amp;&amp; (!row.thruDate || Number(row.thruDate) &gt; Number(fromDate))) ?? null"/>
+            <set field="later" from="Array.from(scopeList).find((row) =&gt; Number(row.fromDate) &gt; Number(fromDate))"/>
+            <if condition="later">
+                <return error="true"
+                        message="POLICY_OVERLAP: A row of this scope already starts later (${later.invoiceMatchPolicyId})"/>
+            </if>
+            <set field="defaults" from="{billBasisEnumId:'ImbReceived', receiptRequired:'Y', quantityTolerancePercent:null,
+                quantityToleranceQuantity:null, priceTolerancePercent:null, priceToleranceAmount:null,
+                varianceActionEnumId:'ImaHold', selfBillingDefault:'N'}"/>
+            <set field="values" from="{}"/>
+            <script>for (const field of Object.keys(defaults)) {
+                const given = context[field]
+                values[field] = given != null &amp;&amp; given !== '' ? given : current ? current[field] ?? null : defaults[field]
+            }</script>
+            <if condition="!['ImbReceived', 'ImbOrdered'].includes(values.billBasisEnumId)">
+                <return error="true" message="BASIS_INVALID: Choose the received or the ordered basis"/></if>
+            <if condition="!['ImaHold', 'ImaWarn'].includes(values.varianceActionEnumId)">
+                <return error="true" message="ACTION_INVALID: Choose to hold the bill or to warn"/></if>
+            <if condition="!['Y', 'N'].includes(values.receiptRequired) || !['Y', 'N'].includes(values.selfBillingDefault)">
+                <return error="true" message="INDICATOR_INVALID: Receipt required and self-billing default are Y or N"/></if>
+            <if condition="['quantityTolerancePercent', 'quantityToleranceQuantity', 'priceTolerancePercent',
+                    'priceToleranceAmount'].some((field) =&gt; values[field] != null
+                        &amp;&amp; toDecimal(values[field]).compare(0) &lt; 0)">
+                <return error="true" message="TOLERANCE_INVALID: A tolerance is not negative"/></if>
+            <set field="same" from="current &amp;&amp; Object.keys(values).every((field) =&gt;
+                String(current[field] ?? '') == String(values[field] ?? '') || (current[field] != null
+                    &amp;&amp; values[field] != null &amp;&amp; toDecimal(current[field]).compare(values[field]) == 0))"/>
+            <if condition="same">
+                <set field="invoiceMatchPolicyId" from="current.invoiceMatchPolicyId"/>
+                <set field="changed" from="false"/>
+                <return/>
+            </if>
+            <if condition="current &amp;&amp; Number(current.fromDate) &gt;= Number(fromDate)">
+                <return error="true" message="DATE_INVALID: The change must start after the row in effect"/></if>
+            <if condition="current">
+                <service-call name="update#mantle.account.invoice.InvoiceMatchPolicy" disable-authz="true"
+                        in-map="{invoiceMatchPolicyId:current.invoiceMatchPolicyId, thruDate:fromDate}"/></if>
+            <service-call name="create#mantle.account.invoice.InvoiceMatchPolicy" out-map="created" disable-authz="true"
+                    in-map="Object.assign({organizationPartyId:organizationPartyId, productId:productId,
+                        productCategoryId:productCategoryId, fromDate:fromDate, changeReason:changeReason,
+                        changedByUserId:ec.user.userId}, values)"/>
+            <set field="invoiceMatchPolicyId" from="created.invoiceMatchPolicyId"/>
+            <set field="changed" from="true"/>
+        </actions>
+    </service>
+    <service verb="end" noun="MatchPolicy" allow-remote="false">
+        <description>End a category or product row of the match policy at thruDate (now by default), so the broader row
+            applies from then. Refuses the organization's own row (change it with store#MatchPolicy), an ended row and an
+            end before the row starts. Needs ACCOUNTING_ADMIN in the row's organization.</description>
+        <in-parameters>
+            <parameter name="invoiceMatchPolicyId" required="true"/>
+            <parameter name="thruDate" type="Timestamp"/>
+            <parameter name="changeReason"/>
+        </in-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.account.invoice.InvoiceMatchPolicy" value-field="row" disable-authz="true"/>
+            <if condition="row == null"><return error="true" message="POLICY_UNAVAILABLE: The policy row is not available"/></if>
+            <set field="workflow" value="component://mr-mantle/service/mantle/account/InvoiceWorkflow.js"/>
+            <script>ec.resource.script(workflow).execute('organization',
+                {organizationPartyId:row.organizationPartyId, permission:'ACCOUNTING_ADMIN', lock:true})</script>
+            <if condition="!row.productId &amp;&amp; !row.productCategoryId">
+                <return error="true" message="POLICY_SCOPE_INVALID: Change the organization's row; it does not end"/></if>
+            <set field="thruDate" from="thruDate ?? ec.user.nowTimestamp"/>
+            <if condition="row.thruDate &amp;&amp; Number(row.thruDate) &lt;= Number(ec.user.nowTimestamp)">
+                <return error="true" message="POLICY_ENDED: The row has already ended"/></if>
+            <if condition="Number(thruDate) &lt;= Number(row.fromDate)">
+                <return error="true" message="DATE_INVALID: The end must be after the row starts"/></if>
+            <service-call name="update#mantle.account.invoice.InvoiceMatchPolicy" disable-authz="true"
+                    in-map="{invoiceMatchPolicyId:invoiceMatchPolicyId, thruDate:thruDate,
+                        changeReason:changeReason || row.changeReason, changedByUserId:ec.user.userId}"/>
+        </actions>
+    </service>
+</services>

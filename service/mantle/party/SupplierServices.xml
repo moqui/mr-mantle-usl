@@ -20,8 +20,9 @@ along with this software (see the LICENSE.md file). If not, see
         <description>Change an organization's profile of a supplier: the row in effect ends at fromDate (now by default) and
             the next starts there with the fields given and the others carried over; nothing changes when nothing differs.
             The finance fields, the default payment term of the supplier's bills (settlementTermId) and self-billing
-            (selfBillingIndicator, Y or N), need SUPPLIER_TERMS_EDIT in the organization. Refuses an unknown term, a
-            supplier another user keeps private and a start before the row in effect.</description>
+            (selfBillingIndicator, Y or N), need SUPPLIER_TERMS_EDIT in the organization. A supplier's first row takes
+            self-billing from the organization's match policy (selfBillingDefault) unless the change gives it. Refuses an
+            unknown term, a supplier another user keeps private and a start before the row in effect.</description>
         <in-parameters>
             <parameter name="organizationPartyId" required="true"/>
             <parameter name="supplierPartyId" required="true"/>
@@ -62,8 +63,20 @@ along with this software (see the LICENSE.md file). If not, see
                 <order-by field-name="-fromDate"/>
             </entity-find>
             <set field="current" from="currentList[0] ?? null"/>
+            <!-- a supplier's first row takes the organization's self-billing default (its match policy row) -->
+            <set field="selfBillingDefault" value="N"/>
+            <if condition="!current">
+                <entity-find entity-name="mantle.account.invoice.InvoiceMatchPolicy" list="matchPolicyList" limit="1"
+                        disable-authz="true">
+                    <date-filter valid-date="fromDate"/>
+                    <econdition field-name="organizationPartyId"/>
+                    <econdition field-name="productId" from="null"/><econdition field-name="productCategoryId" from="null"/>
+                    <order-by field-name="-fromDate"/>
+                </entity-find>
+                <set field="selfBillingDefault" from="matchPolicyList[0]?.selfBillingDefault || 'N'"/>
+            </if>
             <set field="values" from="{settlementTermId:current?.settlementTermId ?? null,
-                selfBillingIndicator:current?.selfBillingIndicator ?? 'N'}"/>
+                selfBillingIndicator:current?.selfBillingIndicator ?? selfBillingDefault}"/>
             <iterate list="financeFields" entry="field">
                 <script>values[field] = context[field] || null</script></iterate>
             <set field="values.selfBillingIndicator" from="values.selfBillingIndicator || 'N'"/>

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<!-- A changed receipt or bill line marks the applied matches it touches stale; the re-evaluation job evaluates them. These
+    only queue: an indexed read of the match lines, and a write only when a match is found. -->
+<eecas xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/entity-eca-3.xsd">
+    <eeca id="AssetReceiptQueueMatchReevaluation" entity="mantle.product.receipt.AssetReceipt"
+            on-create="true" on-update="true" on-delete="true" run-on-error="false" get-entire-entity="true">
+        <description>A purchase receipt created, corrected or removed: queue the matches of its order line.</description>
+        <condition><expression>orderId &amp;&amp; orderItemSeqId</expression></condition>
+        <actions>
+            <service-call name="mantle.account.InvoiceMatchServices.queue#MatchReevaluation" disable-authz="true"
+                    in-map="{assetReceiptId:assetReceiptId, orderId:orderId, orderItemSeqId:orderItemSeqId,
+                        staleReason:'Receipt ' + assetReceiptId + ' changed'}"/>
+        </actions>
+    </eeca>
+    <eeca id="InvoiceItemQueueMatchReevaluation" entity="mantle.account.invoice.InvoiceItem"
+            on-create="true" on-update="true" on-delete="true" run-on-error="false">
+        <description>A bill line added, changed or removed: queue the bill's applied match.</description>
+        <actions>
+            <service-call name="mantle.account.InvoiceMatchServices.queue#MatchReevaluation" disable-authz="true"
+                    in-map="{invoiceId:invoiceId, staleReason:'Bill line ' + invoiceItemSeqId + ' changed'}"/>
+        </actions>
+    </eeca>
+</eecas>
