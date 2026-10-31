@@ -241,11 +241,13 @@ feature(
         }
     }
 )
-// Deleting a time entry whose cost was posted reverses its posting on the day of the delete (the week's policy leaves
-// its time open to changes).
+// Deleting a time entry whose cost was posted reverses its posting on the day of the delete, also after project cost
+// posting is turned off (the week's policy leaves its time open to changes).
 feature("deleting a posted time entry reverses its project cost", {
     when() {
         const before = netCost()
+        // with project cost posting turned off since, the earlier posting is still reversed
+        setFlag("N")
         call("mantle.work.TimeServices.delete#TimeEntry", {timeEntryId: "P11_E1"})
         const operation = ec.entity
             .find("mantle.ledger.transaction.PostingOperation")

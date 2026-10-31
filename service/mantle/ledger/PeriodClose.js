@@ -26,6 +26,14 @@ function periodScope(p, need = "read", lock = false) {
     }).orgPartyIdList
     return {s, period, fromDay, thruDay, afterDay, fromStamp: stamp(fromDay), afterStamp: stamp(afterDay), organizations}
 }
+// The same scope over another period of the organization (the closed month and quarter that end with a closed year).
+function scopeOf(c, period) {
+    const fromDay = lib.calendarDateText(period.fromDate),
+        thruDay = lib.calendarDateText(period.thruDate)
+    const afterDay = lib.calendarDateText(Date.parse(thruDay) + 86400000)
+    const stamp = day => ec.l10n.parseTimestamp(day, "yyyy-MM-dd")
+    return Object.assign({}, c, {period, fromDay, thruDay, afterDay, fromStamp: stamp(fromDay), afterStamp: stamp(afterDay)})
+}
 // The condition of a book day in the period: the accounting day when there is one, else the timestamp field.
 function inPeriod(c, stampField = "transactionDate", dayField = "accountingDate") {
     const cf = ec.entity.conditionFactory
@@ -212,37 +220,45 @@ const checks = {
         )
         const found = []
         for (const bank of banks) {
-            const lines = Array.from(
-                find("mantle.account.method.PaymentMethodTrans", {paymentMethodId: bank.paymentMethodId})
-                    .condition(stampInPeriod(c, "postedDate"))
-                    .selectField("fitId")
-                    .list()
-            ).map(row => row.fitId)
-            if (!lines.length) continue
-            const cleared = Array.from(
-                find("mantle.account.method.BankReconciliationLine", {paymentMethodId: bank.paymentMethodId})
-                    .condition("fitId", "in", lines)
-                    .list()
-            )
-            const sessions = [...new Set(cleared.map(row => row.bankReconciliationId))]
-            const finished = new Set(
-                sessions.length
-                    ? Array.from(
-                          find("mantle.account.method.BankReconciliation")
-                              .condition("bankReconciliationId", "in", sessions)
-                              .condition("statusId", "BrecFinished")
-                              .selectField("bankReconciliationId")
-                              .list()
-                      ).map(row => row.bankReconciliationId)
-                    : []
-            )
-            const done = new Set(cleared.filter(row => finished.has(row.bankReconciliationId)).map(row => row.fitId))
-            const open = lines.filter(fitId => !done.has(fitId))
-            if (!open.length) continue
+            // the period's lines a page at a time, each page against its clearing and the finished statements
+            let open = 0
+            for (let page = 0; ; page++) {
+                const lines = Array.from(
+                    find("mantle.account.method.PaymentMethodTrans", {paymentMethodId: bank.paymentMethodId})
+                        .condition(stampInPeriod(c, "postedDate"))
+                        .selectField("fitId")
+                        .orderBy("fitId")
+                        .offset(page * PAGE)
+                        .limit(PAGE)
+                        .list()
+                ).map(row => row.fitId)
+                if (!lines.length) break
+                const cleared = Array.from(
+                    find("mantle.account.method.BankReconciliationLine", {paymentMethodId: bank.paymentMethodId})
+                        .condition("fitId", "in", lines)
+                        .list()
+                )
+                const sessions = [...new Set(cleared.map(row => row.bankReconciliationId))]
+                const finished = new Set(
+                    sessions.length
+                        ? Array.from(
+                              find("mantle.account.method.BankReconciliation")
+                                  .condition("bankReconciliationId", "in", sessions)
+                                  .condition("statusId", "BrecFinished")
+                                  .selectField("bankReconciliationId")
+                                  .list()
+                          ).map(row => row.bankReconciliationId)
+                        : []
+                )
+                const done = new Set(cleared.filter(row => finished.has(row.bankReconciliationId)).map(row => row.fitId))
+                open += lines.filter(fitId => !done.has(fitId)).length
+                if (lines.length < PAGE) break
+            }
+            if (!open) continue
             found.push({
                 recordKind: "banks",
                 recordId: bank.paymentMethodId,
-                text: (bank.description || bank.paymentMethodId) + ": " + open.length + " lines not on a finished statement",
+                text: (bank.description || bank.paymentMethodId) + ": " + open + " lines not on a finished statement",
                 detail: null
             })
         }
@@ -413,6 +429,27 @@ const checks = {
             })
         }
         return result(found, item => item)
+    },
+    // A hard lock through a fiscal year's last day keeps its closing entries out (locks are never skipped), so it blocks a
+    // year's close: set the lock after the close.
+    PccHardLock(c) {
+        if (c.period.timePeriodTypeId !== "FiscalYear") return {count: 0, items: []}
+        const chain = [...new Set(c.organizations.flatMap(org => lib.organizationChain(org)))]
+        const locks = Array.from(
+            find("mantle.ledger.config.AccountingLock")
+                .condition("organizationPartyId", "in", chain)
+                .condition("isHard", "Y")
+                .condition("lockThroughDate", "greater-equals", c.thruDay)
+                .list()
+        )
+        return result(locks, lock => ({
+            recordKind: "locks",
+            recordId: lock.accountingLockId,
+            text:
+                "Hard lock " + lock.accountingLockId + " (" + lock.lockScope + ") through " +
+                lib.calendarDateText(lock.lockThroughDate),
+            detail: lock.changeReason
+        }))
     },
     // Approved project time of the period whose cost posting differs from its cost (with project cost posting on).
     PccProjectCost(c) {
@@ -717,6 +754,19 @@ function close(p) {
         }
     }
     for (const org of c.organizations) carryForward(c, org, summaries[org].endings)
+    // the closing entries are dated the year's last day, inside the year's last month and quarter: their stored rows
+    // are made again, for each organization, as are the later periods after them
+    if (closingIds.length)
+        for (const inner of Array.from(
+            find("mantle.party.time.TimePeriod", {partyId: c.period.partyId, isClosed: "Y"})
+                .condition("timePeriodId", "not-equals", c.period.timePeriodId)
+                .condition("fromDate", "less-equals", c.thruDay)
+                .condition("thruDate", "greater-equals", c.thruDay)
+                .list()
+        )) {
+            const innerScope = scopeOf(c, inner)
+            for (const org of c.organizations) carryForward(innerScope, org, snapshot(innerScope, org).endings)
+        }
     const own = summaries[s.organizationPartyId]
     call("update#mantle.ledger.transaction.AccountingCloseRun", {
         closeRunId: run.closeRunId,

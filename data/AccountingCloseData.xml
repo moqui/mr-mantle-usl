@@ -37,6 +37,9 @@ along with this software (see the LICENSE.md file). If not, see
     <moqui.basic.Enumeration enumId="PccMissingRates" enumTypeId="PeriodCloseCheck" sequenceNum="60"
             description="Documents without an exchange rate" optionIndicator="Y"
             enumCode="mantle.ledger.CloseServices.check#StandardClose"/>
+    <moqui.basic.Enumeration enumId="PccHardLock" enumTypeId="PeriodCloseCheck" sequenceNum="65"
+            description="Hard locks through the year end" optionIndicator="Y"
+            enumCode="mantle.ledger.CloseServices.check#StandardClose"/>
     <moqui.basic.Enumeration enumId="PccPayableHolds" enumTypeId="PeriodCloseCheck" sequenceNum="70"
             description="Bills on hold" optionIndicator="N"
             enumCode="mantle.ledger.CloseServices.check#StandardClose"/>

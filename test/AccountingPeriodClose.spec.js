@@ -461,10 +461,21 @@ feature("closing-typed entries outside a close are refused, into a closed month 
         const lockedPost = asUser(f.users.glClose, () =>
             rejected("mantle.ledger.LedgerServices.post#AcctgTrans", {acctgTransId: locked.acctgTransId})
         )
+        // a year's close is blocked while a hard lock covers its last day
+        const lockedYearId = call("mantle.party.TimeServices.create#TimePeriod", {
+            partyId: f.org,
+            timePeriodTypeId: "FiscalYear",
+            fromDate: "2020-01-01",
+            thruDate: "2020-12-31"
+        }).timePeriodId
+        const lockedYear = asUser(f.users.closer, () =>
+            call(close + "get#Checklist", {organizationPartyId: f.org, timePeriodId: lockedYearId})
+        )
         fixtures().base.cleanupLocks(f.org)
-        return {draft, template, instance, closedPost, reversal, lockedPost, lock}
+        return {draft, template, instance, closedPost, reversal, lockedPost, lock, lockedYear}
     },
-    then({draft, template, instance, closedPost, reversal, lockedPost}) {
+    then({draft, template, instance, closedPost, reversal, lockedPost, lockedYear}) {
+        row(lockedYear.checkRows, "PccHardLock").status == "blocked" && lockedYear.canClose == false
         draft.includes("CLOSING_ENTRY")
         template.includes("CLOSING_ENTRY")
         instance.includes("CLOSING_ENTRY")
@@ -474,7 +485,8 @@ feature("closing-typed entries outside a close are refused, into a closed month 
     }
 })
 // A rollup child posts under its parent's fiscal year: the year's close closes the child to its own net income account
-// and stores the child's summary rows, so the child's trial balance of the closed year reads them.
+// and stores the child's summary rows, so the child's trial balance of the closed year reads them; the closed December
+// and fourth quarter are stored again with the closing entries.
 feature("a parent's year close closes a rollup child to its own net income account and stores its summary rows", {
     when() {
         const child = fixtures().fixtures("ACCT_P11_CHILD")
@@ -513,6 +525,23 @@ feature("a parent's year close closes a rollup child to its own net income accou
         }
         entry(f.org, "30")
         entry(child.org, "45")
+        // the year's last quarter and month, closed before the year
+        const quarterId = call("mantle.party.TimeServices.create#TimePeriod", {
+            partyId: f.org,
+            timePeriodTypeId: "FiscalQuarter",
+            parentPeriodId: yearId,
+            fromDate: "2022-10-01",
+            thruDate: "2022-12-31"
+        }).timePeriodId
+        const decemberId = call("mantle.party.TimeServices.create#TimePeriod", {
+            partyId: f.org,
+            timePeriodTypeId: "FiscalMonth",
+            parentPeriodId: quarterId,
+            fromDate: "2022-12-01",
+            thruDate: "2022-12-31"
+        }).timePeriodId
+        for (const timePeriodId of [decemberId, quarterId])
+            asUser(f.users.closer, () => call(close + "close#Period", {organizationPartyId: f.org, timePeriodId}))
         const closed = asUser(f.users.closer, () =>
             call(close + "close#Period", {organizationPartyId: f.org, timePeriodId: yearId, changeReason: "Group year end"})
         )
@@ -531,9 +560,20 @@ feature("a parent's year close closes a rollup child to its own net income accou
         const childTrial = asUser(child.users.read, () =>
             call("mantle.ledger.FinanceReportServices.run#TrialBalance", {organizationPartyId: child.org, timePeriodId: yearId})
         )
-        return {child, closing, childRevenue, childTrial}
+        const december = asUser(f.users.read, () =>
+            call("mantle.ledger.FinanceReportServices.run#TrialBalance", {organizationPartyId: f.org, timePeriodId: decemberId})
+        )
+        const childDecember = ec.entity
+            .find("mantle.ledger.account.GlAccountOrgTimePeriod")
+            .condition({organizationPartyId: child.org, timePeriodId: decemberId, glAccountId: "412000000"})
+            .disableAuthz()
+            .one()
+        return {child, closing, childRevenue, childTrial, december, childDecember}
     },
-    then({child, closing, childRevenue, childTrial}) {
+    then({child, closing, childRevenue, childTrial, december, childDecember}) {
+        december.reportRows.find(r => r.glAccountId == "412000000").ending == 0
+        december.reportRows.find(r => r.glAccountId == "850000000").closedSummary == true
+        childDecember.postedDebits == 45 && childDecember.endingBalance == 0
         closing
             .map(tx => tx.organizationPartyId)
             .sort()

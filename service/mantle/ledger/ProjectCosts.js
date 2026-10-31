@@ -93,7 +93,8 @@ function basis(entry, lock = false, removed = false) {
         target: toDecimal(0),
         delta: toDecimal(0)
     }
-    if (!enabled(org)) return Object.assign(out, {skipped: true})
+    // with the flag off nothing new posts, but a deleted entry's earlier posting is still reversed
+    if (!enabled(org) && !(removed && known.row)) return Object.assign(out, {skipped: true})
     const currency = lib.preference(org).baseCurrencyUomId
     out.currencyUomId = currency
     const sheet = entry.timesheetId ? one("mantle.work.time.Timesheet", {timesheetId: entry.timesheetId}) : null
