@@ -222,7 +222,8 @@ along with this software (see the LICENSE.md file). If not, see
                                     in-map="{acctgTransTypeEnumId:fromAcctgTrans.acctgTransTypeEnumId,
                                         organizationPartyId:fromAcctgTrans.organizationPartyId,
                                         otherPartyId:fromAcctgTrans.otherPartyId, itemTypeEnumId:invoiceItem.itemTypeEnumId,
-                                        productId:invoiceItem.productId, assetId:invoiceItem.assetId, direction:'O'}"
+                                        productId:invoiceItem.productId, assetId:invoiceItem.assetId,
+                                        taxAuthorityId:invoiceItem.taxAuthorityId, direction:'O'}"
                                     out-map="invoiceItemGlAccountOut" out-map-add-to-existing="false"/>
                             <set field="itemGlAccountId" from="invoiceItemGlAccountOut?.glAccountId"/>
                             <set field="itemGlAccountTypeEnumId" from="invoiceItemGlAccountOut?.glAccountTypeEnumId"/>
@@ -430,7 +431,8 @@ along with this software (see the LICENSE.md file). If not, see
                             in-map="{acctgTransTypeEnumId:fromAcctgTrans.acctgTransTypeEnumId,
                                 organizationPartyId:fromAcctgTrans.organizationPartyId,
                                 otherPartyId:fromAcctgTrans.otherPartyId, itemTypeEnumId:invoiceItem.itemTypeEnumId,
-                                productId:invoiceItem.productId, assetId:invoiceItem.assetId, direction:'O'}"
+                                productId:invoiceItem.productId, assetId:invoiceItem.assetId,
+                                taxAuthorityId:invoiceItem.taxAuthorityId, direction:'O'}"
                             out-map="invoiceItemGlAccountOut" out-map-add-to-existing="false"/>
                     <set field="itemGlAccountId" from="invoiceItemGlAccountOut?.glAccountId"/>
                     <set field="itemGlAccountTypeEnumId" from="invoiceItemGlAccountOut?.glAccountTypeEnumId"/>
@@ -603,6 +605,8 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="otherPartyId"/>
             <parameter name="itemTypeEnumId" required="true"/>
             <parameter name="productId"/>
+            <parameter name="taxAuthorityId"><description>For a tax line, its authority: the organization's account for
+                the authority (TaxAuthorityGlAccount) comes before the item type's.</description></parameter>
             <parameter name="direction" required="true"/>
         </in-parameters>
         <out-parameters>
@@ -648,6 +652,18 @@ along with this software (see the LICENSE.md file). If not, see
                         <set field="glAccountId" from="direction == 'O' ? assetTypeGlAccount?.profitGlAccountId : assetTypeGlAccount?.receiptGlAccountId"/>
                     </if>
                 </if>
+            </if>
+
+            <!-- a tax line posts to the organization's account for its authority -->
+            <if condition="!glAccountId &amp;&amp; taxAuthorityId &amp;&amp;
+                    ['ItemSalesTax', 'ItemVatTax'].includes(itemTypeEnumId)">
+                <entity-find entity-name="mantle.ledger.config.TaxAuthorityGlAccount" list="taxAuthorityGlAccountList"
+                        cache="true">
+                    <econdition field-name="taxAuthorityId"/>
+                    <econdition field-name="organizationPartyId" operator="in" from="orgPartyIdList"/>
+                </entity-find>
+                <set field="glAccountId" from="orgPartyIdList.map((orgId) =&gt; taxAuthorityGlAccountList
+                        .find((row) =&gt; row.organizationPartyId == orgId)?.glAccountId).find(Boolean) || null"/>
             </if>
 
             <!-- nothing? look by itemTypeEnumId -->
