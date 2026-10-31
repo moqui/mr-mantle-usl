@@ -24,10 +24,15 @@ const dayNumber = day => {
     const [year, month, date] = String(day).split("-").map(Number)
     return Date.UTC(year, month - 1, date) / 86400000
 }
+// Ids given as a list, a comma-separated text or a list of such texts (a multiple drop-down's value).
 const idList = value =>
-    [...new Set((typeof value === "string" ? value.split(",") : Array.from(value || [])).map(id => String(id).trim()))].filter(
-        Boolean
-    )
+    [
+        ...new Set(
+            (typeof value === "string" ? [value] : Array.from(value || []))
+                .flatMap(item => String(item).split(","))
+                .map(id => id.trim())
+        )
+    ].filter(Boolean)
 
 // The organization (with the permission) and a customer the user may see.
 function customerScope(p, permission) {

@@ -49,7 +49,9 @@ function capabilities() {
         payableImport: has("PAYABLE_IMPORT"),
         supplierTermsEdit: has("SUPPLIER_TERMS_EDIT"),
         fiscalClose: has("FISCAL_CLOSE"),
-        fiscalReopen: has("FISCAL_REOPEN")
+        fiscalReopen: has("FISCAL_REOPEN"),
+        creditView: has("CUSTOMER_CREDIT_VIEW"),
+        creditRelease: has("CREDIT_HOLD_RELEASE")
     }
     // An edit permission alone opens no reads: other apps' groups hold some (Projects' RECEIVABLE_EDIT for billing).
     out.read = [
