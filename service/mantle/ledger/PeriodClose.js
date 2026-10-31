@@ -591,41 +591,10 @@ function checklist(p) {
 // a posting before or in the period getting its row: the beginning balance from all earlier postings, the period's
 // debits and credits with and without closing entries, and the ending balance, each in the account's own sign.
 function snapshot(c, org) {
-    const totals = {}
-    const total = id => {
-        if (!totals[id])
-            totals[id] = {
-                before: toDecimal(0),
-                debits: toDecimal(0),
-                credits: toDecimal(0),
-                debitsNoClosing: toDecimal(0),
-                creditsNoClosing: toDecimal(0)
-            }
-        return totals[id]
-    }
-    const summary = dates =>
-        find("mantle.ledger.transaction.AcctgTransAndEntrySummary", {organizationPartyId: org, isPosted: "Y"})
-            .condition(dates)
-            .selectField("glAccountId")
-            .selectField("debitCreditFlag")
-            .selectField("acctgTransTypeEnumId")
-            .selectField("amount")
-            .list()
-    const before = lib.accountingDateCondition({thruDate: c.fromStamp, thruDay: c.fromDay})
-    for (const row of summary(before)) {
-        const sign = row.debitCreditFlag === "D" ? 1 : -1
-        total(row.glAccountId).before = total(row.glAccountId).before.add(toDecimal(row.amount ?? 0).multiply(sign))
-    }
-    for (const row of summary(inPeriod(c))) {
-        const entry = total(row.glAccountId),
-            amount = toDecimal(row.amount ?? 0),
-            debit = row.debitCreditFlag === "D"
-        entry[debit ? "debits" : "credits"] = entry[debit ? "debits" : "credits"].add(amount)
-        // the columns without closing entries leave out net income closing, as Mantle's recalculation does
-        if (row.acctgTransTypeEnumId !== "AttNetIncomeClosing")
-            entry[debit ? "debitsNoClosing" : "creditsNoClosing"] =
-                entry[debit ? "debitsNoClosing" : "creditsNoClosing"].add(amount)
-    }
+    // the totals the statement reports sum for an open period (FinanceReports.periodTotals), stored for the closed one
+    const reports = ec.resource.script("component://mr-mantle/service/mantle/ledger/FinanceReports.js")
+    const {totals} = reports.periodTotals(org, c)
+    const total = id => totals[id] || (totals[id] = reports.blankTotal())
     const stored = new Map(
         Array.from(
             find("mantle.ledger.account.GlAccountOrgTimePeriod", {organizationPartyId: org, timePeriodId: c.period.timePeriodId})

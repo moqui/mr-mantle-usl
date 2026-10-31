@@ -259,6 +259,8 @@ along with this software (see the LICENSE.md file). If not, see
         <alias name="transactionDate" entity-alias="ATX"/><!-- don't select, just use for condition -->
         <alias name="amountUomId" entity-alias="ATX"/><!-- don't select, just use for condition -->
         <alias name="organizationPartyId" entity-alias="ATX"/><!-- don't select, just use for condition -->
+        <alias name="accountingDate" entity-alias="ATX"/><!-- don't select, just use for condition -->
+        <alias name="isPosted" entity-alias="ATX"/><!-- don't select, just use for condition -->
     </view-entity>
     
     <view-entity entity-name="GlAccountOrgTimePeriodDetail" package="mantle.ledger.report">

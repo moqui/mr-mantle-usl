@@ -713,6 +713,43 @@ party (`TimePeriod.partyId`); its other parties are `BudgetParty` rows (`store#B
   as they were for their callers.
 - **Spec.** `AccountingBudgets`.
 
+## Reports (P16)
+
+The report runs in `mantle.ledger.LedgerReportServices`, `FinanceReportServices` and
+`mantle.sales.SalesReportServices`, with `ledger/FinanceReports.js` and `sales/SalesAnalysis.js`. Each checks report read
+(`ACCOUNTING_VIEW`) in the organization through `AccountingPolicy.organization`, so Mantle's REST report paths and every
+caller are scoped (F6), and answers `asOf` with `complete` and the reasons a figure is incomplete.
+
+- **Periods and figures.** `get#ReportBasicInfo`, which `run#IncomeStatement`, `run#BalanceSheet`,
+  `run#CashFlowStatement`, `run#RetainedEarningsStatement` and `run#FinancialRatios` call, refuses a period that is not
+  the organization's own or one of an organization it rolls up to (`PERIOD_UNAVAILABLE`), and answers each period's GL
+  summary rows (`summaryRows`): a closed period's stored `GlAccountOrgTimePeriod` rows, an open period's summed from its
+  posted entries by book day when the report runs (§4 of impl-accounting, F16), so no report depends on
+  `realTimeGlSummary`. `get#GlAccountClassReportInfo` reads its class from those rows (and reads them itself, checked,
+  when called without). The open-period sums are `FinanceReports.periodTotals`, which period close also stores as the
+  closed period's rows. A closed period without stored rows, and postings in another currency than the base, are named in
+  `incompleteReasons`. With `childOrgPeriods` the rolled-up organizations' periods are each read for their own
+  organization.
+- The postings before open periods are summed once per organization and carried forward by the postings between
+  periods; `childOrgPeriods` reads only the organizations the user works in.
+- **`get#PeriodSeriesSummary`** totals the same rows by period and class; `get#AccountLedgerInfo` opens from the period's
+  summary row and reads its entries by book day.
+- **`run#PostedAmountSummary`** answers each account's posted debits, credits, net and balance before and after, in one
+  currency, by book day (`PostedAmountSummary` gained `accountingDate` and `isPosted` for its conditions); a fiscal period
+  sets the days; without one the through date is included, as it always was.
+- **`run#PartnerLedger`**: each customer's (or supplier's) movements on the receivable (or payable) accounts, by book day,
+  with opening, running and closing balances and each line's invoice, payment or journal entry; over 5,000 lines it lists
+  the first 5,000 and leaves the balances unavailable (`complete` false).
+- **`run#SalesAnalysis`**: the organization's sales orders placed, issued quantities, issued sales invoices (by book day)
+  and returns, grouped by product, customer or customer class, each read capped at 2,000 documents and named when capped.
+  Only sales lines (the ItemSales types) and returns once requested count; credit memos no return made are not counted;
+  without a period or days, the fiscal month holding today. The search-backed `get#SalesOrderSummary`,
+  `get#SalesInvoiceSummary`, `get#SalesTopProduct` and `get#InvoicesByCustomerClass` need report read and read the
+  organizations named that the user may read, else every one the user works in.
+- **Spec.** `AccountingStatements` (two spec-local organizations): an open month summed, a closed month read from its
+  stored rows, the series, posted amounts, partner ledger and sales analysis, and the refusals of another organization,
+  its periods and a user without report read.
+
 ## Returns and order changes (P17)
 
 **Flags.** Two audit-logged `PartyAcctgPreference` fields (`entity/ReturnSettlementEntities.xml`), off by default and set
