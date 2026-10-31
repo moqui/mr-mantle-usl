@@ -162,4 +162,11 @@
     ['POST', 'imports/{importId}/activate', 'activateImport'],
     ['POST', 'imports/{importId}/cancel', 'cancelImport'],
     ['GET', 'permalinks', 'resolvePermalink'],
+    ['GET', 'billing/invoices', 'findInvoices'],
+    ['GET', 'billing/invoice', 'getInvoice'],
+    ['POST', 'billing/invoice/access', 'issueInvoiceAccess'],
+    ['POST', 'billing/payments', 'startInvoicePayment'],
+    ['GET', 'billing/payments/{attemptId}', 'getPaymentResult'],
+    ['GET', 'supplier/order', 'getSubmission'],
+    ['POST', 'supplier/bills', 'submitSupplierBill'],
 ]

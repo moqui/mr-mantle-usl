@@ -2032,6 +2032,36 @@ methods.checkReadiness = (p) => {
                     .count() === 0,
         },
     ]
+    // Each mounted app with checks of its own adds them, named by app; one that fails to answer is not ready.
+    const registry = ec.resource.script(
+        'component://mr-mantle/service/mantle/public/PublicApps.js',
+    )
+    for (const m of rows(S + 'PublicSiteApp', {
+        siteId: p.siteId,
+        enabled: 'Y',
+    })) {
+        const service = registry.apps[m.app]?.readiness
+        if (!service) continue
+        try {
+            const out = ec.service
+                .sync()
+                .throwOnError(true)
+                .name(service)
+                .parameters({
+                    input: { siteId: p.siteId, app: m.app, targetId: m.targetId },
+                })
+                .call().result
+            for (const c of out.checks || [])
+                checks.push({ name: m.app + ' ' + c.name, ready: !!c.ready })
+        } catch (error) {
+            ec.message.clearErrors()
+            ec.logger.error(
+                'Readiness of the ' + m.app + ' app on site ' + p.siteId + ' failed: ' +
+                    String(error.message).split('\n')[0],
+            )
+            checks.push({ name: m.app + ' app', ready: false })
+        }
+    }
     return { ready: checks.every((c) => c.ready), checks }
 }
 /* Named internal recipients who can read the category: To beats Cc beats the plain mailbox receipt. */
@@ -2099,19 +2129,36 @@ methods.storeMounts = (p) => {
         if (old && old.siteId !== p.siteId)
             invalid('Hostname already belongs to another site')
     }
+    // The core apps a request names replace the site's core mounts, as before. A targeted app's mount (Billing,
+    // Supplier) is written only by an operator and only when named, so a site owner's save keeps it.
+    const registry = ec.resource.script(
+        'component://mr-mantle/service/mantle/public/PublicApps.js',
+    )
+    const existing = rows(S + 'PublicSiteApp', { siteId: p.siteId }, 100)
+    const named = new Set(mounts.map((m) => m.app))
+    const kept = existing.filter(
+        (old) => registry.apps[old.app]?.target && !named.has(old.app),
+    )
     for (let i = 0; i < mounts.length; i++) {
-        const m = mounts[i]
+        const m = mounts[i],
+            app = registry.apps[m.app]
         if (
-            !['forum', 'account', 'members', 'sites'].includes(m.app) ||
+            !app ||
             !/^\/(?:[a-zA-Z0-9_-]+(?:\/[a-zA-Z0-9_-]+)*)?$/.test(
                 m.pathPrefix || '',
             ) ||
             reserved.includes(m.pathPrefix.split('/')[1])
         )
             invalid('Invalid or reserved mount')
-        if (m.pathPrefix === '/' && m.app !== 'forum')
+        if (m.pathPrefix === '/' && !app.root)
             invalid('Only Forum may mount at root')
-        for (const other of mounts.slice(0, i)) {
+        if (app.target) {
+            if (!isOperator())
+                fail('Unauthorized', 'App targets require an operator')
+            if (!m.targetId || !registry.targets[app.target](m.targetId))
+                invalid('Choose the ' + app.target + ' the ' + m.app + ' app serves')
+        } else if (m.targetId) invalid('The ' + m.app + ' app takes no target')
+        for (const other of mounts.slice(0, i).concat(kept)) {
             if (
                 m.pathPrefix === other.pathPrefix ||
                 (m.pathPrefix !== '/' &&
@@ -2122,15 +2169,15 @@ methods.storeMounts = (p) => {
                 invalid('Mounts overlap')
         }
     }
-    for (const old of rows(S + 'PublicSiteApp', { siteId: p.siteId }, 100))
-        old.delete()
+    for (const old of existing) if (!kept.includes(old)) old.delete()
     for (const [i, m] of mounts.entries())
         create(S + 'PublicSiteApp', {
             siteId: p.siteId,
-            appMountId: m.appMountId || String(i),
+            appMountId: m.appMountId || m.app + '-' + i,
             app: m.app,
             pathPrefix: m.pathPrefix,
             enabled: m.enabled === false ? 'N' : 'Y',
+            targetId: m.targetId || null,
         })
     if (hosts.filter((h) => h.canonical).length > 1)
         invalid('Choose one canonical hostname')
@@ -2245,6 +2292,10 @@ methods.redeemInvitation = (p) => {
     }
     old ? update(old, values) : create(S + 'PublicSiteParty', values)
     update(v, { redeemedAt: now() })
+    // An invitation bound to an app and an outside party (invite#Contact) makes this account's party its contact.
+    ec.resource
+        .script('component://mr-mantle/service/mantle/party/ExternalAccess.js')
+        .bindContact(partyId, json(v.scopes, []))
     return { state: 'active', revision: values.revision }
 }
 methods.revokeInvitation = (p) => {
@@ -5427,7 +5478,7 @@ function execute(operation, p) {
             const allowed =
                 key === 'hosts'
                     ? ['hostname', 'canonical']
-                    : ['appMountId', 'app', 'pathPrefix', 'enabled']
+                    : ['appMountId', 'app', 'pathPrefix', 'enabled', 'targetId']
             for (const item of value) {
                 if (
                     !item ||

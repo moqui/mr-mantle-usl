@@ -216,4 +216,47 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="effectiveDate" from="ec.user.nowTimestamp"/>
         </actions>
     </service>
+
+    <service verb="hostedPending" noun="PaymentAuthorization">
+        <description>A hosted gateway: the payment waits at its page (redirectUrl), which sends the payer back to the
+            returnUrl with a claim the payer's browser carries ('result=paid'), never to be trusted; the outcome comes
+            from the details service (alwaysApprove#PaymentDetails approves it, a capture as well).</description>
+        <implements service="mantle.account.PaymentServices.authorize#Payment"/>
+        <actions>
+            <entity-find-one entity-name="mantle.account.payment.Payment" value-field="payment"/>
+            <set field="redirectUrl"
+                    from="returnUrl ? returnUrl + (returnUrl.includes('?') ? '&amp;' : '?') + 'result=paid' : null"/>
+            <service-call name="create#mantle.account.method.PaymentGatewayResponse" out-map="context"
+                    in-map="{paymentGatewayConfigId:paymentGatewayConfigId, paymentOperationEnumId:'PgoAuthAndCapture',
+                        paymentId:payment.paymentId, paymentMethodId:payment.paymentMethodId, amount:payment.amount,
+                        amountUomId:payment.amountUomId, referenceNum:'TEST-HOSTED-' + payment.paymentId,
+                        transactionDate:ec.user.nowTimestamp, transactionStatus:'Pending', redirectUrl:redirectUrl,
+                        resultSuccess:'N', resultDeclined:'N', resultNsf:'N', resultBadExpire:'N', resultBadCardNumber:'N'}"/>
+        </actions>
+    </service>
+    <service verb="alwaysPending" noun="PaymentDetails">
+        <description>Answers that the gateway has not decided yet: no status, so the payment stays as it is.</description>
+        <implements service="mantle.account.PaymentServices.get#PaymentGatewayDetails"/>
+        <actions>
+            <entity-find-one entity-name="mantle.account.payment.Payment" value-field="payment"/>
+            <service-call name="create#mantle.account.method.PaymentGatewayResponse" out-map="context"
+                    in-map="{paymentGatewayConfigId:paymentGatewayConfigId, paymentOperationEnumId:'PgoTxDetails',
+                        paymentId:payment.paymentId, amount:payment.amount, amountUomId:payment.amountUomId,
+                        referenceNum:payment.paymentRefNum, transactionDate:ec.user.nowTimestamp, transactionStatus:'Pending',
+                        resultSuccess:'N', resultDeclined:'N', resultNsf:'N', resultBadExpire:'N', resultBadCardNumber:'N'}"/>
+        </actions>
+    </service>
+    <service verb="alwaysDecline" noun="PaymentDetails">
+        <description>Answers that the gateway declined the payment.</description>
+        <implements service="mantle.account.PaymentServices.get#PaymentGatewayDetails"/>
+        <actions>
+            <entity-find-one entity-name="mantle.account.payment.Payment" value-field="payment"/>
+            <service-call name="create#mantle.account.method.PaymentGatewayResponse" out-map="context"
+                    in-map="{paymentGatewayConfigId:paymentGatewayConfigId, paymentOperationEnumId:'PgoTxDetails',
+                        paymentId:payment.paymentId, amount:payment.amount, amountUomId:payment.amountUomId,
+                        referenceNum:payment.paymentRefNum, transactionDate:ec.user.nowTimestamp, transactionStatus:'Declined',
+                        resultSuccess:'N', resultDeclined:'Y', resultNsf:'N', resultBadExpire:'N', resultBadCardNumber:'N'}"/>
+            <set field="gatewayStatusId" value="PmntDeclined"/>
+        </actions>
+    </service>
 </services>

@@ -32,6 +32,7 @@ const preferenceFields = [
     "salesInvoiceFinalizedAtShip",
     "projectCostPostingEnabled",
     "taxGatewayConfigId",
+    "invoicePayGatewayConfigId",
     "invoiceDocumentTemplate",
     "paymentDocumentTemplate",
     "documentLocale",

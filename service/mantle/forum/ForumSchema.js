@@ -923,4 +923,41 @@
         service: 'mantle.forum.ImportServices.resolve#Permalink',
         fields: ['siteId', 'path'],
     },
+    issueInvoiceAccess: {
+        service: 'mantle.account.PortalServices.issue#InvoiceAccess',
+        fields: ['siteId', 'invoiceId'],
+    },
+    findInvoices: {
+        service: 'mantle.account.PortalServices.find#Invoices',
+        fields: ['siteId'],
+    },
+    getInvoice: {
+        service: 'mantle.account.PortalServices.get#Invoice',
+        fields: ['siteId', 'invoiceId', 'token'],
+    },
+    startInvoicePayment: {
+        service: 'mantle.account.PortalServices.start#InvoicePayment',
+        fields: ['siteId', 'invoiceId', 'token', 'operationId', 'confirm'],
+    },
+    getPaymentResult: {
+        service: 'mantle.account.PortalServices.get#PaymentResult',
+        fields: ['siteId', 'attemptId', 'token', 'returnKey'],
+    },
+    getSubmission: {
+        service: 'mantle.account.PortalServices.get#Submission',
+        fields: ['siteId', 'orderId', 'token', 'submissionId'],
+    },
+    submitSupplierBill: {
+        service: 'mantle.account.PortalServices.submit#SupplierBill',
+        fields: [
+            'siteId',
+            'orderId',
+            'token',
+            'referenceNumber',
+            'invoiceDate',
+            'amount',
+            'file',
+            'operationId',
+        ],
+    },
 })
