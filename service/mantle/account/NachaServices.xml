@@ -35,6 +35,8 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="addOffsetRecord" type="Boolean">
                 <description>Add a single offset record to create a 'balanced' NACHA file; defaults to BankAccount.nachaAddOffsetRecord (Y/N) or 'false'</description></parameter>
             <parameter name="produceSystemMessage" type="Boolean" default="false"/>
+            <parameter name="paymentIdList" type="List"><description>Only these payments (a payment run's), when
+                given</description></parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="paymentMethodFileId"/>
@@ -73,6 +75,7 @@ along with this software (see the LICENSE.md file). If not, see
                 </econditions>
                 <econdition field-name="paymentInstrumentEnumId" value="PiAch"/>
                 <econdition field-name="paymentMethodFileId" from="null"/>
+                <econdition field-name="paymentId" operator="in" from="paymentIdList" ignore-if-empty="true"/>
                 <econdition field-name="effectiveDate" operator="greater-equals" from="fromDate" ignore-if-empty="true"/>
                 <econdition field-name="effectiveDate" operator="less-equals" from="thruDate"/>
                 <order-by field-name="effectiveDate"/>
@@ -596,7 +599,10 @@ along with this software (see the LICENSE.md file). If not, see
                         if ('99' === type) {
                             // return
                             const payment = ec.entity.find("mantle.account.payment.Payment").condition({paymentId: paymentId}).one()
-                            if (payment) {
+                            // a return imported again changes nothing: the payment was declined then
+                            if (payment && payment.statusId === "PmntDeclined") {
+                                ec.message.addMessage(`Payment ${paymentId} was already returned`)
+                            } else if (payment) {
                                 // find description of the return reason code
                                 const returnReason = ec.entity.find("moqui.basic.Enumeration")
                                         .condition({enumTypeId: "ACHReturnCode", enumCode: lastAddenda.returnReasonCode}).one()

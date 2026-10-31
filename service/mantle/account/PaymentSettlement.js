@@ -13,6 +13,7 @@ const T = "mantle.ledger.transaction.AcctgTrans",
 // The item types of a settlement adjustment: a credit memo line posted to the account the user chose.
 const adjustmentTypes = ["ItemPromptDiscount", "ItemWriteOff"]
 const day = /^\d{4}-\d{2}-\d{2}$/
+const terms = () => ec.resource.script("component://mr-mantle/service/mantle/account/PaymentTerms.js")
 
 function dateInput(value, canonicalDay = null) {
     if (!value) denied("EFFECTIVE_DATE_REQUIRED", "Choose an effective accounting date")
@@ -219,8 +220,35 @@ function adjustmentRow(scope, date, byKey, row, index) {
         denied("ADJUSTMENT_REASON_REQUIRED", "Choose a discount or write-off and enter a reason")
     const target = byKey[key("invoice", row.invoiceId)],
         amount = lib.amount(row.amount, scope.currencyUomId)
-    if (!row.glAccountId) denied("ADJUSTMENT_ACCOUNT_REQUIRED", "Choose an explicit adjustment account")
-    const account = policy.account(scope.organizationPartyId, row.glAccountId, date.timestamp)
+    let glAccountId = row.glAccountId
+    // A prompt-payment discount the invoice's due schedule offers on the date posts to the discount account and is issued
+    // at once (create#InvoiceCreditMemo promptDiscount); any other discount or write-off names its account, and on a bill
+    // its credit is approved, which needs INVOICE_APPROVE.
+    // within the terms only on the side's discount account: a discount on another account is a write-off of the bill
+    let discountAccount = null
+    if (row.itemTypeEnumId === "ItemPromptDiscount")
+        try {
+            discountAccount = terms().discountAccount(scope.organizationPartyId, scope.direction === "receivable")
+        } catch (error) {
+            if (!glAccountId) throw error
+        }
+    const promptDiscount = row.itemTypeEnumId === "ItemPromptDiscount" && (!glAccountId || glAccountId === discountAccount)
+    if (promptDiscount) {
+        // open on the accounting date and today: a lapsed discount is not taken by dating the settlement back
+        const invoice = one(I, {invoiceId: row.invoiceId})
+        for (const onDate of [date.timestamp, ec.user.nowTimestamp]) {
+            const offered = terms().schedule(invoice, onDate).discountAvailable
+            if (offered.isZero() || amount.compare(offered) > 0)
+                denied("DISCOUNT_NOT_AVAILABLE", "The invoice's terms offer no discount of this amount on the date and today")
+        }
+        glAccountId = discountAccount
+    } else if (scope.direction === "payable" && !lib.has("INVOICE_APPROVE"))
+        denied(
+            "ADJUSTMENT_APPROVAL_REQUIRED",
+            "A write-off or a discount outside the bill's terms is approved as a credit; ask a user who approves bills"
+        )
+    if (!glAccountId) denied("ADJUSTMENT_ACCOUNT_REQUIRED", "Choose an explicit adjustment account")
+    const account = policy.account(scope.organizationPartyId, glAccountId, date.timestamp)
     return {
         rowSeq: String(index + 1),
         invoiceId: row.invoiceId,
@@ -229,7 +257,8 @@ function adjustmentRow(scope, date, byKey, row, index) {
         itemTypeDescription: one("moqui.basic.Enumeration", {enumId: row.itemTypeEnumId})?.description,
         amount: String(amount),
         currencyUomId: scope.currencyUomId,
-        glAccountId: row.glAccountId,
+        glAccountId,
+        promptDiscount,
         accountCode: account.row.accountCode,
         accountName: account.row.accountName,
         reason: String(row.reason).trim()
@@ -370,7 +399,7 @@ function normalized(p, lock = false) {
         accountingDate: date.day,
         allocations: allocationRows.map(row => policy.pick(row, ["sourceKey", "targetKey", "amount"])),
         adjustments: adjustmentRows.map(row =>
-            policy.pick(row, ["invoiceId", "itemTypeEnumId", "amount", "glAccountId", "reason"])
+            policy.pick(row, ["invoiceId", "itemTypeEnumId", "amount", "glAccountId", "reason", "promptDiscount"])
         ),
         sourceVersions
     }
@@ -556,10 +585,12 @@ function createAdjustment(row, plan, request) {
         amount: row.amount,
         itemTypeEnumId: row.itemTypeEnumId,
         overrideGlAccountId: row.glAccountId,
-        description: row.reason
+        description: row.reason,
+        promptDiscount: !!row.promptDiscount
     })
-    for (const statusId of receivable ? ["InvoiceFinalized"] : ["InvoiceReceived", "InvoiceApproved"])
-        call("update#" + I, {invoiceId: made.invoiceId, statusId, statusId_changeReason: row.reason})
+    if (!row.promptDiscount)
+        for (const statusId of receivable ? ["InvoiceFinalized"] : ["InvoiceReceived", "InvoiceApproved"])
+            call("update#" + I, {invoiceId: made.invoiceId, statusId, statusId_changeReason: row.reason})
     const invoiceIds = verifyPosting(rows(T, {invoiceId: made.invoiceId}), plan.lines, request.organizationPartyId)
     const application = writeApplication(
         {sourceKey: key("credit", made.invoiceId), targetKey: row.targetKey, amount: row.amount},

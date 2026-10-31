@@ -263,20 +263,26 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
     <service verb="store" noun="SettlementTerm" allow-remote="false">
-        <description>Create or change a due term in days, weeks or another time unit for future documents; no issued
-            invoice is recomputed. Refuses a user without finance administration, a stale revision, a missing
-            description, a negative value and a unit that is not a time unit.</description>
+        <description>Create or change a payment term for future documents: its due time in days, weeks or another time
+            unit, and with lines its installments and early-payment discounts (SettlementTermLine), which end the lines in
+            effect and start the new ones; with lines the term is due in the last line's days. No issued invoice is
+            recomputed: each keeps its InvoiceDueSchedule. Refuses a user without finance administration, a stale revision,
+            a missing description, a negative value, a unit that is not a time unit, and lines whose portions do not add up
+            to 100 percent or whose discount ends after its portion is due.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
             <parameter name="settlementTermId"/>
             <parameter name="description"/>
             <parameter name="termValue" type="BigDecimal"/>
             <parameter name="termValueUomId"/>
+            <parameter name="lines" type="Object"><description>The term's lines, a list (or its JSON) of maps with portionPercent,
+                daysBasis, discountPercent and discountDays; an empty list ends the lines, none leaves them.</description></parameter>
             <parameter name="changeReason"/>
             <parameter name="lastUpdatedStamp" type="Timestamp"/>
         </in-parameters>
         <out-parameters>
             <parameter name="settlementTermId"/>
+            <parameter name="linesChanged" type="Boolean"/>
         </out-parameters>
         <actions>
             <set field="policy" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')"/>
@@ -288,6 +294,12 @@ along with this software (see the LICENSE.md file). If not, see
                     <field-map field-name="settlementTermId"/>
                 </entity-find-one>
                 <script>policy.revision(oldTerm, lastUpdatedStamp)</script>
+            </if>
+            <set field="paymentTerms" value="component://mr-mantle/service/mantle/account/PaymentTerms.js"/>
+            <set field="lineDays" from="ec.resource.script(paymentTerms).lineDays(lines)"/>
+            <if condition="lineDays != null">
+                <set field="termValue" from="lineDays"/>
+                <set field="termValueUomId" value="TF_day"/>
             </if>
             <if condition="!description || termValue == null || toDecimal(termValue).compare(0) &lt; 0">
                 <return error="true" message="Give a due-term description and nonnegative value"/>
@@ -311,6 +323,8 @@ along with this software (see the LICENSE.md file). If not, see
                             disable-authz="true"/>
                 </else>
             </if>
+            <set field="linesChanged" from="ec.resource.script(paymentTerms).execute('storeLines', {settlementTermId:settlementTermId,
+                lines:lines, changeReason:changeReason}).linesChanged"/>
         </actions>
     </service>
     <service verb="get" noun="PaymentMethods" allow-remote="false">
@@ -446,6 +460,7 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="inherited" type="Boolean"/>
             <parameter name="costingMessage"/>
             <parameter name="terms" type="List"/>
+            <parameter name="termLines" type="List"/>
             <parameter name="currencies" type="List"/>
             <parameter name="currenciesCount" type="Integer"/>
             <parameter name="currenciesPageIndex" type="Integer"/>
@@ -462,6 +477,7 @@ along with this software (see the LICENSE.md file). If not, see
                     in-map="{organizationPartyId:organizationPartyId}"/>
             <if condition="!scope.organizationPartyId">
                 <set field="terms" from="[]"/>
+                <set field="termLines" from="[]"/>
                 <set field="currencies" from="[]"/>
                 <set field="currenciesCount" from="0"/>
                 <set field="rates" from="[]"/>
@@ -469,6 +485,8 @@ along with this software (see the LICENSE.md file). If not, see
             </if>
             <entity-find entity-name="mantle.account.invoice.SettlementTerm" list="settlementTerms" disable-authz="true"/>
             <set field="terms" from="Array.from(settlementTerms).map(policy.map)"/>
+            <set field="termLines" from="ec.resource.script('component://mr-mantle/service/mantle/account/PaymentTerms.js')
+                .execute('termLines', {}).termLines"/>
             <entity-find-count entity-name="moqui.basic.Uom" count-field="currenciesCount" disable-authz="true">
                 <econdition field-name="uomTypeEnumId" value="UT_CURRENCY_MEASURE"/>
             </entity-find-count>
