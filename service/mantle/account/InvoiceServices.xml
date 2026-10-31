@@ -4213,8 +4213,8 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="invoiceId"/>
             <parameter name="recordId"/>
             <parameter name="queue"><description>incoming, review (received, awaiting approval), held, approved, due (approved
-                and due within a week), credits, expenses (from a person: an employee's or contractor's bill) or all, the
-                default.</description></parameter>
+                and due within a week), credits, expenses (from a person: an employee's or contractor's bill; incoming or
+                received unless a status is given) or all, the default.</description></parameter>
             <parameter name="supplierPartyId"/>
             <parameter name="statusId"/>
             <parameter name="invoiceTypeEnumId"/>

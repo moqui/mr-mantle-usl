@@ -79,7 +79,11 @@ along with this software (see the LICENSE.md file). If not, see
         <member-entity entity-alias="INV" entity-name="mantle.account.invoice.Invoice" join-from-alias="HLD">
             <key-map field-name="invoiceId"/>
         </member-entity>
+        <member-entity entity-alias="FROMP" entity-name="mantle.party.Party" join-from-alias="INV">
+            <key-map field-name="fromPartyId" related="partyId"/>
+        </member-entity>
         <alias-all entity-alias="HLD"/>
+        <alias entity-alias="FROMP" name="fromPrivateOwnerUserId" field="privateOwnerUserId"/>
         <alias entity-alias="INV" name="fromPartyId"/>
         <alias entity-alias="INV" name="toPartyId"/>
         <alias entity-alias="INV" name="statusId"/>

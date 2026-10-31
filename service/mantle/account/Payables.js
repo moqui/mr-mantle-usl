@@ -78,7 +78,10 @@ function payableQuery(p) {
     else if (queue === "review") query = query.condition("statusId", "InvoiceReceived")
     else if (queue === "held") query = query.condition("invoiceId", "in", heldInvoiceIds(organizationPartyId))
     else if (queue === "credits") query = query.condition("invoiceTypeEnumId", "InvoiceCreditMemo")
-    else if (queue === "expenses") query = query.condition("fromPartyTypeEnumId", "PtyPerson")
+    else if (queue === "expenses") {
+        query = query.condition("fromPartyTypeEnumId", "PtyPerson")
+        if (!p.statusId) query = query.condition("statusId", "in", ["InvoiceIncoming", "InvoiceReceived"])
+    }
     else if (["approved", "due"].includes(queue)) {
         query = query.condition("statusId", "InvoiceApproved").condition("unpaidTotal", "greater", 0)
         if (queue === "due") query = query.condition("dueDate", "less", new Date(Number(ec.user.nowTimestamp) + 7 * dayMs))

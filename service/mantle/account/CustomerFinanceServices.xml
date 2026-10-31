@@ -277,7 +277,7 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <service-call name="mantle.account.CustomerFinanceServices.check#CustomerScope" disable-authz="true"
                     in-map="{organizationPartyId:organizationPartyId, customerPartyId:customerPartyId,
-                        permission:(side == 'supplier' ? 'PAYABLE_EDIT' : 'RECEIVABLE_EDIT')}"/>
+                        permission:(side == 'supplier' ? 'PAYABLE_EDIT' : 'RECEIVABLE_EDIT'), side:side}"/>
             <entity-find-one entity-name="moqui.basic.Enumeration" value-field="idType" cache="true" disable-authz="true">
                 <field-map field-name="enumId" from="partyIdTypeEnumId"/></entity-find-one>
             <if condition="idType?.enumTypeId != 'PartyIdType'">
@@ -319,7 +319,7 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <service-call name="mantle.account.CustomerFinanceServices.check#CustomerScope" disable-authz="true"
                     in-map="{organizationPartyId:organizationPartyId, customerPartyId:customerPartyId,
-                        permission:'TAX_STATEMENT_EDIT'}"/>
+                        permission:'TAX_STATEMENT_EDIT', side:side}"/>
             <entity-find-one entity-name="mantle.other.tax.TaxAuthority" value-field="taxAuthority" disable-authz="true"/>
             <if condition="taxAuthority == null">
                 <return error="true" message="TAX_AUTHORITY_INVALID: Choose a tax authority"/></if>
@@ -365,7 +365,7 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <service-call name="mantle.account.CustomerFinanceServices.check#CustomerScope" disable-authz="true"
                     in-map="{organizationPartyId:organizationPartyId, customerPartyId:customerPartyId,
-                        permission:'PAYMENT_EDIT'}"/>
+                        permission:'PAYMENT_EDIT', side:side}"/>
             <set field="workflow" value="component://mr-mantle/service/mantle/account/InvoiceWorkflow.js"/>
             <if condition="!ec.resource.script(workflow).execute('permissions', {permissions:['BANK_RECONCILE']}).BANK_RECONCILE">
                 <return error="true" message="PERMISSION_DENIED: BANK_RECONCILE authority is required"/></if>
