@@ -136,4 +136,365 @@
             <script>ec.context.putAll(ec.resource.script('component://mr-mantle/service/mantle/ledger/AssetBooks.js').execute('context',context))</script>
         </actions>
     </service>
+
+    <!-- Fixed asset books (impl-accounting P12, design-accounting §10; logic in FixedAssets.js): class defaults, the book
+        events of an asset and depreciation as a kind of period run. The organization is the asset's owner. -->
+    <service verb="store" noun="Class" allow-remote="false">
+        <description>Start a dated version of an organization's book defaults for an asset class (ACCOUNTING_ADMIN): useful
+            life, residual percent, book and tax methods and accounts. Given the version it replaces (fixedAssetClassId),
+            the new one starts at fromDate and the old one ends there; given only that version and a thruDate, it ends the
+            version. Key fields are audit-logged with the change reason. Refuses a class that is not an AssetClass, a type
+            that is not a fixed asset type, a life outside 1 to 100 years, a residual outside 0 to 99 percent, a missing
+            method, an account not assigned to the organization, dates that do not follow, an overlapping version
+            (CLASS_OVERLAP) and a missing reason.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="fixedAssetClassId"/>
+            <parameter name="classEnumId"/>
+            <parameter name="assetTypeEnumId"/>
+            <parameter name="description"/>
+            <parameter name="fromDate" type="Timestamp"/>
+            <parameter name="thruDate" type="Timestamp"/>
+            <parameter name="usefulLifeYears" type="Integer"/>
+            <parameter name="salvagePercent" type="BigDecimal"/>
+            <parameter name="depreciationTypeEnumId"/>
+            <parameter name="taxDepreciationTypeEnumId"/>
+            <parameter name="assetGlAccountId"/>
+            <parameter name="accDepreciationGlAccountId"/>
+            <parameter name="depreciationGlAccountId"/>
+            <parameter name="gainGlAccountId"/>
+            <parameter name="lossGlAccountId"/>
+            <parameter name="changeReason"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="fixedAssetClassId"/>
+        </out-parameters>
+        <actions>
+            <set field="answer" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FixedAssets.js')
+                    .execute('storeClass', context)"/>
+            <set field="fixedAssetClassId" from="answer.fixedAssetClassId"/>
+        </actions>
+    </service>
+    <service verb="capitalize" noun="Asset" allow-remote="false">
+        <description>Put a fixed asset in service on the books (ACCOUNTING_GL_POST in its owner organization): its
+            class's version in effect on the in-service day fills what is not given (useful life, residual, method,
+            accounts), the asset takes that basis and its own account row, and an asset not received posts its cost from
+            the offset account given, else the Unreceived Fixed Asset clearing account (a received one is on the books from
+            its receipt, reclassified when the class's asset account differs; one whose receipt has not posted is refused,
+            RECEIPT_NOT_POSTED). Writes an AbeCapitalize book event; a retry with the same operation key
+            answers the first. Refuses a closed period, an asset already capitalized or disposed, another currency, a
+            received asset's cost changed here (COST_FROM_RECEIPT), a source that is not the asset's receipt or the
+            organization's bill, and missing accounts.</description>
+        <in-parameters>
+            <parameter name="assetId" required="true"/>
+            <parameter name="classEnumId"/>
+            <parameter name="inServiceDate" type="Date"/>
+            <parameter name="acquireCost" type="BigDecimal"/>
+            <parameter name="acquireCostUomId"/>
+            <parameter name="usefulLifeYears" type="Integer"/>
+            <parameter name="salvageValue" type="BigDecimal"/>
+            <parameter name="depreciationTypeEnumId"/>
+            <parameter name="assetGlAccountId"/>
+            <parameter name="accDepreciationGlAccountId"/>
+            <parameter name="depreciationGlAccountId"/>
+            <parameter name="sourceInvoiceId"/>
+            <parameter name="sourceAssetReceiptId"/>
+            <parameter name="offsetGlAccountId"/>
+            <parameter name="changeReason"/>
+            <parameter name="operationKey" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="assetBookEventId"/>
+            <parameter name="acctgTransId"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="answer" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FixedAssets.js')
+                    .execute('capitalize', context)"/>
+            <set field="assetBookEventId" from="answer.assetBookEventId"/>
+            <set field="acctgTransId" from="answer.acctgTransId"/>
+            <set field="alreadyApplied" from="answer.alreadyApplied"/>
+        </actions>
+    </service>
+    <service verb="adjust" noun="AssetBook" allow-remote="false">
+        <description>Change a capitalized asset's book basis from a day forward (ACCOUNTING_GL_POST): a change in cost
+            posts against the Unreceived Fixed Asset clearing account, a change in useful life moves its end, a change in
+            residual its salvage value; later depreciation uses the new basis. A received asset's change of cost needs the
+            offset account it comes from (OFFSET_REQUIRED). Writes an AbeAdjust book event with the net
+            book before and after. Refuses a closed period, an asset not capitalized or disposed, no change, a day before
+            posted depreciation (DEPRECIATED_AFTER), a residual not below the cost, a cost below the depreciation posted
+            (BOOK_NEGATIVE), a life ending by the day and a missing reason.</description>
+        <in-parameters>
+            <parameter name="assetId" required="true"/>
+            <parameter name="effectiveDate" type="Date"/>
+            <parameter name="costChange" type="BigDecimal"/>
+            <parameter name="usefulLifeChange" type="Integer"/>
+            <parameter name="salvageChange" type="BigDecimal"/>
+            <parameter name="offsetGlAccountId"/>
+            <parameter name="changeReason"/>
+            <parameter name="operationKey" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="assetBookEventId"/>
+            <parameter name="acctgTransId"/>
+            <parameter name="netBookBefore" type="BigDecimal"/>
+            <parameter name="netBookAfter" type="BigDecimal"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="answer" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FixedAssets.js')
+                    .execute('adjust', context)"/>
+            <set field="assetBookEventId" from="answer.assetBookEventId"/>
+            <set field="acctgTransId" from="answer.acctgTransId"/>
+            <set field="netBookBefore" from="answer.netBookBefore"/>
+            <set field="netBookAfter" from="answer.netBookAfter"/>
+            <set field="alreadyApplied" from="answer.alreadyApplied"/>
+        </actions>
+    </service>
+    <service verb="dispose" noun="Asset" allow-remote="false">
+        <description>Scrap or sell a capitalized asset (ACCOUNTING_GL_POST): its cost and accumulated depreciation leave
+            the books, a sale's proceeds go to the clearing account its invoice line credits (the asset's Unissued Fixed
+            Asset account), and the difference posts as a gain or a loss; the asset ends its life on the day and is kept.
+            Writes an AbeDispose book event. Refuses a closed period, an asset not capitalized or already disposed, a day
+            before it went in service or before posted depreciation, a month before the disposal not yet depreciated
+            (DEPRECIATION_DUE), an invoice without a line to the clearing account, a sale without proceeds, proceeds on a
+            scrap, an invoice that is not the organization's to the buyer or that sells the asset itself
+            (ASSET_SOLD_BY_INVOICE) and a missing reason.</description>
+        <in-parameters>
+            <parameter name="assetId" required="true"/>
+            <parameter name="disposalDate" type="Date"/>
+            <parameter name="disposalTypeEnumId"/>
+            <parameter name="proceedsAmount" type="BigDecimal"/>
+            <parameter name="buyerPartyId"/>
+            <parameter name="salesInvoiceId"/>
+            <parameter name="changeReason"/>
+            <parameter name="operationKey" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="assetBookEventId"/>
+            <parameter name="acctgTransId"/>
+            <parameter name="gainLossAmount" type="BigDecimal"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="answer" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FixedAssets.js')
+                    .execute('dispose', context)"/>
+            <set field="assetBookEventId" from="answer.assetBookEventId"/>
+            <set field="acctgTransId" from="answer.acctgTransId"/>
+            <set field="gainLossAmount" from="answer.gainLossAmount"/>
+            <set field="alreadyApplied" from="answer.alreadyApplied"/>
+        </actions>
+    </service>
+    <service verb="reverse" noun="AssetBookEvent" allow-remote="false">
+        <description>Reverse an asset's latest capitalization, adjustment or disposal in force
+            (ACCOUNTING_GL_POST): a dated reversal of its posting in an open period, and the asset's book basis and accounts
+            as they were before it. Writes an AbeReversal book event linked to it. Refuses another kind of event, one
+            already reversed, one with a later event in force (EVENT_NOT_LATEST), a capitalization or adjustment that
+            depreciation has used since (EVENT_DEPRECIATED), a day before the event or in a closed period and a missing
+            reason.</description>
+        <in-parameters>
+            <parameter name="assetBookEventId" required="true"/>
+            <parameter name="reversalDate" type="Date"/>
+            <parameter name="changeReason"/>
+            <parameter name="operationKey" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="assetBookEventId"/>
+            <parameter name="acctgTransId"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="answer" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FixedAssets.js')
+                    .execute('reverse', context)"/>
+            <set field="assetBookEventId" from="answer.assetBookEventId"/>
+            <set field="acctgTransId" from="answer.acctgTransId"/>
+            <set field="alreadyApplied" from="answer.alreadyApplied"/>
+        </actions>
+    </service>
+    <service verb="repair" noun="AcquireCost" allow-remote="false">
+        <description>Rewrite one asset's acquire cost as audited data repair (ACCOUNTING_ADMIN), through
+            mantle.product.AssetServices.update#AssetAcquireCost, which reposts its receipts, issuances and counts: only
+            while every posted transaction of the asset is in an open period (F39), and never on a capitalized asset
+            (ASSET_CAPITALIZED: adjust the book) or a disposed one. Writes an AbeCostRepair book event with
+            the old and new cost. Refuses a period closed for any of its postings (PERIOD_CLOSED), a cost that is not
+            positive and a missing reason.</description>
+        <in-parameters>
+            <parameter name="assetId" required="true"/>
+            <parameter name="acquireCost" type="BigDecimal"/>
+            <parameter name="changeReason"/>
+            <parameter name="operationKey" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="assetBookEventId"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="answer" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FixedAssets.js')
+                    .execute('repairCost', context)"/>
+            <set field="assetBookEventId" from="answer.assetBookEventId"/>
+            <set field="alreadyApplied" from="answer.alreadyApplied"/>
+        </actions>
+    </service>
+    <service verb="get" noun="AssetBook" allow-remote="false">
+        <description>A fixed asset's book for EquipmentDetail, for a user with Accounting read authority in its owner
+            organization: its identity, book basis, accumulated depreciation and net book, its accounts, its class's
+            defaults in effect today, its book events (with which may be reversed), its depreciation by period and its
+            receipts, each with its transaction, and what the user may do. Refuses another organization's asset
+            (ASSET_UNAVAILABLE) and an asset that is not a fixed asset.</description>
+        <in-parameters>
+            <parameter name="assetId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="asset" type="Map"/>
+            <parameter name="accounts" type="List"/>
+            <parameter name="classDefaults" type="Map"/>
+            <parameter name="events" type="List"/>
+            <parameter name="depreciations" type="List"/>
+            <parameter name="receipts" type="List"/>
+            <parameter name="canCapitalize" type="Boolean"/>
+            <parameter name="canAdjust" type="Boolean"/>
+            <parameter name="canDispose" type="Boolean"/>
+            <parameter name="canRepair" type="Boolean"/>
+            <parameter name="canPostLedger" type="Boolean"/>
+            <parameter name="periodOpen" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="answer" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FixedAssets.js')
+                    .execute('book', context)"/>
+            <set field="asset" from="answer.asset"/>
+            <set field="accounts" from="answer.accounts"/>
+            <set field="classDefaults" from="answer.classDefaults"/>
+            <set field="events" from="answer.events"/>
+            <set field="depreciations" from="answer.depreciations"/>
+            <set field="receipts" from="answer.receipts"/>
+            <set field="canCapitalize" from="answer.canCapitalize"/>
+            <set field="canAdjust" from="answer.canAdjust"/>
+            <set field="canDispose" from="answer.canDispose"/>
+            <set field="canRepair" from="answer.canRepair"/>
+            <set field="canPostLedger" from="answer.canPostLedger"/>
+            <set field="periodOpen" from="answer.periodOpen"/>
+        </actions>
+    </service>
+    <service verb="preview" noun="Depreciation" allow-remote="false">
+        <description>Preview a fiscal month's depreciation of the organization's fixed assets
+            (ACCOUNTING_GL_POST), all of them or those of a class or chosen: a period run of kind PrkDepreciation
+            (PeriodRunServices.preview#Run), one result per asset not yet depreciated for the month, an asset that cannot
+            be computed a failed result. Refuses a closed period and a period that is not a fiscal month.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="timePeriodId" required="true"/>
+            <parameter name="effectiveDate" type="Date"/>
+            <parameter name="classEnumId"/>
+            <parameter name="assetIdList" type="List"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="periodRunId"/>
+            <parameter name="calculationVersion"/>
+            <parameter name="resultCount" type="Integer"/>
+            <parameter name="failedCount" type="Integer"/>
+            <parameter name="totalAmount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <set field="answer" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FixedAssets.js')
+                    .execute('previewDepreciation', context)"/>
+            <set field="periodRunId" from="answer.periodRunId"/>
+            <set field="calculationVersion" from="answer.calculationVersion"/>
+            <set field="resultCount" from="answer.resultCount"/>
+            <set field="failedCount" from="answer.failedCount"/>
+            <set field="totalAmount" from="answer.totalAmount"/>
+        </actions>
+    </service>
+    <service verb="get" noun="DepreciationPreview" allow-remote="false">
+        <description>A depreciation run (PeriodRunServices.get#Run) with each asset's cost, residual,
+            depreciation before the period, the period's amount and the net book after it. Refuses a user without Accounting
+            read authority in the run's organization and a run of another kind.</description>
+        <in-parameters>
+            <parameter name="periodRunId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="run" type="Map"/>
+            <parameter name="results" type="List"/>
+        </out-parameters>
+        <actions>
+            <set field="answer" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FixedAssets.js')
+                    .execute('depreciationPreview', context)"/>
+            <set field="run" from="answer.run"/>
+            <set field="results" from="answer.results"/>
+        </actions>
+    </service>
+    <service verb="post" noun="Depreciation" allow-remote="false">
+        <description>Post a reviewed depreciation run (ACCOUNTING_GL_POST) through PeriodRunServices.post#Run: each
+            asset-period once, each in its own transaction with its depreciation row, an asset that does not post a failed
+            result with no row. Refuses a run of another kind, a changed run (RUN_CHANGED) and a closed period.</description>
+        <in-parameters>
+            <parameter name="periodRunId" required="true"/>
+            <parameter name="calculationVersion" required="true"/>
+            <parameter name="operationKey" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="statusId"/>
+            <parameter name="postedCount" type="Integer"/>
+            <parameter name="failedCount" type="Integer"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="answer" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FixedAssets.js')
+                    .execute('postDepreciation', context)"/>
+            <set field="statusId" from="answer.statusId"/>
+            <set field="postedCount" from="answer.postedCount"/>
+            <set field="failedCount" from="answer.failedCount"/>
+            <set field="alreadyApplied" from="answer.alreadyApplied"/>
+        </actions>
+    </service>
+    <service verb="calculate" noun="DepreciationRun" allow-remote="false">
+        <description>The depreciation period run's results (PeriodRunKind PrkDepreciation): the
+            organization's fixed assets with a method, in service by the month's end, not disposed by it and not yet
+            depreciated for it, each with the month's amount (calculate#FixedAssetDepreciation) and accounts, or why it
+            cannot be computed. Called by PeriodRunServices.preview#Run and post#Run, which check the permission.</description>
+        <implements service="mantle.ledger.PeriodRunServices.define#RunCalculation"/>
+        <out-parameters>
+            <parameter name="results" type="List"/>
+        </out-parameters>
+        <actions>
+            <set field="answer" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FixedAssets.js')
+                    .execute('calculateRun', context)"/>
+            <set field="results" from="answer.results"/>
+        </actions>
+    </service>
+    <service verb="post" noun="DepreciationRun" allow-remote="false">
+        <description>Post a previewed depreciation run: each ready result's asset through
+            post#AssetPeriodDepreciation in its own transaction, posted or failed with its reason. Called by
+            PeriodRunServices.post#Run.</description>
+        <implements service="mantle.ledger.PeriodRunServices.define#RunPosting"/>
+        <out-parameters>
+            <parameter name="postedCount" type="Integer"/>
+            <parameter name="failedCount" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <set field="answer" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FixedAssets.js')
+                    .execute('postRun', context)"/>
+            <set field="postedCount" from="answer.postedCount"/>
+            <set field="failedCount" from="answer.failedCount"/>
+        </actions>
+    </service>
+    <service verb="post" noun="AssetPeriodDepreciation" allow-remote="false">
+        <description>One asset's depreciation for a fiscal month, through
+            AssetAutoPostServices.calculateAndPost#FixedAssetDepreciation, with its depreciation row: refused when the asset
+            is already depreciated for the month, has nothing to post or its transaction did not post, so the caller's
+            transaction rolls back and leaves no row (F38). Called in a new transaction by post#DepreciationRun.</description>
+        <in-parameters>
+            <parameter name="assetId" required="true"/>
+            <parameter name="timePeriodId" required="true"/>
+            <parameter name="transactionDate" type="Timestamp"/>
+            <parameter name="expectedAmount" type="BigDecimal"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="acctgTransId"/>
+        </out-parameters>
+        <actions>
+            <set field="answer" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FixedAssets.js')
+                    .execute('postAssetPeriod', context)"/>
+            <set field="acctgTransId" from="answer.acctgTransId"/>
+        </actions>
+    </service>
 </services>
