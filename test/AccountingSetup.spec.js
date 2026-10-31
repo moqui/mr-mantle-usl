@@ -109,7 +109,6 @@ feature("finance administration sets up a new organization from the chart templa
         stale.includes("STALE_REVISION")
         preference.baseCurrencyUomId == "USD"
         preference.postingGuardEnabled == "Y"
-        preference.singleCurrencyDocumentsOnly == "Y"
         run.statusId == "AsrDraft"
         run.sourcePartyId == "DefaultSettings"
         run.migrationGlAccountId == "913000000"
@@ -279,8 +278,8 @@ feature("readiness names the untied open items and blocks activation, which post
         r.row("OPEN_ITEM_TIE").detailText.includes("open items 500.00") || r.row("OPEN_ITEM_TIE").detailText.includes("open items 700.00")
         r.row("OPENING_BALANCED").status == "blocker"
         r.row("POSTING_GUARD").status == "ok"
-        r.row("SINGLE_CURRENCY").status == "ok"
-        r.row("SINGLE_CURRENCY").message.includes("Single currency until base-currency posting")
+        r.row("EXCHANGE_RATES").status == "ok"
+        !r.before.readinessRows.some(row => row.code == "SINGLE_CURRENCY")
         r.row("REMINDER_JOB").status == "ok"
         r.row("POSTED_HISTORY").status == "ok"
         r.row("PRODUCTION_ACCOUNTS").status == "warning"

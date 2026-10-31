@@ -441,8 +441,7 @@ feature("statements are by customer and currency, for a receivables editor", {
         const statementFixture = helper().fixtures("NATIVE_STMT")
         helper().call("update#mantle.ledger.config.PartyAcctgPreference", {
             organizationPartyId: statementFixture.org,
-            postingGuardEnabled: "N",
-            singleCurrencyDocumentsOnly: "N"
+            postingGuardEnabled: "N"
         })
         for (const [amount, currency] of [
             ["31", "USD"],
