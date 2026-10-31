@@ -667,6 +667,33 @@ along with this software (see the LICENSE.md file). If not, see
 
     <service verb="process" noun="ReturnItemResponses">
         <description>
+            Process responses for items with statuses other than Created, Requested, or Cancelled (respond#ReturnItems).
+            Refused for a return of an organization with PartyAcctgPreference.returnSettlementRequired
+            (RETURN_SETTLEMENT_REQUIRED): its responses come only from settle#Return.
+        </description>
+        <in-parameters>
+            <parameter name="returnId" required="true"/>
+            <parameter name="returnItemSeqId"><description>If not specified try processing all items</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="returnInvoiceId"/>
+            <parameter name="creditPaymentId"/>
+            <parameter name="refundPaymentId"/>
+            <parameter name="replacementOrderIds" type="List"/>
+        </out-parameters>
+        <actions>
+            <service-call name="mantle.order.ReturnServices.get#ReturnSettlementMode" out-map="settlementMode"
+                    in-map="{returnId:returnId}"/>
+            <if condition="settlementMode.settlementRequired">
+                <return error="true"
+                        message="RETURN_SETTLEMENT_REQUIRED: Return ${returnId} is credited, refunded or replaced when settled"/>
+            </if>
+            <service-call name="mantle.order.ReturnServices.respond#ReturnItems" out-map="context"
+                    in-map="{returnId:returnId, returnItemSeqId:returnItemSeqId}"/>
+        </actions>
+    </service>
+    <service verb="respond" noun="ReturnItems" allow-remote="false">
+        <description>
             Process responses for items with statuses other than Created, Requested, or Cancelled.
             Called by SECA rule on ReturnHeader Approved and ReturnItem Received statuses.
             If ReturnItem.responseImmediate = 'Y' process on Approved status or later (Shipped, Received, Completed).
@@ -676,19 +703,22 @@ along with this software (see the LICENSE.md file). If not, see
             With settlement (settle#Return, which has checked eligibility, authority and the caps under lock) it responds
             for the quantities given whatever the item's status and earlier responses, links each billing to its receipt
             and original invoice line, adds to the item's response amount, refunds through create#RefundPayment against
-            the original payment (refundForPaymentId) as a promised refund for the credit memo, and completes no item.
+            the original payments (refundSources) as promised refunds for the credit memo, leaves the credit memo in process
+            for settle#Return to finalize, records a replaced quantity on the item, and completes no item.
         </description>
         <in-parameters>
             <parameter name="returnId" required="true"/>
             <parameter name="returnItemSeqId"><description>If not specified try processing all items (most common)</description></parameter>
             <parameter name="settlement" type="Map"><description>From settle#Return: quantities (returnItemSeqId to
                 quantity), receipts (returnItemSeqId to assetReceiptId), originals (returnItemSeqId to a map of invoiceId and
-                invoiceItemSeqId), refundForPaymentId, and billingFields for each ReturnItemBilling.</description></parameter>
+                invoiceItemSeqId), unitAmounts (returnItemSeqId to the unit amount credited), refundSources (maps of paymentId
+                and amount), and billingFields for each ReturnItemBilling.</description></parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="returnInvoiceId"/>
             <parameter name="creditPaymentId"/>
             <parameter name="refundPaymentId"/>
+            <parameter name="refundPaymentIds" type="List"/>
             <parameter name="replacementOrderIds" type="List"/>
         </out-parameters>
         <actions>
@@ -720,6 +750,7 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="placedOrderOut" from="null"/>
             <set field="faPaymentOut" from="null"/>
             <set field="refundPmntOut" from="null"/>
+            <set field="refundPaymentIds" from="[]"/>
             <set field="paymentMethodId" from="null"/>
             <iterate list="returnItemList" entry="returnItem">
                 <if condition="settlement"><then>
@@ -743,6 +774,8 @@ along with this software (see the LICENSE.md file). If not, see
                     <set field="amountRemaining" from="(returnItem.responseAmount != null &amp;&amp; !toDecimal(returnItem.responseAmount).isZero() ? toDecimal(returnItem.responseAmount) : itemQuantity.multiply(itemAmount)).setScale(2, 'HALF_UP')"/>
                     <if condition="settlement">
                         <set field="itemQuantity" from="toDecimal(settlement.quantities[returnItem.returnItemSeqId])"/>
+                        <if condition="settlement.unitAmounts?.[returnItem.returnItemSeqId] != null">
+                            <set field="itemAmount" from="toDecimal(settlement.unitAmounts[returnItem.returnItemSeqId])"/></if>
                         <set field="amountRemaining" from="ec.l10n.roundCurrency(itemQuantity.multiply(itemAmount),
                                 returnHeader.currencyUomId)"/>
                     </if>
@@ -957,15 +990,25 @@ along with this software (see the LICENSE.md file). If not, see
                     -->
 
                     <if condition="settlement"><then>
-                        <!-- a settlement refunds the original payment it chose, for the credit memo -->
-                        <if condition="!settlement.refundForPaymentId">
-                            <return error="true" message="REFUND_SOURCE_REQUIRED: A refund needs the original payment"/></if>
-                        <service-call name="mantle.account.PaymentServices.create#RefundPayment" out-map="refundPmntOut"
-                                out-map-add-to-existing="false"
-                                in-map="{paymentId:settlement.refundForPaymentId, amount:paymentTotal, statusId:'PmntPromised',
-                                    comments:'Refund for return ' + returnId}"/>
-                        <service-call name="update#mantle.account.payment.Payment"
-                                in-map="{paymentId:refundPmntOut.paymentId, forInvoiceId:returnInvoiceId}"/>
+                        <!-- a settlement refunds the original payments it chose, each for its share, for the credit memo -->
+                        <set field="sourceTotal" from="Array.from(settlement.refundSources ?? [])
+                                .reduce((total, source) =&gt; total.add(source.amount), toDecimal(0))"/>
+                        <if condition="sourceTotal.compare(paymentTotal) != 0">
+                            <return error="true"
+                                    message="REFUND_SOURCE_REQUIRED: The refund's original payments do not cover it"/>
+                        </if>
+                        <iterate list="Array.from(settlement.refundSources)" entry="refundSource">
+                            <service-call name="mantle.account.PaymentServices.create#RefundPayment" out-map="refundPmntOut"
+                                    out-map-add-to-existing="false"
+                                    in-map="{paymentId:refundSource.paymentId, amount:refundSource.amount,
+                                        statusId:'PmntPromised', comments:'Refund for return ' + returnId}"/>
+                            <service-call name="update#mantle.account.payment.Payment"
+                                    in-map="{paymentId:refundPmntOut.paymentId, forInvoiceId:returnInvoiceId}"/>
+                            <script>refundPaymentIds.push(refundPmntOut.paymentId)</script>
+                            <if condition="refundPaymentIds.length == 1">
+                                <set field="firstRefundOut" from="refundPmntOut"/></if>
+                        </iterate>
+                        <set field="refundPmntOut" from="firstRefundOut"/>
                     </then><else>
                     <!-- NOTE: don't specify paymentInstrumentEnumId, create#Payment will determine from toPaymentMethodId or default to PiCompanyCheck (paymentInstrumentEnumId:'PiCompanyCheck',) -->
                     <service-call name="mantle.account.PaymentServices.create#Payment" out-map="refundPmntOut" out-map-add-to-existing="false"
@@ -1019,6 +1062,12 @@ along with this software (see the LICENSE.md file). If not, see
                 <iterate list="replaceItemList" entry="returnItem">
                     <set field="replaceOrderId" from="approvedItemSet.includes(returnItem.returnItemSeqId) ? approvedOrderOut.orderId : placedOrderOut.orderId"/>
                     <set field="itemQuantity" from="returnItem.receivedQuantity != null &amp;&amp; !toDecimal(returnItem.receivedQuantity).isZero() ? returnItem.receivedQuantity : returnItem.returnQuantity"/>
+                    <!-- a settlement replaces the quantity it gives, and records it: replacing credits nothing -->
+                    <if condition="settlement">
+                        <set field="itemQuantity" from="toDecimal(settlement.quantities[returnItem.returnItemSeqId])"/>
+                        <set field="returnItem.replacedQuantity"
+                                from="toDecimal(returnItem.replacedQuantity ?? 0).add(itemQuantity)"/>
+                    </if>
 
                     <service-call name="mantle.order.OrderServices.add#OrderProductQuantity"
                             in-map="{orderId:replaceOrderId, productId:(returnItem.replacementProductId || returnItem.productId),
@@ -1041,7 +1090,10 @@ along with this software (see the LICENSE.md file). If not, see
                             shipmentMethodEnumId:returnHeader.shipmentMethodEnumId}"/>
                     <!-- place and approve order, come from here ready to ship -->
                     <service-call name="mantle.order.OrderServices.place#Order" in-map="{orderId:approvedOrderOut.orderId}"/>
-                    <service-call name="mantle.order.OrderServices.approve#Order" in-map="{orderId:approvedOrderOut.orderId}"/>
+                    <!-- a settler without order approval leaves the replacement placed, for the order's approver -->
+                    <if condition="!settlement || ec.user.hasPermission('ORDER_APPROVE')">
+                        <service-call name="mantle.order.OrderServices.approve#Order"
+                                in-map="{orderId:approvedOrderOut.orderId}"/></if>
                 </if>
                 <if condition="placedOrderOut">
                     <service-call name="mantle.order.OrderServices.set#OrderBillingShippingInfo"
@@ -1071,16 +1123,17 @@ along with this software (see the LICENSE.md file). If not, see
                             <break/>
                         </if>
                     </iterate>
-                    <if condition="approveOrder">
+                    <if condition="approveOrder &amp;&amp; (!settlement || ec.user.hasPermission('ORDER_APPROVE'))">
                         <service-call name="mantle.order.OrderServices.approve#Order" in-map="{orderId:originalReplacementOrderId}"/>
                     </if>
                 </if>
             </iterate>
 
             <!-- if returnInvoiceId set statusId to InvoiceApproved, trigger payment applications based on forInvoiceId -->
-            <if condition="returnInvoiceId">
+            <!-- a settlement's credit memo is finalized by settle#Return through change#InvoiceState -->
+            <if condition="returnInvoiceId &amp;&amp; !settlement">
                 <service-call name="update#mantle.account.invoice.Invoice"
-                        in-map="{invoiceId:returnInvoiceId, statusId:(settlement ? 'InvoiceFinalized' : 'InvoiceApproved')}"/>
+                        in-map="{invoiceId:returnInvoiceId, statusId:'InvoiceApproved'}"/>
             </if>
             <set field="creditPaymentId" from="faPaymentOut?.paymentId"/>
             <set field="refundPaymentId" from="refundPmntOut?.paymentId"/>
@@ -1522,6 +1575,19 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="settlementRequired" from="preferenceOut.partyAcctgPreference?.returnSettlementRequired == 'Y'"/>
         </actions>
     </service>
+    <service verb="sync" noun="ReturnShipmentReceipts" allow-remote="false">
+        <description>For an organization with returnSettlementRequired, a return shipment delivered after a receipt through
+            Mantle's own services (receive#ShipmentProduct, as a SimpleScreens receipt does): each item's received quantity
+            becomes what its receipts hold, accepted and rejected, never more than authorized and never less than recorded,
+            with no response processed, so settle#Return has it to settle. Run by ShipmentDeliveredReturnReceive in place
+            of receive#ReturnShipmentItems; what receive#ReturnItems recorded is not counted again.</description>
+        <in-parameters><parameter name="shipmentId" required="true"/></in-parameters>
+        <out-parameters><parameter name="syncedItems" type="List"/></out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/order/ReturnSettlement.js"/>
+            <set field="syncedItems" from="ec.resource.script(module).execute('syncReceived', context).syncedItems"/>
+        </actions>
+    </service>
     <service verb="define" noun="ReturnSettlementRequest" type="interface">
         <in-parameters>
             <parameter name="returnId" required="true"/>
@@ -1592,7 +1658,8 @@ along with this software (see the LICENSE.md file). If not, see
                 confirmed</description></parameter>
             <parameter name="creditInvoiceIds" type="List"/>
             <parameter name="creditPaymentId"/>
-            <parameter name="refundPaymentId"/>
+            <parameter name="refundPaymentId"><description>The first refund</description></parameter>
+            <parameter name="refundPaymentIds" type="List"><description>A refund per original payment</description></parameter>
             <parameter name="refundStatusId"/>
             <parameter name="replacementOrderIds" type="List"/>
             <parameter name="settledLines" type="List"/>

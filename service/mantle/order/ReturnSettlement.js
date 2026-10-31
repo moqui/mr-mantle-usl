@@ -49,7 +49,79 @@ function standing(billings) {
     return billings.filter(row => !cancelled.has(row.invoiceId))
 }
 
-// ---- receipt (WarehouseTaskServices.receive#ReturnItems)
+// ---- receipt (WarehouseTaskServices.receive#ReturnItems, and Mantle's own receipt under the flag)
+
+// An item's received quantity, and its status once all it authorizes arrived (ReturnManResp for a manual response); its
+// non-product children (adjustments) follow it, prorated.
+function recordReceived(item, received) {
+    const full = received.compare(dec(item.returnQuantity)) >= 0
+    const manual = item.returnResponseEnumId === "RrspManual" && !item.responseDate
+    const statusId = full && receivableStatuses.includes(item.statusId) ? "ReturnReceived" : item.statusId
+    call("update#" + RI, {
+        returnId: item.returnId,
+        returnItemSeqId: item.returnItemSeqId,
+        receivedQuantity: received,
+        statusId
+    })
+    if (full && manual && statusId === "ReturnReceived")
+        call("update#" + RI, {returnId: item.returnId, returnItemSeqId: item.returnItemSeqId, statusId: "ReturnManResp"})
+    const ratio = dec(item.returnQuantity).isZero()
+        ? toDecimal(1)
+        : min(toDecimal(1), received.divide(dec(item.returnQuantity)).setScale(6, "HALF_UP"))
+    for (const child of rows(RI, {returnId: item.returnId, parentItemSeqId: item.returnItemSeqId})) {
+        if (!receivableStatuses.includes(child.statusId)) continue
+        call("update#" + RI, {
+            returnId: child.returnId,
+            returnItemSeqId: child.returnItemSeqId,
+            receivedQuantity: dec(child.returnQuantity ?? 1).multiply(ratio),
+            statusId: full ? "ReturnReceived" : child.statusId
+        })
+    }
+    return {
+        returnId: item.returnId,
+        returnItemSeqId: item.returnItemSeqId,
+        receivedQuantity: received,
+        statusId: full && statusId === "ReturnReceived" ? (manual ? "ReturnManResp" : "ReturnReceived") : statusId
+    }
+}
+function headerReceived(returnId) {
+    call("mantle.order.ReturnServices.checkUpdate#ReturnHeaderStatus", {
+        returnId,
+        statusId: "ReturnReceived",
+        itemStatusIds: ["ReturnReceived", "ReturnManResp", "ReturnCompleted", "ReturnCancelled"]
+    })
+    call("mantle.order.ReturnServices.checkUpdate#ReturnHeaderStatus", {
+        returnId,
+        statusId: "ReturnManResp",
+        itemStatusIds: ["ReturnReceived", "ReturnManResp", "ReturnCancelled"]
+    })
+}
+// Under returnSettlementRequired, a return shipment received through Mantle's own services (receive#ShipmentProduct and
+// deliver#Shipment, as a SimpleScreens receipt does) sets each item's received quantity to what its receipts hold,
+// accepted and rejected, and processes no response. What receive#ReturnItems already recorded is not counted again.
+function syncReceived(p) {
+    const keys = [
+        ...new Set(
+            rows("mantle.shipment.ShipmentItemSource", {shipmentId: p.shipmentId})
+                .filter(row => row.returnId && row.returnItemSeqId)
+                .map(row => row.returnId + ":" + row.returnItemSeqId)
+        )
+    ].sort()
+    const touched = new Set()
+    const syncedItems = []
+    for (const key of keys) {
+        const [returnId, returnItemSeqId] = key.split(":")
+        const item = find(RI, {returnId, returnItemSeqId}).forUpdate(true).one()
+        if (!item || !receivableStatuses.includes(item.statusId)) continue
+        const receipts = rows(AR, {returnId, returnItemSeqId})
+        const received = min(sum(receipts, "quantityAccepted").add(sum(receipts, "quantityRejected")), dec(item.returnQuantity))
+        if (received.compare(dec(item.receivedQuantity)) <= 0) continue
+        syncedItems.push(recordReceived(item, received))
+        touched.add(returnId)
+    }
+    for (const returnId of touched) headerReceived(returnId)
+    return {syncedItems}
+}
 
 function receive(p) {
     if (!has("STOCK_RECEIVE")) denied("PERMISSION_DENIED", "Stock receive authority is required")
@@ -122,8 +194,8 @@ function receive(p) {
             })
             if (out.assetReceiptId) assetReceiptIds.push(out.assetReceiptId)
         } else {
-            // units rejected at the dock are received without stock, so nothing is posted
-            const receipt = ec.entity.makeValue(AR).setAll({
+            // units rejected at the dock are received without stock, so post#AssetReceipt posts nothing
+            const out = call("create#" + AR, {
                 productId: item.productId,
                 shipmentId: p.shipmentId,
                 shipmentItemSourceId: source.shipmentItemSourceId,
@@ -135,13 +207,7 @@ function receive(p) {
                 quantityRejected: rejected,
                 rejectionReasonEnumId: line.rejectionReasonEnumId
             })
-            const wasDisabled = ec.artifactExecution.disableAuthz()
-            try {
-                receipt.setSequencedIdPrimary().create()
-            } finally {
-                if (!wasDisabled) ec.artifactExecution.enableAuthz()
-            }
-            assetReceiptIds.push(receipt.assetReceiptId)
+            assetReceiptIds.push(out.assetReceiptId)
         }
         // the source's quantity still to handle
         const handled = sum(rows(AR, {shipmentItemSourceId: source.shipmentItemSourceId}), "quantityAccepted").add(
@@ -154,50 +220,10 @@ function receive(p) {
             statusId: notHandled.isZero() ? "SisReceived" : source.statusId
         })
 
-        const full = received.compare(dec(item.returnQuantity)) === 0
-        const manual = item.returnResponseEnumId === "RrspManual" && !item.responseDate
-        call("update#" + RI, {
-            returnId: item.returnId,
-            returnItemSeqId: item.returnItemSeqId,
-            receivedQuantity: received,
-            statusId: full ? "ReturnReceived" : item.statusId
-        })
-        if (full && manual)
-            call("update#" + RI, {returnId: item.returnId, returnItemSeqId: item.returnItemSeqId, statusId: "ReturnManResp"})
-        // non-product child items (adjustments) follow their parent, prorated
-        const ratio = dec(item.returnQuantity).isZero()
-            ? toDecimal(1)
-            : received.divide(dec(item.returnQuantity)).setScale(6, "HALF_UP")
-        for (const child of rows(RI, {returnId: item.returnId, parentItemSeqId: item.returnItemSeqId})) {
-            if (!receivableStatuses.includes(child.statusId)) continue
-            call("update#" + RI, {
-                returnId: child.returnId,
-                returnItemSeqId: child.returnItemSeqId,
-                receivedQuantity: dec(child.returnQuantity ?? 1).multiply(ratio),
-                statusId: full ? "ReturnReceived" : child.statusId
-            })
-        }
         touched.add(item.returnId)
-        receivedItems.push({
-            returnId: item.returnId,
-            returnItemSeqId: item.returnItemSeqId,
-            receivedQuantity: received,
-            statusId: full ? (manual ? "ReturnManResp" : "ReturnReceived") : item.statusId,
-            assetReceiptIds
-        })
+        receivedItems.push(Object.assign(recordReceived(item, received), {assetReceiptIds}))
     }
-    for (const returnId of touched) {
-        call("mantle.order.ReturnServices.checkUpdate#ReturnHeaderStatus", {
-            returnId,
-            statusId: "ReturnReceived",
-            itemStatusIds: ["ReturnReceived", "ReturnManResp", "ReturnCompleted", "ReturnCancelled"]
-        })
-        call("mantle.order.ReturnServices.checkUpdate#ReturnHeaderStatus", {
-            returnId,
-            statusId: "ReturnManResp",
-            itemStatusIds: ["ReturnReceived", "ReturnManResp", "ReturnCancelled"]
-        })
-    }
+    for (const returnId of touched) headerReceived(returnId)
     const open = rows("mantle.shipment.ShipmentItemSource", {shipmentId: p.shipmentId}).filter(
         row => row.statusId !== "SisReceived" && dec(row.quantityNotHandled ?? row.quantity).compare(0) > 0
     )
@@ -354,15 +380,23 @@ function plan(p, lock) {
         const orderItem = item.orderId
             ? one("mantle.order.OrderItem", {orderId: item.orderId, orderItemSeqId: item.orderItemSeqId})
             : null
-        const unitAmount = dec(
-            [item.returnPrice, orderItem?.unitAmount].find(value => value != null && !dec(value).isZero()) ?? 0
-        )
-        const settled = sum(
+        const askedUnit = dec([item.returnPrice, orderItem?.unitAmount].find(value => value != null && !dec(value).isZero()) ?? 0)
+        // settled: what billing links credited or refunded, and what was replaced, which credits nothing
+        const credited = sum(
             ownBillings.filter(row => row.returnItemSeqId === item.returnItemSeqId),
             "quantity"
         )
+        const settled = credited.add(dec(item.replacedQuantity))
         const billings = billingsOf(item.orderId, item.orderItemSeqId, scope)
         const billed = sum(billings, "quantity")
+        // a credit is never above the unit price the original billed, whatever the return item says
+        const billedUnit = billed.isZero()
+            ? null
+            : billings
+                  .reduce((total, row) => total.add(dec(row.quantity).multiply(dec(row.amount))), zero())
+                  .divide(billed)
+                  .setScale(6, "HALF_UP")
+        const unitAmount = billedUnit && billedUnit.compare(askedUnit) < 0 ? billedUnit : askedUnit
         const orderCap = positive(billed.subtract(creditedOf(item.orderId, item.orderItemSeqId, scope)))
         let basis
         if (item.statusId === "ReturnCancelled") basis = zero()
@@ -385,6 +419,8 @@ function plan(p, lock) {
             returnQuantity: dec(item.returnQuantity),
             receivedQuantity: dec(item.receivedQuantity),
             settledQuantity: settled,
+            creditedQuantity: credited,
+            replacedQuantity: dec(item.replacedQuantity),
             billedQuantity: billed,
             unbilledQuantity: scope.supplierReturn ? positive(open.subtract(eligible)) : zero(),
             eligibleQuantity: eligible,
@@ -398,6 +434,12 @@ function plan(p, lock) {
         }
     })
     const requested = Array.from(p.lineList || []).filter(line => line && line.returnItemSeqId)
+    const seen = new Set()
+    for (const line of requested) {
+        if (seen.has(line.returnItemSeqId))
+            denied("DUPLICATE_LINE", "Return item " + line.returnItemSeqId + " is asked for more than once; give it once")
+        seen.add(line.returnItemSeqId)
+    }
     const asked = requested.length
         ? requested
         : itemRows.filter(row => row.eligibleQuantity.compare(0) > 0).map(row => ({returnItemSeqId: row.returnItemSeqId}))
@@ -433,29 +475,57 @@ function plan(p, lock) {
             assetReceiptId: row.assetReceiptId
         })
     }
-    for (const line of [...lineRows]) {
-        const parent = items.find(item => item.returnItemSeqId === line.returnItemSeqId)
-        if (dec(parent.returnQuantity).isZero()) continue
-        const ratio = line.quantity.divide(dec(parent.returnQuantity)).setScale(6, "HALF_UP")
-        for (const child of children.filter(row => row.parentItemSeqId === line.returnItemSeqId)) {
-            const childQuantity = dec(child.returnQuantity ?? 1)
-                .multiply(ratio)
-                .setScale(6, "HALF_UP")
-            const unitAmount = dec(child.returnPrice)
-            if (childQuantity.isZero() || unitAmount.isZero()) continue
-            lineRows.push({
-                returnItemSeqId: child.returnItemSeqId,
-                parentItemSeqId: line.returnItemSeqId,
-                productName: child.description || line.productName,
-                quantity: childQuantity,
-                returnResponseEnumId: line.returnResponseEnumId,
-                responseName: line.responseName,
-                unitAmount,
-                amount: ec.l10n.roundCurrency(childQuantity.multiply(unitAmount), currencyUomId),
-                originalInvoiceId: null,
-                originalInvoiceItemSeqId: null,
-                assetReceiptId: line.assetReceiptId
-            })
+    // An item's adjustments (discount, tax) follow its credit or refund: each settlement credits the adjustment's total
+    // times the share of the item credited so far, rounded, less what it credited before, so settling one unit at a
+    // time never credits more than the whole. A supplier credit nets them into the line's credit, which is linked to
+    // the bill line; a replacement carries none, as it credits nothing.
+    if (scope.supplierReturn) {
+        for (const line of lineRows) {
+            const parent = items.find(item => item.returnItemSeqId === line.returnItemSeqId)
+            const parentRow = itemRows.find(row => row.returnItemSeqId === line.returnItemSeqId)
+            if (dec(parent.returnQuantity).isZero()) continue
+            const shareOf = quantity => min(toDecimal(1), quantity.divide(dec(parent.returnQuantity)).setScale(9, "HALF_UP"))
+            for (const child of children.filter(row => row.parentItemSeqId === line.returnItemSeqId)) {
+                const childTotal = dec(child.returnQuantity ?? 1).multiply(dec(child.returnPrice))
+                const now = ec.l10n
+                    .roundCurrency(childTotal.multiply(shareOf(parentRow.creditedQuantity.add(line.quantity))), currencyUomId)
+                    .subtract(ec.l10n.roundCurrency(childTotal.multiply(shareOf(parentRow.creditedQuantity)), currencyUomId))
+                line.amount = line.amount.add(now)
+            }
+            if (line.amount.compare(0) <= 0)
+                denied("CREDIT_CAP_EXCEEDED", "Return item " + line.returnItemSeqId + " has no billed amount left to credit")
+        }
+    } else {
+        for (const line of [...lineRows]) {
+            if (line.returnResponseEnumId === "RrspReplace") continue
+            const parent = items.find(item => item.returnItemSeqId === line.returnItemSeqId)
+            const parentRow = itemRows.find(row => row.returnItemSeqId === line.returnItemSeqId)
+            if (dec(parent.returnQuantity).isZero()) continue
+            const share = min(
+                toDecimal(1),
+                parentRow.creditedQuantity.add(line.quantity).divide(dec(parent.returnQuantity)).setScale(9, "HALF_UP")
+            )
+            for (const child of children.filter(row => row.parentItemSeqId === line.returnItemSeqId)) {
+                const childTotal = dec(child.returnQuantity ?? 1).multiply(dec(child.returnPrice))
+                const before = ownBillings
+                    .filter(row => row.returnItemSeqId === child.returnItemSeqId)
+                    .reduce((total, row) => total.add(dec(row.quantity).multiply(dec(row.amount))), zero())
+                const amount = ec.l10n.roundCurrency(childTotal.multiply(share), currencyUomId).subtract(before)
+                if (amount.isZero()) continue
+                lineRows.push({
+                    returnItemSeqId: child.returnItemSeqId,
+                    parentItemSeqId: line.returnItemSeqId,
+                    productName: child.description || line.productName,
+                    quantity: toDecimal(1),
+                    returnResponseEnumId: line.returnResponseEnumId,
+                    responseName: line.responseName,
+                    unitAmount: amount,
+                    amount,
+                    originalInvoiceId: null,
+                    originalInvoiceItemSeqId: null,
+                    assetReceiptId: line.assetReceiptId
+                })
+            }
         }
     }
     const total = response =>
@@ -477,8 +547,7 @@ function plan(p, lock) {
             reasonText = text
         }
     }
-    let refundForPaymentId = null
-    let refundGateway = false
+    const refundSourceRows = []
     if (refundTotal.compare(0) > 0) {
         const pending = items.filter(item => {
             if (!item.refundPaymentId) return false
@@ -486,13 +555,21 @@ function plan(p, lock) {
             return refund && refund.paymentTypeEnumId === "PtRefund" && !doneRefundStatuses.includes(refund.statusId)
         })
         if (pending.length) refuse("REFUND_PENDING", "A refund of this return is waiting for its gateway result")
+        // within what the orders' payments hold: the largest first (the latest of equal ones), each to what is left of it
         const orderIds = [...new Set(items.map(row => row.orderId).filter(Boolean))]
-        const source = refundSources(orderIds, scope).find(row => row.refundable.compare(refundTotal) >= 0)
-        if (!source) refuse("CREDIT_CAP_EXCEEDED", "A refund stays within what the customer paid and was not refunded")
-        else {
-            refundForPaymentId = source.paymentId
-            refundGateway = source.gateway
+        const sources = refundSources(orderIds, scope).sort(
+            (a, b) => b.refundable.compare(a.refundable) || String(b.paymentId).localeCompare(String(a.paymentId))
+        )
+        let remaining = refundTotal
+        for (const source of sources) {
+            if (remaining.compare(0) <= 0) break
+            const amount = min(source.refundable, remaining)
+            if (amount.compare(0) <= 0) continue
+            refundSourceRows.push({paymentId: source.paymentId, amount, gateway: source.gateway})
+            remaining = remaining.subtract(amount)
         }
+        if (remaining.compare(0) > 0)
+            refuse("CREDIT_CAP_EXCEEDED", "A refund stays within what the customer paid on the order and was not refunded")
     }
     if (!lineRows.length) refuse("NOTHING_TO_SETTLE", "Nothing on this return may be settled now")
     if (receiptless && !reason) refuse("REASON_REQUIRED", "A credit without receipt needs a reason")
@@ -507,6 +584,17 @@ function plan(p, lock) {
         if (receiptless && !has("RETURN_CREDIT_APPROVE")) missing.push("RETURN_CREDIT_APPROVE")
     }
     if (missing.length) refuse("FORBIDDEN", missing.join(" and ") + " authority is required")
+    // a customer credit memo is issued as the organization issues its invoices: with approval required, by an approver
+    // allowed to approve what they drafted; a credit without receipt carries its approver's approval
+    const creditMemo = !scope.supplierReturn && creditTotal.add(refundTotal).compare(0) !== 0
+    const preference = lib.policy.preference(scope.organizationPartyId)
+    if (
+        creditMemo &&
+        !receiptless &&
+        preference.invoiceApprovalRequired === "Y" &&
+        (!has("INVOICE_APPROVE") || preference.allowAccountingSelfApproval !== "Y")
+    )
+        refuse("APPROVAL_REQUIRED", "This organization approves credits; settling needs an approver allowed to self-approve")
     const closed = periodFinding(scope)
     if (closed) refuse("CLOSED_PERIOD", closed)
 
@@ -524,14 +612,14 @@ function plan(p, lock) {
         ]),
         lines: lineRows.map(row => [row.returnItemSeqId, String(row.quantity), row.returnResponseEnumId]),
         receiptless,
-        refundForPaymentId
+        refunds: refundSourceRows.map(row => [row.paymentId, String(row.amount)])
     })
     return {
         scope,
         header,
         receiptless,
         reason,
-        refundGateway,
+        approvalRequired: preference.invoiceApprovalRequired === "Y",
         result: {
             returnId: header.returnId,
             organizationPartyId: scope.organizationPartyId,
@@ -542,7 +630,8 @@ function plan(p, lock) {
             creditTotal,
             refundTotal,
             replaceQuantity,
-            refundForPaymentId,
+            refundSourceRows,
+            refundForPaymentId: refundSourceRows[0]?.paymentId || null,
             previewVersion,
             canSettle: !reasonCode,
             reasonCode,
@@ -596,6 +685,7 @@ function settle(p) {
         creditInvoiceIds: [],
         creditPaymentId: null,
         refundPaymentId: null,
+        refundPaymentIds: [],
         refundStatusId: null,
         replacementOrderIds: [],
         settledLines: out.lineRows.map(row => ({
@@ -609,12 +699,15 @@ function settle(p) {
     if (scope.supplierReturn) supplierCredits(out, scope, billingFields, result)
     else customerResponses(out, planned, billingFields, result)
     completeSettled(out, planned)
+    // the gateway last, under this settlement's key: a decline refuses the whole settlement, so nothing is settled
+    deliverRefunds(out, op, result)
     entityLib.complete(op, RH, out.returnId, result)
     return result
 }
 
 function customerResponses(out, planned, billingFields, result) {
     const quantities = {}
+    const unitAmounts = {}
     const receipts = {}
     const originals = {}
     for (const line of out.lineRows) {
@@ -626,41 +719,80 @@ function customerResponses(out, planned, billingFields, result) {
                 returnResponseEnumId: line.returnResponseEnumId
             })
         quantities[line.returnItemSeqId] = line.quantity
+        unitAmounts[line.returnItemSeqId] = line.unitAmount
         if (!planned.receiptless && line.assetReceiptId) receipts[line.returnItemSeqId] = line.assetReceiptId
         if (line.originalInvoiceId)
             originals[line.returnItemSeqId] = {invoiceId: line.originalInvoiceId, invoiceItemSeqId: line.originalInvoiceItemSeqId}
     }
-    const responded = call("mantle.order.ReturnServices.process#ReturnItemResponses", {
+    const responded = call("mantle.order.ReturnServices.respond#ReturnItems", {
         returnId: out.returnId,
-        settlement: {quantities, receipts, originals, refundForPaymentId: out.refundForPaymentId, billingFields}
+        settlement: {
+            quantities,
+            unitAmounts,
+            receipts,
+            originals,
+            refundSources: out.refundSourceRows.map(row => ({paymentId: row.paymentId, amount: row.amount})),
+            billingFields
+        }
     })
-    if (responded.returnInvoiceId) result.creditInvoiceIds.push(responded.returnInvoiceId)
+    if (responded.returnInvoiceId) {
+        result.creditInvoiceIds.push(responded.returnInvoiceId)
+        issueCredit(responded.returnInvoiceId, out, planned)
+    }
     result.creditPaymentId = responded.creditPaymentId || null
     result.replacementOrderIds = Array.from(responded.replacementOrderIds || [])
-    const refundPaymentId = responded.refundPaymentId || null
-    result.refundPaymentId = refundPaymentId
-    if (refundPaymentId) {
-        // the refund goes back through the original's gateway, else it is paid now; either applies it to the credit memo
-        if (planned.refundGateway)
+    result.refundPaymentIds = Array.from(responded.refundPaymentIds || [])
+    result.refundPaymentId = result.refundPaymentIds[0] || null
+}
+
+// The credit memo is issued through the invoice workflow (change#InvoiceState): its period, posting and the credit cap of
+// its original sales invoice when it has one; with approval required, approved by the settler (who may self-approve); a
+// credit without receipt carries the approval of its approver, the settler, stamped self-approved.
+function issueCredit(invoiceId, out, planned) {
+    const originals = [...new Set(out.lineRows.map(row => row.originalInvoiceId).filter(Boolean))]
+    const fields = {invoiceId}
+    if (originals.length === 1) fields.creditForInvoiceId = originals[0]
+    if (planned.receiptless)
+        Object.assign(fields, {approvedByUserId: ec.user.userId, approvedDate: ec.user.nowTimestamp, isSelfApproved: "Y"})
+    call("update#" + INV, fields)
+    if (planned.receiptless) call("update#" + INV, {invoiceId, approvedSourceVersion: lib.fingerprint(one(INV, {invoiceId}))})
+    const record = one(INV, {invoiceId})
+    call("mantle.account.InvoiceServices.change#InvoiceState", {
+        invoiceId,
+        organizationPartyId: out.organizationPartyId,
+        action: planned.approvalRequired && !planned.receiptless ? "approve" : "finalize",
+        lastUpdatedStamp: record.lastUpdatedStamp,
+        changeReason: "Return " + out.returnId + " settled"
+    })
+}
+
+// Each refund goes back through its original's gateway, keyed by the settlement's operation key, else it is paid now;
+// either applies it to the credit memo. A declined refund refuses the settlement (REFUND_DECLINED); one the gateway has
+// not decided stays promised (REFUND_PENDING).
+function deliverRefunds(out, op, result) {
+    result.refundStatusIds = []
+    result.refundPaymentIds.forEach((refundPaymentId, index) => {
+        const source = out.refundSourceRows[index]
+        if (source.gateway)
             call("mantle.account.PaymentServices.refund#SinglePayment", {
-                paymentId: out.refundForPaymentId,
+                paymentId: source.paymentId,
                 refundPaymentId,
-                operationKey: "RS-" + refundPaymentId
+                operationKey: op.operationKey + "-" + (index + 1)
             })
-        else
-            call("update#" + PAY, {
-                paymentId: refundPaymentId,
-                statusId: "PmntDelivered",
-                effectiveDate: ec.user.nowTimestamp
-            })
+        else call("update#" + PAY, {paymentId: refundPaymentId, statusId: "PmntDelivered", effectiveDate: ec.user.nowTimestamp})
         const refund = one(PAY, {paymentId: refundPaymentId})
-        result.refundStatusId = refund.statusId
+        if (refund.statusId === "PmntDeclined")
+            denied("REFUND_DECLINED", "The gateway declined the refund to payment " + source.paymentId + "; nothing was settled")
+        result.refundStatusIds.push(refund.statusId)
         if (!["PmntDelivered", "PmntConfirmed"].includes(refund.statusId)) result.resultCode = "REFUND_PENDING"
-    }
+    })
+    result.refundStatusId = result.refundStatusIds[0] || null
 }
 
 function supplierCredits(out, scope, billingFields, result) {
     for (const line of out.lineRows) {
+        if (!line.originalInvoiceId || line.amount.compare(0) <= 0)
+            denied("CREDIT_CAP_EXCEEDED", "Return item " + line.returnItemSeqId + " has no billed amount to credit")
         const credit = call("mantle.account.InvoiceServices.create#InvoiceCreditMemo", {
             originalInvoiceId: line.originalInvoiceId,
             linkToOriginal: true,
@@ -713,8 +845,9 @@ function supplierCredits(out, scope, billingFields, result) {
     }
 }
 
-// An item settled for all it authorizes is complete, with its adjustments; one credited without receipt has its
-// remainder closed first (Received), as a return authorizer closes it.
+// An item settled for all it authorizes (credited, refunded or replaced) is complete, with its adjustments; one credited
+// without receipt has its remainder closed first (Received), as a return authorizer closes it, and when that completes the
+// return its open shipment is closed: cancelled with nothing received on it, else delivered.
 function completeSettled(out, planned) {
     const settledNow = standing(rows(RIB, {returnId: out.returnId}))
     const closing = []
@@ -723,7 +856,7 @@ function completeSettled(out, planned) {
         const settled = sum(
             settledNow.filter(row => row.returnItemSeqId === line.returnItemSeqId),
             "quantity"
-        )
+        ).add(dec(item.replacedQuantity))
         if (settled.compare(dec(item.returnQuantity)) < 0) continue
         if (item.statusId === "ReturnApproved" && !planned.receiptless) continue
         closing.push(...rows(RI, {returnId: out.returnId, parentItemSeqId: item.returnItemSeqId}), item)
@@ -742,9 +875,19 @@ function completeSettled(out, planned) {
     }
     for (const item of open)
         call("mantle.order.ReturnServices.complete#ReturnItem", {returnId: item.returnId, returnItemSeqId: item.returnItemSeqId})
+    if (!planned.receiptless || one(RH, {returnId: out.returnId}).statusId !== "ReturnCompleted") return
+    const shipmentIds = [
+        ...new Set(rows("mantle.shipment.ShipmentItemSource", {returnId: out.returnId}).map(row => row.shipmentId))
+    ]
+    for (const shipmentId of shipmentIds) {
+        const shipment = one("mantle.shipment.Shipment", {shipmentId})
+        if (!shipment || ["ShipDelivered", "ShipCancelled"].includes(shipment.statusId)) continue
+        if (rows(AR, {shipmentId}).length) call("mantle.shipment.ShipmentServices.deliver#Shipment", {shipmentId})
+        else call("mantle.shipment.ShipmentServices.cancel#Shipment", {shipmentId, undoIssueReceive: false})
+    }
 }
 
-const operations = {receive, preview, settle}
+const operations = {receive, syncReceived, preview, settle}
 ;({
     execute: (operation, parameters) => {
         if (!operations[operation]) throw new Error("Unknown return operation " + operation)

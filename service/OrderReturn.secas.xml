@@ -81,15 +81,17 @@ along with this software (see the LICENSE.md file). If not, see
     </seca>
 
     <!-- Receive ReturnItems when Return Shipment Delivered (statusId=ShipDelivered, shipmentTypeEnumId=ShpTpSalesReturn);
-        not for an organization with returnSettlementRequired, whose returns WarehouseTaskServices.receive#ReturnItems
-        receives -->
+        for an organization with returnSettlementRequired, its received quantities only (sync#ReturnShipmentReceipts) -->
     <seca id="ShipmentDeliveredReturnReceive" service="update#mantle.shipment.Shipment" when="post-service">
         <condition><expression>statusChanged &amp;&amp; statusId == 'ShipDelivered'</expression></condition>
         <actions>
             <service-call name="mantle.order.ReturnServices.get#ReturnSettlementMode" out-map="settlementMode"
                     in-map="{shipmentId:shipmentId}"/>
-            <if condition="!settlementMode.settlementRequired">
-                <service-call name="mantle.order.ReturnServices.receive#ReturnShipmentItems" in-map="context"/></if>
+            <if condition="!settlementMode.settlementRequired"><then>
+                <service-call name="mantle.order.ReturnServices.receive#ReturnShipmentItems" in-map="context"/>
+            </then><else-if condition="settlementMode.returnId">
+                <service-call name="mantle.order.ReturnServices.sync#ReturnShipmentReceipts" in-map="{shipmentId:shipmentId}"/>
+            </else-if></if>
         </actions>
     </seca>
 

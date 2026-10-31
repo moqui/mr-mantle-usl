@@ -4567,7 +4567,8 @@ along with this software (see the LICENSE.md file). If not, see
         SECA leaves it in process, the ship SECA finalizes it, and a package reopened before ship takes its lines off. -->
     <service verb="finalize" noun="ShipmentInvoices" allow-remote="false">
         <description>Finalize the shipment's sales invoices still in process, as create#SalesShipmentInvoices does at pack
-            without the flag: each moves to InvoiceFinalized (whose SECAs post it, apply the payments that name it and send
+            without the flag, dated the ship day (invoice date, book day and due date): each moves to InvoiceFinalized
+            (whose SECAs post it, apply the payments that name it and send
             it), and the order parts' captured payments are applied (apply#OrderPaymentsToInvoice). Run by the
             ShipmentShippedFinalizeInvoices SECA.</description>
         <in-parameters><parameter name="shipmentId" required="true"/></in-parameters>
@@ -4579,6 +4580,7 @@ along with this software (see the LICENSE.md file). If not, see
             </entity-find>
             <set field="invoiceIdList" from="[]"/>
             <set field="orderPartsByInvoice" from="{}"/>
+            <set field="shipDate" from="ec.user.nowTimestamp"/>
             <iterate list="shipmentBillingList" entry="billing">
                 <entity-find-one entity-name="mantle.order.OrderItem" value-field="billedOrderItem" disable-authz="true">
                     <field-map field-name="orderId" from="billing.orderId"/>
@@ -4591,6 +4593,12 @@ along with this software (see the LICENSE.md file). If not, see
                 <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice" for-update="true"
                         disable-authz="true"/>
                 <if condition="invoice?.statusId != 'InvoiceInProcess'"><continue/></if>
+                <!-- dated the ship day, so revenue, receivable and the due date come at shipment, not at pack -->
+                <service-call name="update#mantle.account.invoice.Invoice" disable-authz="true"
+                        in-map="{invoiceId:invoiceId, invoiceDate:shipDate,
+                            accountingDate:ec.l10n.format(shipDate, 'yyyy-MM-dd')}"/>
+                <service-call name="mantle.account.InvoiceServices.checkSet#InvoiceDueDate" disable-authz="true"
+                        in-map="{invoiceId:invoiceId, overrideExisting:true}"/>
                 <service-call name="update#mantle.account.invoice.Invoice"
                         in-map="{invoiceId:invoiceId, statusId:'InvoiceFinalized'}"/>
                 <iterate list="Array.from(orderPartsByInvoice[invoiceId])" entry="orderPartKey">
@@ -4657,6 +4665,11 @@ along with this software (see the LICENSE.md file). If not, see
                     <return error="true"
                             message="INVOICE_FINALIZED: Invoice ${invoiceId} is not in process; correct it with a credit memo"/>
                 </if>
+            </iterate>
+            <!-- the calculated tax lines of a draft go first; it is taxed again when it is issued -->
+            <iterate list="invoiceIdList" entry="invoiceId">
+                <service-call name="mantle.other.TaxServices.calculate#InvoiceSalesTax" disable-authz="true"
+                        in-map="{invoiceId:invoiceId, clear:true}"/>
             </iterate>
             <!-- children first: a line with child lines cannot be deleted -->
             <set field="lineKeys"
