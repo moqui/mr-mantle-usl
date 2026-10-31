@@ -117,7 +117,15 @@ feature("active organization selection narrows an otherwise authorized child for
 })
 feature("another currency with no rate is refused at finalize; every invoice gets its book day", {
     when() {
-        const foreign = helper().draft(f, "25", "SEK")
+        // XTS, the ISO code reserved for testing: a currency no other spec gives a rate
+        if (!helper().lib.one("moqui.basic.Uom", {uomId: "XTS"}))
+            helper().call("create#moqui.basic.Uom", {
+                uomId: "XTS",
+                uomTypeEnumId: "UT_CURRENCY_MEASURE",
+                description: "Testing currency",
+                abbreviation: "XTS"
+            })
+        const foreign = helper().draft(f, "25", "XTS")
         const adopted = helper().rejected("mantle.account.InvoiceServices.change#InvoiceState", {
             invoiceId: foreign.invoiceId,
             action: "finalize",

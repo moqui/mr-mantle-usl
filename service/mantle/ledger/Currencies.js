@@ -56,10 +56,48 @@ function rateOn(fromUomId, toUomId, day) {
 function missingText(fromUomId, toUomId, day) {
     return "No exchange rate from " + fromUomId + " to " + toUomId + " on " + day
 }
-// The rate a document posts at in an organization's base currency: the one kept on the document (its own rate to that
-// currency), else the rate of its book day, which is then kept on the document so its applications and adjustments use
-// it; null for a document in the base currency or with no rate.
-function documentRate(kind, id, organizationPartyId) {
+// A decimal rate text that is a positive number, else null (F422).
+function positiveRate(text) {
+    if (text == null || !/^\d+(\.\d+)?$/.test(String(text).trim())) return null
+    const value = toDecimal(String(text).trim())
+    return value.compare(0) > 0 ? value : null
+}
+const INVOICE_TYPES = [
+    "AttSalesInvoice",
+    "AttVendRtnInvoice",
+    "AttPurchaseInvoice",
+    "AttCustRtnInvoice",
+    "AttCreditMemo",
+    "AttVendCreditMemo",
+    "AttPayrollInvoice",
+    "AttTaxInvoice",
+    "AttGarnishmentInvoice",
+    "AttCommissionInvoice"
+]
+const CASH_TYPES = ["AttPayment", "AttDisbursement", "AttReceipt", "AttIncomingPayment", "AttOutgoingPayment"]
+// Whether a document has a transaction depending on its kept rate: an unreversed posting of its own, of an adjustment or
+// of an application (posted or held), other than the one being converted.
+function hasDependents(kind, id, org, exceptTxId) {
+    const cf = ec.entity.conditionFactory
+    const fields = kind === "invoice" ? ["invoiceId", "toInvoiceId"] : ["paymentId", "toPaymentId"]
+    let q = find(T, {organizationPartyId: org})
+        .condition(
+            cf.makeCondition(
+                fields.map(field => cf.makeCondition(field, "equals", id)),
+                "or"
+            )
+        )
+        .condition("reversedByAcctgTransId", "is-null", null)
+        .condition("reverseOfAcctgTransId", "is-null", null)
+    if (exceptTxId) q = q.condition("acctgTransId", "not-equals", exceptTxId)
+    return !!q.limit(1).one()
+}
+// The rate a document posts at in an organization's base currency, kept on the document so its adjustments and
+// applications use it; null for a document in the base currency or with no rate. The kept rate stands while anything
+// depends on it, or when it was chosen (no rate date) or taken for the document's book day; otherwise (a re-post after
+// its postings were reversed, its book day changed) and when the base currency changed, the rate of the book day is
+// taken again (F421). A later rate change affects later documents only.
+function documentRate(kind, id, organizationPartyId, exceptTxId = null) {
     const base = lib.preference(organizationPartyId).baseCurrencyUomId
     const invoice = kind === "invoice"
     const entity = invoice ? "mantle.account.invoice.Invoice" : "mantle.account.payment.Payment"
@@ -67,18 +105,44 @@ function documentRate(kind, id, organizationPartyId) {
     const record = id ? one(entity, {[key]: id}) : null
     const currency = record && (invoice ? record.currencyUomId : record.amountUomId)
     if (!record || !base || !currency || currency === base) return null
-    if (record.exchangeRate && record.exchangeRateToUomId === base)
-        return {
-            exchangeRate: record.exchangeRate,
-            exchangeRateDate: record.exchangeRateDate,
-            exchangeRateSource: record.exchangeRateSource
-        }
     const day = lib.lib.bookDay(record.accountingDate, invoice ? record.invoiceDate : record.effectiveDate)
+    const keptRate = record.exchangeRateToUomId === base ? positiveRate(record.exchangeRate) : null
+    const kept = keptRate && {
+        exchangeRate: rateText(keptRate),
+        exchangeRateDate: record.exchangeRateDate,
+        exchangeRateSource: record.exchangeRateSource
+    }
+    if (
+        kept &&
+        (!record.exchangeRateDate ||
+            ec.l10n.format(record.exchangeRateDate, "yyyy-MM-dd") === day ||
+            hasDependents(kind, id, organizationPartyId, exceptTxId))
+    )
+        return kept
     const found = rateOn(currency, base, day)
-    if (!found) return null
+    if (!found) return kept || null
     const out = {exchangeRate: rateText(found.rate), exchangeRateDate: found.rateDate, exchangeRateSource: found.rateSource}
-    if (!record.exchangeRate) call("update#" + entity, Object.assign({[key]: id, exchangeRateToUomId: base}, out))
+    if (!kept || kept.exchangeRate !== out.exchangeRate || record.exchangeRateSource !== out.exchangeRateSource)
+        call("update#" + entity, Object.assign({[key]: id, exchangeRateToUomId: base}, out))
     return out
+}
+// The rate an asset's cost converts at (F417): the one its first posting kept on the asset (its receipt's), else the rate
+// of its acquisition day, then kept; so its receipt, issues and variances post at one rate and its inventory account
+// clears. Null when there is none.
+function assetRate(asset, base, fallbackDay) {
+    const keptRate = asset.exchangeRateToUomId === base ? positiveRate(asset.exchangeRate) : null
+    if (keptRate) return {rate: keptRate, rateDate: asset.exchangeRateDate, rateSource: asset.exchangeRateSource}
+    const day = lib.lib.bookDay(null, asset.acquiredDate || asset.receivedDate) || fallbackDay
+    const found = rateOn(asset.acquireCostUomId, base, day)
+    if (!found) return null
+    call("update#mantle.product.asset.Asset", {
+        assetId: asset.assetId,
+        exchangeRate: rateText(found.rate),
+        exchangeRateDate: found.rateDate,
+        exchangeRateSource: found.rateSource,
+        exchangeRateToUomId: base
+    })
+    return found
 }
 // Each line's amount in the base currency at the rate, rounded to it; each side is trued up on its largest line to the
 // side's total at the rate, so a single control line holds exactly its document total at the rate.
@@ -109,20 +173,47 @@ function writeLines(converted) {
         })
     }
 }
-// The rate a transaction converts at: the one it carries, else the rate of its book day; null when there is none.
-function transactionRate(tx, base) {
-    if (tx.exchangeRate)
-        return {rate: toDecimal(tx.exchangeRate), rateDate: tx.exchangeRateDate, rateSource: tx.exchangeRateSource}
-    return rateOn(tx.amountUomId, base, lib.postingDay(tx))
+// The rate a transaction converts at, {rate, rateDate, rateSource} or {missing, message}: the one it carries; a
+// document's own posting at its document's rate (kept on the document, F423); a posting of an asset's cost at the
+// asset's rate (F417), refused when it holds another currency or several assets' costs; else the rate of its book day.
+function transactionRate(tx, base, lines = null, keep = true) {
+    const carried = positiveRate(tx.exchangeRate)
+    if (carried) return {rate: carried, rateDate: tx.exchangeRateDate, rateSource: tx.exchangeRateSource}
+    const day = lib.postingDay(tx)
+    const missing = message => ({missing: true, message: message || missingText(tx.amountUomId, base, day)})
+    const own =
+        tx.invoiceId && !tx.paymentId && !tx.paymentApplicationId && INVOICE_TYPES.includes(tx.acctgTransTypeEnumId)
+            ? ["invoice", tx.invoiceId]
+            : tx.paymentId && !tx.paymentApplicationId && CASH_TYPES.includes(tx.acctgTransTypeEnumId)
+              ? ["payment", tx.paymentId]
+              : null
+    if (own && !tx.reverseOfAcctgTransId) {
+        const found = keep ? documentRate(own[0], own[1], tx.organizationPartyId, tx.acctgTransId) : null
+        if (found)
+            return {rate: toDecimal(found.exchangeRate), rateDate: found.exchangeRateDate, rateSource: found.exchangeRateSource}
+        if (keep) return missing()
+    }
+    if ((tx.assetReceiptId || tx.assetIssuanceId || tx.physicalInventoryId) && !tx.reverseOfAcctgTransId) {
+        const lineAssets = [...new Set((lines || rows(E, {acctgTransId: tx.acctgTransId})).map(l => l.assetId).filter(Boolean))]
+        const assetId = tx.assetId || (lineAssets.length === 1 ? lineAssets[0] : null)
+        const asset = assetId ? one("mantle.product.asset.Asset", {assetId}) : null
+        if (!asset || asset.acquireCostUomId !== tx.amountUomId)
+            return missing(
+                "ASSET_CURRENCY: An inventory posting in " + tx.amountUomId + " converts only at its asset's cost rate"
+            )
+        const keptRate = asset.exchangeRateToUomId === base ? positiveRate(asset.exchangeRate) : null
+        if (!keep) return keptRate || rateOn(asset.acquireCostUomId, base, day) ? {rate: keptRate} : missing()
+        return assetRate(asset, base, day) || missing()
+    }
+    return rateOn(tx.amountUomId, base, day) || missing()
 }
 // Whether an unposted transaction in another currency would convert, without changing it (verifyOnly and the guard).
 function convertible(p) {
     const tx = one(T, {acctgTransId: p.acctgTransId})
     const base = tx && lib.preference(tx.organizationPartyId).baseCurrencyUomId
     if (!tx || !base || !tx.amountUomId || tx.amountUomId === base) return {missing: false}
-    return transactionRate(tx, base)
-        ? {missing: false}
-        : {missing: true, message: missingText(tx.amountUomId, base, lib.postingDay(tx))}
+    const found = transactionRate(tx, base, null, false)
+    return found.missing ? found : {missing: false}
 }
 // post#AcctgTrans: an unposted transaction in another currency than its organization's base currency is converted to
 // it, at the rate the transaction carries (its document's, which the auto-post services pass) or else the rate of its book
@@ -138,10 +229,17 @@ function convert(p) {
     find("mantle.party.Party", {partyId: initial.organizationPartyId}).forUpdate(true).one()
     const tx = find(T, {acctgTransId: p.acctgTransId}).forUpdate(true).one()
     if (tx.isPosted === "Y" || tx.amountUomId === base) return {converted: false}
-    const found = transactionRate(tx, base)
-    if (!found) return {converted: false, missing: true, message: missingText(tx.amountUomId, base, lib.postingDay(tx))}
+    // an application's posting held in the error journal and posted again books its realized difference (F418)
+    if (APPLICATION_TYPES.includes(tx.acctgTransTypeEnumId) && tx.paymentApplicationId && !tx.reverseOfAcctgTransId)
+        return convertApplication({acctgTransId: tx.acctgTransId})
     const lines = Array.from(find(E, {acctgTransId: tx.acctgTransId}).orderBy("acctgTransEntrySeqId").list())
-    writeLines(convertLines(lines, found.rate, base))
+    const found = transactionRate(tx, base, lines)
+    if (found.missing) return {converted: false, missing: true, message: found.message}
+    writeLines(
+        tx.acctgTransTypeEnumId === "AttInvoiceAdjust" && tx.invoiceId && !tx.reverseOfAcctgTransId
+            ? convertAdjustment(tx, lines, found.rate, base)
+            : convertLines(lines, found.rate, base)
+    )
     call("update#" + T, {
         acctgTransId: tx.acctgTransId,
         amountUomId: base,
@@ -151,6 +249,51 @@ function convert(p) {
         exchangeRateSource: found.rateSource
     })
     return {converted: true}
+}
+// An invoice adjustment's lines (F419): its control line (the invoice's receivable or payable account) is what brings the
+// invoice's posted control total to its total after the adjustment at the rate, as an application clears (F413); the
+// largest line of the other side takes the rounding, so the transaction balances.
+function convertAdjustment(tx, lines, rate, base) {
+    const out = convertLines(lines, rate, base)
+    const invoice = one("mantle.account.invoice.Invoice", {invoiceId: tx.invoiceId})
+    const control = call("mantle.ledger.InvoiceAutoPostServices.get#InvoiceTypeTransType", {
+        invoiceTypeEnumId: invoice.invoiceTypeEnumId,
+        organizationPartyId: tx.organizationPartyId,
+        isPayable: invoice.toPartyId === tx.organizationPartyId ? "Y" : "N"
+    }).glAccountId
+    const controlRows = out.filter(row => row.line.glAccountId === control && row.original != null)
+    if (!control || controlRows.length !== 1) return out
+    const row = controlRows[0],
+        sign = row.line.debitCreditFlag === "D" ? 1 : -1
+    let priorDoc = toDecimal(0),
+        priorBase = toDecimal(0)
+    for (const posting of find(T, {organizationPartyId: tx.organizationPartyId, invoiceId: tx.invoiceId, isPosted: "Y"})
+        .condition("acctgTransTypeEnumId", "in", INVOICE_TYPES.concat(["AttInvoiceAdjust"]))
+        .condition("originalCurrencyUomId", "is-not-null", null)
+        .condition("reversedByAcctgTransId", "is-null", null)
+        .condition("reverseOfAcctgTransId", "is-null", null)
+        .condition("paymentId", "is-null", null)
+        .condition("paymentApplicationId", "is-null", null)
+        .orderBy("acctgTransId")
+        .list())
+        for (const line of rows(E, {acctgTransId: posting.acctgTransId}).filter(l => l.glAccountId === control)) {
+            const lineSign = line.debitCreditFlag === "D" ? 1 : -1
+            priorDoc = priorDoc.add(toDecimal(line.originalCurrencyAmount ?? 0).multiply(lineSign))
+            priorBase = priorBase.add(toDecimal(line.amount ?? 0).multiply(lineSign))
+        }
+    const target = lib.lib
+        .money(priorDoc.add(row.original.multiply(sign)).multiply(rate), base)
+        .subtract(priorBase)
+        .multiply(sign)
+    const difference = target.subtract(row.amount)
+    if (difference.isZero()) return out
+    row.amount = target
+    const other = out.filter(r => r.line.debitCreditFlag !== row.line.debitCreditFlag && r.original != null)
+    if (other.length) {
+        const largest = other.reduce((best, r) => (r.original.abs().compare(best.original.abs()) > 0 ? r : best))
+        largest.amount = largest.amount.add(difference)
+    }
+    return out
 }
 // The document of each line of an application's posting: the first line is its base record's (the payment, else the
 // invoice), the second the other document's (the invoice, the to payment or the to invoice).
@@ -211,9 +354,9 @@ function convertApplication(p) {
     if (!base || !tx.amountUomId || tx.amountUomId === base) return {converted: false}
     const lines = Array.from(find(E, {acctgTransId: tx.acctgTransId}).orderBy("acctgTransEntrySeqId").list())
     if (lines.length !== 2)
-        return {converted: false, missing: true, code: "RATE_MISSING", message: "An application posting needs two lines"}
+        return {converted: false, missing: true, code: "APPLICATION_SHAPE", message: "An application posting needs two lines"}
     const documents = applicationDocuments(tx)
-    const rates = documents.map(([kind, id]) => documentRate(kind, id, org))
+    const rates = documents.map(([kind, id]) => documentRate(kind, id, org, tx.acctgTransId))
     const missingIndex = rates.findIndex(rate => !rate)
     if (missingIndex >= 0) {
         const [kind, id] = documents[missingIndex]
@@ -301,6 +444,7 @@ function csv(text) {
 }
 function importRates(p) {
     lib.organization(p, "admin")
+    ratesAdmin()
     lib.reason(p)
     const text = String(p.csvText || "")
     if (!text || text.length > 2097152) throw new Error("Supply a CSV file of at most 2 MiB")
@@ -409,7 +553,32 @@ function refreshRates(p) {
     if (!providerService) denied("RATE_PROVIDER_MISSING", "Choose an exchange rate provider in the accounting preferences")
     const provider = one("moqui.basic.Enumeration", {enumTypeId: "ExchangeRateProvider", enumCode: providerService})
     if (!provider) denied("RATE_PROVIDER_MISSING", "The exchange rate provider is not a known provider")
+    // the provider is asked outside any transaction (refresh#Rates has none); the proposals are written in their own (F425)
     const fetched = call(providerService, {sourceText: p.sourceText || null})
+    return ec.service
+        .sync()
+        .name("mantle.ledger.CurrencyServices.propose#Rates")
+        .parameters({
+            organizationPartyId: org,
+            uomIdList: p.uomIdList || null,
+            fromUomId: fetched.fromUomId,
+            rateDay: fetched.rateDay,
+            rates: fetched.rates || [],
+            rateSource: fetched.rateSource,
+            providerServiceName: providerService
+        })
+        .disableAuthz()
+        .requireNewTransaction(true)
+        .call()
+}
+// propose#Rates: a provider's rates as proposals to the base currency, cross rates through the provider's currency.
+function proposeRates(p) {
+    const scope = lib.organization(p, "admin")
+    const org = scope.organizationPartyId
+    const base = lib.preference(org).baseCurrencyUomId
+    if (!base) denied("BASE_CURRENCY_REQUIRED", "Choose the organization's base currency")
+    const fetched = p,
+        providerService = p.providerServiceName
     const quotes = {[fetched.fromUomId]: toDecimal(1)}
     for (const row of fetched.rates || []) {
         const value = toDecimal(String(row.rate))
@@ -471,6 +640,17 @@ function getProposals(p) {
         ).map(proposalRow)
     }
 }
+// Exchange rates are global UomConversion rows, so every writer of an active rate (store#Rate, the CSV import, an accepted
+// proposal) needs finance administration of every organization: ACCOUNTING_ADMIN, which AccountingPolicy scopes to
+// every internal organization, or a system administrator; never a capability limited to some organizations (F420).
+function ratesAdmin() {
+    const domain = ec.resource.script("component://mr-mantle/service/mantle/product/ProductAccess.js")
+    if (!(domain.systemAdmin() || lib.capabilities().admin))
+        denied("PERMISSION_DENIED", "Exchange rates are shared by every organization: finance administration is required")
+    const internal = find("mantle.party.PartyRole", {roleTypeId: "OrgInternal"}).count()
+    if (!domain.systemAdmin() && lib.access("admin").organizationPartyIds.length < internal)
+        denied("PERMISSION_DENIED", "Exchange rates need finance administration of every organization")
+}
 // accept#RateProposals and reject#RateProposals: each proposal decided in its own transaction, re-read under lock (the
 // organization's, still proposed); an accepted one becomes an active dated rate through store#Rate. A failure is named
 // in the results and the others go on.
@@ -504,6 +684,7 @@ function decideProposals(p, accept) {
 }
 function decideProposal(p) {
     const scope = lib.organization(p, "admin")
+    if (p.accept) ratesAdmin()
     find("mantle.party.Party", {partyId: scope.organizationPartyId}).forUpdate(true).one()
     const row = find(PROPOSAL, {rateProposalId: p.rateProposalId}).forUpdate(true).one()
     if (!row || row.organizationPartyId !== scope.organizationPartyId)
@@ -534,6 +715,7 @@ const operations = {
     importRates,
     ecbRates,
     refreshRates,
+    proposeRates,
     getProposals,
     acceptProposals: p => decideProposals(p, true),
     rejectProposals: p => decideProposals(p, false),
@@ -549,6 +731,7 @@ const operations = {
     rateOn,
     documentRate,
     missingText,
+    ratesAdmin,
     execute: (op, p) => {
         if (!operations[op]) throw new Error("Unknown currency operation " + op)
         return operations[op](p)

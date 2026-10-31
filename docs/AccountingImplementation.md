@@ -938,6 +938,15 @@ single-currency refusal of P4 and P19 (D18) is gone. The logic is in `ledger/Cur
   transaction reads one row more and is otherwise posted as before. With no rate the transaction stays as it is: with
   the guard on it is refused (`RATE_MISSING`; an automatic posting goes to the error journal), with the guard off
   Mantle's own check holds it in the error journal. `verifyOnly` converts nothing and reports a missing rate.
+- **Whose rate.** A document's own posting re-posted from the error journal takes its document's rate and keeps it on
+  the document (F423); a kept rate is taken again on a re-post when nothing depends on it (its own posting, adjustments
+  and applications reversed) and it was not taken for the book day, or when the base currency changed (F421); a rate
+  must be a positive decimal (F422). A posting of an asset's cost (receipt, issuance, variance, issuance delta) converts
+  at the asset's rate (`Asset.exchangeRate`, kept by its first posting at its acquisition day), so its inventory account
+  clears; one in another currency than the asset's cost, or holding several assets, is refused (`ASSET_CURRENCY`, F417).
+  An application posting re-posted from the error journal is converted as an application (F418). An invoice
+  adjustment posts its control line cumulatively: the invoice's total after it at the rate, less what its postings put
+  there (F419).
 - **Payments.** A payment in another currency posts unapplied, never straight to the receivable or payable, and each
   application posts on its own.
 - **Realized exchange.** `post#PaymentApplication` converts an application in another currency line by line
@@ -959,7 +968,11 @@ single-currency refusal of P4 and P19 (D18) is gone. The logic is in `ledger/Cur
   payments, or of `uomIdList`, gets a `CurrencyRateProposal` to the base currency, a cross rate through the provider's
   currency (12 places), not active until `accept#RateProposals` stores it through `store#Rate`;
   `reject#RateProposals` rejects. Each decision runs in its own transaction under the organization's lock; a pair and
-  day already proposed or accepted answers that proposal. All need `ACCOUNTING_ADMIN`.
+  day already proposed or accepted answers that proposal. All need `ACCOUNTING_ADMIN`. `refresh#Rates` runs outside a
+  transaction: the provider is asked first and `propose#Rates` writes the proposals in their own (F425). Rates are
+  global, so `store#Rate`, the CSV import and accepting a proposal check `Currencies.ratesAdmin`: finance administration
+  of every internal organization (ACCOUNTING_ADMIN, which AccountingPolicy scopes to all of them) or a system
+  administrator (F420).
 - **Kept as they are.** The settlement workbench (`CURRENCY_MISMATCH`), the payment lifecycle drafts, payment runs and
   internal transfers stay in the base currency; a document in another currency is paid through Mantle's payment and
   `apply#*` services. Credit exposure stays in the policy's currency (P10's `CURRENCY_DIFFERENT`), and landed costs

@@ -37,6 +37,8 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <set field="policy" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')"/>
             <script>policy.organization(context, 'admin')</script>
+            <!-- a rate is every organization's: finance administration of all of them (impl-accounting F420) -->
+            <script>ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js').ratesAdmin()</script>
             <set field="changeReason" from="policy.reason(context)"/>
             <script>policy.currency(uomId)</script>
             <script>policy.currency(toUomId)</script>
@@ -190,7 +192,7 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="rateSource"/>
         </out-parameters>
     </service>
-    <service verb="get" noun="EcbRates" allow-remote="false">
+    <service verb="get" noun="EcbRates" allow-remote="false" transaction="ignore">
         <description>The European Central Bank's daily euro reference rates (free, no key), from its daily file or the
             copy given. Refuses a file over 1 MiB or without its day or rates, and an answer of the bank that is not a
             success.</description>
@@ -210,13 +212,14 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="rateSource" from="fetched.rateSource"/>
         </actions>
     </service>
-    <service verb="refresh" noun="Rates" allow-remote="false">
+    <service verb="refresh" noun="Rates" allow-remote="false" transaction="ignore">
         <description>Ask the organization's rate provider (rateProviderServiceName) for the day's rates and propose a rate
             to the base currency for each currency the organization deals in (its invoices and payments), or each of
             uomIdList: a cross rate through the provider's currency. A proposal is not active until accept#RateProposals;
             the same pair and day proposed or accepted before answers that proposal. Refuses a user without finance
             administration, no base currency, no provider or one that is not an ExchangeRateProvider, and a provider without
-            the base currency.</description>
+            the base currency. It runs outside a transaction: the provider is asked first, then propose#Rates writes the
+            proposals in their own.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
             <parameter name="uomIdList" type="List"/>
@@ -234,6 +237,30 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="proposals" from="refreshed.proposals"/>
             <set field="skippedUomIds" from="refreshed.skippedUomIds"/>
             <set field="rateDay" from="refreshed.rateDay"/>
+        </actions>
+    </service>
+    <service verb="propose" noun="Rates" allow-remote="false">
+        <description>The proposals of refresh#Rates from a provider's answer, in their own transaction. Refuses a user
+            without finance administration and no base currency or base rate.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="uomIdList" type="List"/>
+            <parameter name="fromUomId" required="true"/>
+            <parameter name="rateDay" required="true"/>
+            <parameter name="rates" type="List"/>
+            <parameter name="rateSource"/>
+            <parameter name="providerServiceName" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="proposals" type="List"/>
+            <parameter name="skippedUomIds" type="List"/>
+            <parameter name="rateDay"/>
+        </out-parameters>
+        <actions>
+            <set field="proposed" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                    .execute('proposeRates', context)"/>
+            <set field="proposals" from="proposed.proposals"/>
+            <set field="skippedUomIds" from="proposed.skippedUomIds"/>
         </actions>
     </service>
     <service verb="get" noun="RateProposals" allow-remote="false">

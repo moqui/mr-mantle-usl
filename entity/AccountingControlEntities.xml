@@ -146,6 +146,15 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="exchangeRateSource" type="text-medium" enable-audit-log="update"/>
         <field name="exchangeRateToUomId" type="id" enable-audit-log="update"/>
     </extend-entity>
+    <extend-entity entity-name="Asset" package="mantle.product.asset">
+        <field name="exchangeRate" type="text-short" enable-audit-log="update">
+            <description>The decimal rate of acquireCostUomId to exchangeRateToUomId the asset's first posting took (its
+                receipt's); every later posting of the asset's cost in that currency converts at it, so its inventory
+                account clears (impl-accounting F417).</description></field>
+        <field name="exchangeRateDate" type="date-time" enable-audit-log="update"/>
+        <field name="exchangeRateSource" type="text-medium" enable-audit-log="update"/>
+        <field name="exchangeRateToUomId" type="id" enable-audit-log="update"/>
+    </extend-entity>
     <!-- A rate a provider proposed (refresh#Rates); it is active only when a finance user accepts it (store#Rate). -->
     <entity entity-name="CurrencyRateProposal" package="mantle.ledger.config" cache="never">
         <field name="rateProposalId" type="id" is-pk="true"/>

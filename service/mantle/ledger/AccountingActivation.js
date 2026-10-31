@@ -470,6 +470,16 @@ function readiness(p) {
                     type => !call("mantle.ledger.LedgerServices.get#DefaultGlAccountByType", {glAccountTypeEnumId: type, organizationPartyId: org}).glAccountId
                 )
                 if (unmapped.length) return ["warning", "Map the exchange gain and loss accounts; a settled exchange difference needs them", unmapped]
+                // postings made before base-currency posting in another currency stay as they are; reports name them
+                // incomplete (impl-accounting F428)
+                const unconverted = find("mantle.ledger.transaction.AcctgTrans", {organizationPartyId: org, isPosted: "Y"})
+                    .condition("amountUomId", "not-equals", base)
+                    .count()
+                if (unconverted)
+                    return [
+                        "warning",
+                        unconverted + " postings in another currency were made before base-currency posting; reports name them incomplete"
+                    ]
                 return used.size
                     ? ["ok", "Documents in " + [...used].sort().join(", ") + " post at their rates in " + base]
                     : ["ok", "Postings convert to " + base + " at the rate of their day"]
