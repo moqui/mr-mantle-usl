@@ -43,24 +43,19 @@ function product(productId, weight) {
             uomId: "WT_lb"
         })
 }
-function receive(productId, quantity, acquireCost) {
-    const out = call("mantle.product.AssetServices.receive#Asset", {
-        productId,
-        facilityId: f.facilityId,
-        quantity,
-        ownerPartyId: f.org,
-        acquireCost
-    })
+function receive(productId, quantity, acquireCost, extra = {}) {
+    const out = call(
+        "mantle.product.AssetServices.receive#Asset",
+        Object.assign({productId, facilityId: f.facilityId, quantity, ownerPartyId: f.org, acquireCost}, extra)
+    )
     call("update#mantle.product.asset.Asset", {assetId: out.assetId, acquireCostUomId: "USD"})
     return out
 }
-function issue(assetId, productId, quantity) {
-    const out = call("create#mantle.product.issuance.AssetIssuance", {
-        assetId,
-        productId,
-        quantity,
-        issuedDate: ec.user.nowTimestamp
-    })
+function issue(assetId, productId, quantity, extra = {}) {
+    const out = call(
+        "create#mantle.product.issuance.AssetIssuance",
+        Object.assign({assetId, productId, quantity, issuedDate: ec.user.nowTimestamp}, extra)
+    )
     call("create#mantle.product.asset.AssetDetail", {
         assetId,
         productId,
@@ -70,6 +65,54 @@ function issue(assetId, productId, quantity) {
         availableToPromiseDiff: -quantity
     })
     return out.assetIssuanceId
+}
+// An approved carrier bill with one freight line, posted to freight in.
+function freightBill(amount) {
+    const invoiceId = call("create#mantle.account.invoice.Invoice", {
+        invoiceTypeEnumId: "InvoiceSales",
+        fromPartyId: f.customer,
+        toPartyId: f.org,
+        statusId: "InvoiceIncoming",
+        invoiceDate: f.timestamp,
+        accountingDate: f.day,
+        currencyUomId: "USD",
+        draftedByUserId: ec.user.userId
+    }).invoiceId
+    call("mantle.account.InvoiceServices.create#InvoiceItem", {
+        invoiceId,
+        itemTypeEnumId: "ItemShipping",
+        quantity: "1",
+        amount: String(amount),
+        description: "Freight in"
+    })
+    call("update#mantle.account.invoice.Invoice", {invoiceId, statusId: "InvoiceApproved"})
+    const line = ec.entity.find("mantle.account.invoice.InvoiceItem").condition({invoiceId}).disableAuthz().one()
+    return {invoiceId, invoiceItemSeqId: line.invoiceItemSeqId}
+}
+// Preview a landed cost as the GL user, and post that preview with a new operation key.
+function landed(bill, receiptIds, basisEnumId = "LcbQuantity") {
+    return asUser(f.users.gl, () => {
+        const p = Object.assign({basisEnumId, assetReceiptIds: receiptIds.join(",")}, bill)
+        return {p, preview: call(BOOK + "preview#LandedCost", p)}
+    })
+}
+function postLanded(review, key) {
+    return asUser(f.users.gl, () =>
+        call(
+            BOOK + "post#LandedCost",
+            Object.assign({}, review.p, {
+                inputFingerprint: review.preview.inputFingerprint,
+                operationKey: key,
+                changeReason: "Landed cost spec"
+            })
+        )
+    )
+}
+function debits(acctgTransId) {
+    const out = {}
+    for (const r of entries(acctgTransId).filter(r => r.debitCreditFlag == "D"))
+        out[r.glAccountId] = (out[r.glAccountId] || toDecimal(0)).add(r.amount)
+    return out
 }
 function entries(acctgTransId) {
     return list("mantle.ledger.transaction.AcctgTransEntry", {acctgTransId})
@@ -396,3 +439,195 @@ feature("cost data repair is finance administration's, reposts the product's his
         events.length == 1 && events[0].eventTypeEnumId == "AbeCostDataRepair" && events[0].changeReason != null
     }
 })
+
+feature("a sale between the preview and the post makes the landed cost stale (F275)", {
+    when() {
+        product("P13_STALE", null)
+        const r = receive("P13_STALE", 10, 2)
+        const review = landed(freightBill(10), [r.assetReceiptId])
+        issue(r.assetId, "P13_STALE", 3)
+        const refused = asUser(f.users.gl, () =>
+            rejected(
+                BOOK + "post#LandedCost",
+                Object.assign({}, review.p, {
+                    inputFingerprint: review.preview.inputFingerprint,
+                    operationKey: "P13-STALE",
+                    changeReason: "Stale"
+                })
+            )
+        )
+        return {refused}
+    },
+    then({refused}) {
+        refused.includes("STALE_PREVIEW")
+    }
+})
+
+feature("two receipts into one asset moved out and back share one cost change (F276)", {
+    when() {
+        product("P13_SHARED", null)
+        const first = receive("P13_SHARED", 10, 2)
+        const second = receive("P13_SHARED", 10, 2, {assetId: first.assetId})
+        const other = call("create#mantle.product.asset.Asset", {
+            productId: "P13_SHARED",
+            ownerPartyId: f.org,
+            facilityId: f.facilityId,
+            assetTypeEnumId: "AstTpInventory",
+            hasQuantity: "Y",
+            quantityOnHandTotal: 0,
+            availableToPromiseTotal: 0,
+            acquireCost: 2,
+            acquireCostUomId: "USD"
+        }).assetId
+        // a move out to the other asset and back
+        for (const [from, to] of [
+            [first.assetId, other],
+            [other, first.assetId]
+        ]) {
+            call("create#mantle.product.asset.AssetDetail", {
+                assetId: from,
+                productId: "P13_SHARED",
+                otherAssetId: to,
+                effectiveDate: ec.user.nowTimestamp,
+                quantityOnHandDiff: -5,
+                availableToPromiseDiff: -5
+            })
+            call("create#mantle.product.asset.AssetDetail", {
+                assetId: to,
+                productId: "P13_SHARED",
+                otherAssetId: from,
+                effectiveDate: ec.user.nowTimestamp,
+                quantityOnHandDiff: 5,
+                availableToPromiseDiff: 5
+            })
+        }
+        const review = landed(freightBill(40), [first.assetReceiptId, second.assetReceiptId])
+        const posted = postLanded(review, "P13-SHARED")
+        return {
+            review,
+            posted,
+            asset: one("mantle.product.asset.Asset", {assetId: first.assetId}),
+            events: list("mantle.product.asset.AssetBookEvent", {acctgTransId: posted.acctgTransId})
+        }
+    },
+    then({review, posted, asset, events}) {
+        review.preview.complete == true
+        review.preview.allocationRows.every(r => toDecimal(r.onHandQuantity).compare(10) === 0)
+        events.length == 1
+        asset.acquireCost == 4
+    }
+})
+
+feature("cost data repair is refused after a landed cost, naming its transaction (F277)", {
+    when() {
+        const p = {
+            organizationPartyId: f.org,
+            productId: "P13_SHARED",
+            acquireCost: 3,
+            changeReason: "Repair after landed",
+            operationKey: "P13-REPAIR-LANDED"
+        }
+        return {refused: asUser(f.users.financeadmin, () => rejected(BOOK + "repair#ProductAcquireCost", p))}
+    },
+    then({refused}) {
+        refused.includes("BOOK_EVENTS")
+    }
+})
+
+feature("the issued share splits by what took the stock: 99 sold to cost of goods sold, 1 to a run to variance (F278)", {
+    when() {
+        call("create#mantle.ledger.config.GlAccountTypeDefault", {
+            organizationPartyId: f.org,
+            glAccountTypeEnumId: "GatProductionVariance",
+            glAccountId: "519200000"
+        })
+        call("create#mantle.work.effort.WorkEffort", {
+            workEffortId: "P13_RUN",
+            workEffortTypeEnumId: "WetTask",
+            workEffortName: "Valuation run",
+            ownerPartyId: f.org
+        })
+        product("P13_SPLIT", null)
+        const r = receive("P13_SPLIT", 100, 1)
+        issue(r.assetId, "P13_SPLIT", 99)
+        issue(r.assetId, "P13_SPLIT", 1, {workEffortId: "P13_RUN"})
+        const posted = postLanded(landed(freightBill(100), [r.assetReceiptId]), "P13-SPLIT")
+        return {lines: debits(posted.acctgTransId)}
+    },
+    then({lines}) {
+        lines["512000000"] == 99
+        lines["519200000"] == 1
+    }
+})
+
+feature("stock transferred to another facility keeps its on-hand share there (F279), which its valuation shows (F281)", {
+    when() {
+        // the in-transit account the organization's inventory mapping names (from DefaultSettings), assigned to it
+        call("create#mantle.ledger.account.GlAccountOrganization", {
+            organizationPartyId: f.org,
+            glAccountId: "142000000",
+            fromDate: 0
+        })
+        call("create#mantle.facility.Facility", {
+            facilityId: "ACCT_P13_WH2",
+            facilityTypeEnumId: "FcTpWarehouse",
+            ownerPartyId: f.org,
+            facilityName: "Valuation second warehouse"
+        })
+        product("P13_MOVED", null)
+        const r = receive("P13_MOVED", 10, 3)
+        const shipmentId = call("create#mantle.shipment.Shipment", {
+            shipmentTypeEnumId: "ShpTpTransfer",
+            fromPartyId: f.org,
+            toPartyId: f.org,
+            statusId: "ShipDelivered"
+        }).shipmentId
+        issue(r.assetId, "P13_MOVED", 4, {shipmentId})
+        const moved = receive("P13_MOVED", 4, 3, {shipmentId, facilityId: "ACCT_P13_WH2"})
+        const review = landed(freightBill(20), [r.assetReceiptId])
+        postLanded(review, "P13-MOVED")
+        return {
+            review,
+            there: one("mantle.product.asset.Asset", {assetId: moved.assetId}),
+            report: asUser(f.users.read, () =>
+                call(REPORT + "run#InventoryValuation", {organizationPartyId: f.org, facilityId: "ACCT_P13_WH2"})
+            )
+        }
+    },
+    then({review, there, report}) {
+        review.preview.allocationRows[0].onHandQuantity == 10
+        review.preview.allocationRows[0].issuedAmount == 0
+        there.acquireCost == 5
+        report.valuationRows.find(r => r.productId == "P13_MOVED").difference == 0
+    }
+})
+
+feature(
+    "$100 over 30,000 units posts quantity x unit change to inventory and the rest to cost of goods sold; an earlier day is at that day's cost (F280, F282)",
+    {
+        when() {
+            product("P13_BULK", null)
+            const yesterday = new Date(Number(ec.user.nowTimestamp) - 86400000)
+            const r = receive("P13_BULK", 30000, 1, {receivedDate: yesterday})
+            const posted = postLanded(landed(freightBill(100), [r.assetReceiptId]), "P13-BULK")
+            const report = day =>
+                asUser(f.users.read, () =>
+                    call(REPORT + "run#InventoryValuation", {organizationPartyId: f.org, productId: "P13_BULK", asOfDate: day})
+                )
+            return {
+                lines: debits(posted.acctgTransId),
+                asset: one("mantle.product.asset.Asset", {assetId: r.assetId}),
+                today: report(null),
+                earlier: report(ec.l10n.format(yesterday, "yyyy-MM-dd"))
+            }
+        },
+        then({lines, asset, today, earlier}) {
+            lines["141000000"] == 99
+            lines["512000000"] == 1
+            asset.acquireCost == 1.0033
+            today.valuationRows[0].value == 30099 && today.valuationRows[0].difference == 0
+            earlier.valuationRows[0].value == 30000 && earlier.valuationRows[0].difference == 0
+            earlier.pastDay == true
+        }
+    }
+)

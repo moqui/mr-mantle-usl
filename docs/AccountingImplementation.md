@@ -494,8 +494,9 @@ first release has local sales tax and the US 1099 data.
 `AssetBookServices` (logic in `ledger/AssetCosts.js`, beside Products P9's revaluation in `ledger/AssetBooks.js`) posts
 landed costs and repairs cost data. Every read checks Accounting's report read in the organization.
 
-- **Valuation.** `run#InventoryValuation`: the organization's inventory through a day at each asset's current cost
-  (`AssetValuationSummary`), by product, beside the posted net of its inventory accounts (the `GatInventory` default and
+- **Valuation.** `run#InventoryValuation`: the organization's inventory through a day, by asset (up to 5,000; else
+  incomplete), at each asset's cost on that day (its current cost, back to the cost before each later revaluation or
+  landed cost), by product, beside the posted net of its inventory accounts (the `GatInventory` default and
   every inventory `AssetTypeGlAccount` of the organization chain) for that product, with the totals of stock, inventory
   and WIP accounts and their difference; entries without a product are a row of their own. The exceptions are receipts,
   issues and count variances whose posting result is `AtrNoAcquireCost`, `AtrNoAcctgPreference` or `AtrPostingFailed`,
@@ -513,16 +514,20 @@ landed costs and repairs cost data. Every read checks Accounting's report read i
   is a posted bill's line of the `EngItemsLandedCost` group (`ItemShipping`, `ItemFee`, `ItemMiscCharge`) without a
   product, credited to the account the bill's posting debited for it. It is spread over posted inventory receipts of
   the organization by quantity, value (at the receipt date's cost), weight (`Weight`, else `ShippingWeight`) or volume;
-  each share splits by the receipt's stock still on hand (also in an asset a revaluation split it into), which raises
-  that asset's cost from the accounting date (an `AbeLandedCost` book event), and what already left, which goes to the
-  asset type's issuance account (cost of goods sold), or `GatProductionVariance` for stock issued to work. The preview's
+  each share splits by the receipt's stock still on hand (also in the assets a revaluation split it into, a move put it
+  in, or a transfer shipment received at another facility of the organization; each asset once), which raises that
+  asset's cost from the accounting date (an `AbeLandedCost` book event; the shares of one asset summed), and what already
+  left, which goes by issue kind to the asset type's issuance account (cost of goods sold) or `GatProductionVariance`
+  (issued to work). The inventory posts quantity × the unit change at the cost's four decimals; the rest of the share
+  goes to cost of goods sold, so the stock and the account move alike. The preview's
   `inputFingerprint` covers the line, receipts, stock and accounts; the post locks the organization, the bill and the
   assets, refuses a stale preview, findings, a line already allocated (`ALREADY_ALLOCATED`, checked after the operation
   key's earlier answer) and an account not active for the organization, posts one `AttLandedCost` transaction and keeps
   a `LandedCostAllocation` row per receipt.
 - **Cost data repair.** `repair#ProductAcquireCost` (`ACCOUNTING_ADMIN`; reason; operation key): the organization's
   inventory assets of a product (and facility) get the cost through `AssetServices.update#AssetAcquireCost`, which
-  reposts their history, only when every posted transaction of those assets is in an open period; each change is an
+  reposts their history, only when every posted transaction of those assets is in an open period and they have no
+  revaluation or landed cost events (`BOOK_EVENTS`, naming the transactions to reverse first); each change is an
   `AbeCostDataRepair` event. Mantle's `update#ProductAcquireCost` is not organization-scoped and is not called.
 - **Scrap by reason.** `post#PhysicalInventoryVariance` posts a count variance to the organization's
   `VarianceReasonGlAccount` for its reason, then, for a scrap reason (`enumCode` scrap: `InVrScrap`, `InVrExpired`), to

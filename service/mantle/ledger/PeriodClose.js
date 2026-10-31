@@ -356,19 +356,39 @@ const checks = {
     },
     // Receipts and issues of the period's stock that posted nothing (no cost, no accounting preference, a failed
     // posting) for the organizations' assets (impl-accounting F10).
-    // A receipt without a cost (AtrNoAcquireCost) is the valuation row PccReceiptCostBasis's (InventoryReportServices).
     PccStockPostings(c) {
         const failed = ["AtrNoAcquireCost", "AtrNoAcctgPreference", "AtrPostingFailed"]
         const found = []
         let count = 0
+        const cf = ec.entity.conditionFactory
+        // an inventory receipt without a cost is PccReceiptCostBasis's; another kind's (supplies, fixed assets) is here
+        const receiptResults = cf.makeCondition(
+            [
+                cf.makeCondition("acctgTransResultEnumId", "in", failed.slice(1)),
+                cf.makeCondition(
+                    [
+                        cf.makeCondition("acctgTransResultEnumId", "equals", "AtrNoAcquireCost"),
+                        cf.makeCondition("assetTypeEnumId", "not-equals", "AstTpInventory")
+                    ],
+                    "and"
+                )
+            ],
+            "or"
+        )
         for (const [entity, idField, dateField, label, results] of [
-            ["mantle.product.receipt.AssetReceiptAndOwner", "assetReceiptId", "receivedDate", "Receipt", failed.slice(1)],
-            ["mantle.product.issuance.AssetIssuanceAndOwner", "assetIssuanceId", "issuedDate", "Issue", failed]
+            ["mantle.product.receipt.AssetReceiptValuation", "assetReceiptId", "receivedDate", "Receipt", receiptResults],
+            [
+                "mantle.product.issuance.AssetIssuanceAndOwner",
+                "assetIssuanceId",
+                "issuedDate",
+                "Issue",
+                cf.makeCondition("acctgTransResultEnumId", "in", failed)
+            ]
         ]) {
             const query = () =>
                 find(entity)
                     .condition("ownerPartyId", "in", c.organizations)
-                    .condition("acctgTransResultEnumId", "in", results)
+                    .condition(results)
                     .condition(stampInPeriod(c, dateField))
             count += query().count()
             for (const movement of query().orderBy(idField).limit(ITEM_LIMIT).list())

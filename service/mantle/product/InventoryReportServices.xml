@@ -207,7 +207,8 @@ along with this software (see the LICENSE.md file). If not, see
 
     <!-- Accounting's inventory valuation (impl-accounting P13; logic in product/InventoryValuation.js) -->
     <service verb="run" noun="InventoryValuation" allow-remote="false">
-        <description>An organization's inventory valued at each asset's current cost (AssetValuationSummary) through a day,
+        <description>An organization's inventory valued at each asset's cost on a day (AssetValuationSummary's current cost,
+            back to the cost before each later revaluation or landed cost) through that day,
             by product beside the posted balance of its inventory accounts, with the totals of stock, the inventory and WIP
             accounts and their difference; the movements that explain a difference (receipts and issues that posted
             nothing, zero-cost receipts, count variances that did not post, stock postings in the error journal) and the
@@ -236,6 +237,9 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="complete" type="Boolean"/>
             <parameter name="exceptionRows" type="List"/>
             <parameter name="wipRows" type="List"/>
+            <parameter name="wipComplete" type="Boolean"/>
+            <parameter name="facilityFiltered" type="Boolean"/>
+            <parameter name="pastDay" type="Boolean"/>
             <parameter name="canRepair" type="Boolean"/>
             <parameter name="canRevalue" type="Boolean"/>
         </out-parameters>
@@ -256,6 +260,9 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="complete" from="out.complete"/>
             <set field="exceptionRows" from="out.exceptionRows"/>
             <set field="wipRows" from="out.wipRows"/>
+            <set field="wipComplete" from="out.wipComplete"/>
+            <set field="facilityFiltered" from="out.facilityFiltered"/>
+            <set field="pastDay" from="out.pastDay"/>
             <set field="canRepair" from="out.canRepair"/>
             <set field="canRevalue" from="out.canRevalue"/>
         </actions>

@@ -63,7 +63,9 @@ function ledgerNet(org, accounts, afterDay, byField, conditions = {}) {
     let q = find("mantle.ledger.transaction.AcctgTransAndEntrySummary", {organizationPartyId: org, isPosted: "Y"})
         .condition("glAccountId", "in", accounts)
         .condition(lib.accountingDateCondition({thruDate: midnight(afterDay), thruDay: afterDay}))
-    for (const [field, value] of Object.entries(conditions)) if (value) q = q.condition(field, value)
+    for (const [field, value] of Object.entries(conditions))
+        if (Array.isArray(value)) q = q.condition(field, "in", value.length ? value : ["_NA_"])
+        else if (value) q = q.condition(field, value)
     for (const field of [byField, "debitCreditFlag", "amount"]) q = q.selectField(field)
     for (const row of q.list()) {
         const key = row[byField] || ""
@@ -72,7 +74,12 @@ function ledgerNet(org, accounts, afterDay, byField, conditions = {}) {
     }
     return out
 }
-function stockQuery(org, afterDay, p) {
+// The organization's inventory through a day, by asset: its quantity then, at its cost then. The cost is the asset's
+// current cost, back to the cost before each revaluation or landed cost dated after the day (a repair reposts history,
+// so it is not undone). Up to ASSET_LIMIT assets; beyond that the stock is incomplete.
+const ASSET_LIMIT = 5000
+function stockOf(org, afterDay, p = {}) {
+    const currency = lib.preference(org).baseCurrencyUomId
     let q = find("mantle.product.asset.AssetValuationSummary", {ownerPartyId: org, assetTypeEnumId: "AstTpInventory"}).condition(
         "effectiveDate",
         "less",
@@ -80,30 +87,80 @@ function stockQuery(org, afterDay, p) {
     )
     if (p.facilityId) q = q.condition("facilityId", p.facilityId)
     if (p.productId) q = q.condition("productId", p.productId)
-    return q
+    for (const field of ["assetId", "productId", "acquireCost", "acquireCostUomId", "quantityOnHandDiff"])
+        q = q.selectField(field)
+    const found = Array.from(
+        q
+            .orderBy("assetId")
+            .limit(ASSET_LIMIT + 1)
+            .list()
+    )
+    const complete = found.length <= ASSET_LIMIT
+    const assets = found.slice(0, ASSET_LIMIT).filter(r => toDecimal(r.quantityOnHandDiff ?? 0).compare(0) !== 0)
+    const earlierCost = {}
+    if (afterDay <= today() && assets.length)
+        for (const event of find("mantle.product.asset.AssetBookEvent")
+            .condition(
+                "assetId",
+                "in",
+                assets.map(a => a.assetId)
+            )
+            .condition("eventTypeEnumId", "in", ["AbeInventoryRevaluation", "AbeLandedCost"])
+            .condition("eventDate", "greater-equals", midnight(afterDay))
+            .orderBy("-eventDate")
+            .list())
+            earlierCost[event.assetId] = event.previousUnitCost
+    const byProduct = {}
+    let total = toDecimal(0),
+        otherCurrency = false
+    for (const asset of assets) {
+        const entry =
+            byProduct[asset.productId] ||
+            (byProduct[asset.productId] = {quantity: toDecimal(0), value: toDecimal(0), minCost: null, maxCost: null})
+        const quantity = toDecimal(asset.quantityOnHandDiff)
+        const cost = Object.prototype.hasOwnProperty.call(earlierCost, asset.assetId)
+            ? earlierCost[asset.assetId]
+            : asset.acquireCost
+        entry.quantity = entry.quantity.add(quantity)
+        if (asset.acquireCostUomId && asset.acquireCostUomId !== currency) {
+            entry.otherCurrency = otherCurrency = true
+            continue
+        }
+        const value = quantity.multiply(toDecimal(cost ?? 0))
+        entry.value = entry.value.add(value)
+        total = total.add(value)
+        if (cost != null) {
+            if (entry.minCost == null || toDecimal(cost).compare(entry.minCost) < 0) entry.minCost = toDecimal(cost)
+            if (entry.maxCost == null || toDecimal(cost).compare(entry.maxCost) > 0) entry.maxCost = toDecimal(cost)
+        }
+    }
+    return {currency, byProduct, total: money(total, currency), otherCurrency, complete}
+}
+// The ledger conditions of a valuation's filters: a product, and for a facility the organization's assets there (stock
+// postings name their asset; few name a facility).
+function ledgerFilter(org, p) {
+    const out = {}
+    if (p.productId) out.productId = p.productId
+    if (p.facilityId)
+        out.assetId = Array.from(
+            find("mantle.product.asset.Asset", {ownerPartyId: org, facilityId: p.facilityId})
+                .selectField("assetId")
+                .limit(ASSET_LIMIT)
+                .list()
+        ).map(r => r.assetId)
+    return out
 }
 // The stock value and the inventory and WIP balances of an organization through a day, and the difference.
 function tieOut(org, afterDay, p = {}) {
-    const currency = lib.preference(org).baseCurrencyUomId
     const accounts = stockAccounts(org)
-    let stockValue = toDecimal(0),
-        otherCurrency = false
-    for (const row of stockQuery(org, afterDay, p)
-        .selectField("acquireCostUomId")
-        .selectField("quantityOnHandDiff")
-        .selectField("totalCost")
-        .list()) {
-        if (row.acquireCostUomId && row.acquireCostUomId !== currency) otherCurrency = true
-        else stockValue = stockValue.add(toDecimal(row.totalCost ?? 0))
-    }
-    const facility = p.facilityId ? {facilityId: p.facilityId} : {},
-        product = p.productId ? {productId: p.productId} : {}
-    const inventoryByAccount = ledgerNet(org, accounts.inventory, afterDay, "glAccountId", Object.assign({}, facility, product))
-    const wipByAccount = ledgerNet(org, accounts.wip, afterDay, "glAccountId", Object.assign({}, facility, product))
+    const stock = stockOf(org, afterDay, p)
+    const currency = stock.currency
+    const filter = ledgerFilter(org, p)
+    const inventoryByAccount = ledgerNet(org, accounts.inventory, afterDay, "glAccountId", filter)
+    const wipByAccount = ledgerNet(org, accounts.wip, afterDay, "glAccountId", filter)
     const sum = byAccount => Object.values(byAccount).reduce((total, v) => total.add(v), toDecimal(0))
     const inventoryBalance = money(sum(inventoryByAccount), currency),
         wipBalance = money(sum(wipByAccount), currency)
-    stockValue = money(stockValue, currency)
     const names = Object.fromEntries(
         accounts.inventory.length + accounts.wip.length
             ? Array.from(
@@ -121,13 +178,16 @@ function tieOut(org, afterDay, p = {}) {
     )
     return {
         currency,
-        stockValue,
+        stock,
+        stockValue: stock.total,
         inventoryBalance,
         wipBalance,
-        difference: stockValue.subtract(inventoryBalance),
-        otherCurrency,
+        difference: stock.total.subtract(inventoryBalance),
+        otherCurrency: stock.otherCurrency,
+        complete: stock.complete,
         accounts,
-        accountRows
+        accountRows,
+        filter
     }
 }
 function asOf(p) {
@@ -146,34 +206,13 @@ function valuation(p) {
     const day = asOf(p),
         afterDay = dayAfter(day)
     const totals = tieOut(org, afterDay, p)
+    const wip = wipByRun(org, afterDay, p)
     const currency = totals.currency
-    const stock = {}
-    let truncated = false
-    const grouped = Array.from(
-        stockQuery(org, afterDay, p)
-            .selectField("productId")
-            .selectField("acquireCostUomId")
-            .selectField("quantityOnHandDiff")
-            .selectField("totalCost")
-            .selectField("minAcquireCost")
-            .selectField("maxAcquireCost")
-            .orderBy("productId")
-            .limit(ROW_LIMIT + 1)
-            .list()
-    )
-    if (grouped.length > ROW_LIMIT) truncated = true
-    for (const row of grouped.slice(0, ROW_LIMIT)) {
-        const key = row.productId
-        const entry = stock[key] || (stock[key] = {quantity: toDecimal(0), value: toDecimal(0), otherCurrency: false})
-        entry.quantity = entry.quantity.add(toDecimal(row.quantityOnHandDiff ?? 0))
-        if (row.acquireCostUomId && row.acquireCostUomId !== currency) entry.otherCurrency = true
-        else entry.value = entry.value.add(toDecimal(row.totalCost ?? 0))
-        entry.minCost = row.minAcquireCost
-        entry.maxCost = row.maxAcquireCost
-    }
-    const facility = p.facilityId ? {facilityId: p.facilityId} : {},
-        productFilter = p.productId ? {productId: p.productId} : {}
-    const ledger = ledgerNet(org, totals.accounts.inventory, afterDay, "productId", Object.assign({}, facility, productFilter))
+    const stock = totals.stock.byProduct
+    const truncated = !totals.complete
+    const ledger = ledgerNet(org, totals.accounts.inventory, afterDay, "productId", totals.filter)
+    // when the stock is incomplete, only its products are compared with their ledger
+    if (truncated) for (const key of Object.keys(ledger)) if (key && !stock[key]) delete ledger[key]
     const ids = [...new Set([...Object.keys(stock), ...Object.keys(ledger).filter(Boolean)])]
     const names = productNames(ids)
     const standards = {}
@@ -242,7 +281,10 @@ function valuation(p) {
         valuationRowsPageRangeHigh: Math.min(valuationRows.length, (pageIndex + 1) * pageSize),
         complete: !truncated,
         exceptionRows: exceptions(org, afterDay, p),
-        wipRows: wipByRun(org, p),
+        facilityFiltered: !!p.facilityId,
+        pastDay: day < today(),
+        wipRows: wip.rows,
+        wipComplete: wip.complete,
         canRepair: !!s.capabilities.admin,
         canRevalue: !!s.capabilities.glPost
     }
@@ -359,20 +401,30 @@ function exceptions(org, afterDay, p = {}) {
 }
 // Production runs and other work with stock issued to it that its receipts have not taken back out, by the assets'
 // current cost: the WIP a run holds until its cost close.
-function wipByRun(org, p = {}) {
+function wipByRun(org, afterDay, p = {}) {
     const net = {}
-    const add = (entity, quantityField, sign) => {
-        let q = find(entity, {ownerPartyId: org}).condition("workEffortId", "is-not-null", null)
+    let complete = true
+    const add = (entity, quantityField, dateField, sign) => {
+        let q = find(entity, {ownerPartyId: org})
+            .condition("workEffortId", "is-not-null", null)
+            .condition(dateField, "less", midnight(afterDay))
         if (p.facilityId) q = q.condition("facilityId", p.facilityId)
-        for (const row of q.limit(ROW_LIMIT).list()) {
+        const found = Array.from(
+            q
+                .orderBy(dateField + ",workEffortId")
+                .limit(ROW_LIMIT + 1)
+                .list()
+        )
+        if (found.length > ROW_LIMIT) complete = false
+        for (const row of found.slice(0, ROW_LIMIT)) {
             const value = toDecimal(row[quantityField] ?? 0).multiply(toDecimal(row.acquireCost ?? 0))
             net[row.workEffortId] = (net[row.workEffortId] || toDecimal(0)).add(sign > 0 ? value : value.negate())
         }
     }
-    add(ISSUE, "quantity", 1)
-    add(RECEIPT, "quantityAccepted", -1)
+    add(ISSUE, "quantity", "issuedDate", 1)
+    add(RECEIPT, "quantityAccepted", "receivedDate", -1)
     const ids = Object.keys(net).filter(id => net[id].compare(0) !== 0)
-    if (!ids.length) return []
+    if (!ids.length) return {rows: [], complete}
     const currency = lib.preference(org).baseCurrencyUomId
     const efforts = Object.fromEntries(
         Array.from(find("mantle.work.effort.WorkEffort").condition("workEffortId", "in", ids).list()).map(r => [
@@ -396,17 +448,16 @@ function wipByRun(org, p = {}) {
         .useCache(true)
         .list())
         statuses[row.statusId] = row.description
-    return ids
-        .filter(id => !["WeCancelled"].includes(efforts[id]?.statusId))
-        .sort()
-        .slice(0, LIST_LIMIT)
-        .map(id => ({
-            workEffortId: id,
-            workEffortName: efforts[id]?.workEffortName || id,
-            statusText: statuses[efforts[id]?.statusId] || "",
-            openWip: money(net[id], currency),
-            currency
-        }))
+    const open = ids.filter(id => !["WeCancelled"].includes(efforts[id]?.statusId)).sort()
+    if (open.length > LIST_LIMIT) complete = false
+    const rowsOut = open.slice(0, LIST_LIMIT).map(id => ({
+        workEffortId: id,
+        workEffortName: efforts[id]?.workEffortName || id,
+        statusText: statuses[efforts[id]?.statusId] || "",
+        openWip: money(net[id], currency),
+        currency
+    }))
+    return {rows: rowsOut, complete}
 }
 
 // The period or dates of a report, checked against the organization.
@@ -530,9 +581,7 @@ function productAccounting(p) {
     const currency = lib.preference(org).baseCurrencyUomId
     const afterDay = dayAfter(today())
     const totals = tieOut(org, afterDay, {productId})
-    let quantity = toDecimal(0)
-    for (const row of stockQuery(org, afterDay, {productId}).selectField("quantityOnHandDiff").list())
-        quantity = quantity.add(toDecimal(row.quantityOnHandDiff ?? 0))
+    const quantity = totals.stock.byProduct[productId]?.quantity ?? toDecimal(0)
     const standards = rows("mantle.product.cost.ProductStandardCost", {productId, organizationPartyId: org, state: "approved"})
         .sort((a, b) => (ms(b.fromDate) ?? 0) - (ms(a.fromDate) ?? 0))
         .slice(0, LIST_LIMIT)

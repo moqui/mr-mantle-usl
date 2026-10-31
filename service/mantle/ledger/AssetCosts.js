@@ -11,6 +11,8 @@ const {find, one, rows, map, call, ms, denied} = lib
 const ALLOCATION = "mantle.account.invoice.LandedCostAllocation"
 const ASSET = "mantle.product.asset.Asset"
 const RECEIPT_LIMIT = 50
+// the decimals Asset.acquireCost keeps (currency-amount): a new unit cost is rounded to them before the inventory posts
+const COST_SCALE = 4
 const BASIS_DIMENSIONS = {LcbWeight: ["Weight", "ShippingWeight"], LcbVolume: ["Volume"]}
 
 // The bill and its organization, read through the Accounting record check (a bill of an organization the user works in).
@@ -131,22 +133,51 @@ function sources(p) {
         canPost: !!scope.capabilities.glPost
     }
 }
-// A receipt's asset and the assets a revaluation split its stock into, each with its own on-hand quantity.
-function heldBy(asset, lock, depth = 0) {
+// A receipt's asset and the assets its stock went on to: those a revaluation split it into or a move put it in
+// (AssetDetail.otherAssetId), and those a transfer shipment's issue received at another facility of the organization.
+// Each asset once (a move out and back is not followed twice), in a stable order.
+function successors(asset, org) {
+    const ids = new Set(
+        rows("mantle.product.asset.AssetDetail", {otherAssetId: asset.assetId})
+            .filter(r => toDecimal(r.quantityOnHandDiff || 0).compare(0) > 0)
+            .map(r => r.assetId)
+    )
+    for (const issue of rows("mantle.product.issuance.AssetIssuance", {assetId: asset.assetId}).filter(r => r.shipmentId)) {
+        const shipment = one("mantle.shipment.Shipment", {shipmentId: issue.shipmentId})
+        if (shipment?.shipmentTypeEnumId !== "ShpTpTransfer") continue
+        for (const receipt of rows("mantle.product.receipt.AssetReceipt", {shipmentId: issue.shipmentId}))
+            if (receipt.productId === asset.productId) ids.add(receipt.assetId)
+    }
+    return [...ids]
+        .filter(id => id && id !== asset.assetId)
+        .map(id => one(ASSET, {assetId: id}))
+        .filter(a => a && a.ownerPartyId === org)
+        .sort((a, b) => a.assetId.localeCompare(b.assetId))
+}
+function heldBy(asset, org, lock, visited = new Set()) {
+    if (visited.has(asset.assetId) || visited.size > 50) return []
+    visited.add(asset.assetId)
     const current = lock ? find(ASSET, {assetId: asset.assetId}).forUpdate(true).one() : asset
     const out = [current]
-    if (depth > 4) return out
-    const successors = [
-        ...new Set(
-            rows("mantle.product.asset.AssetDetail", {otherAssetId: asset.assetId})
-                .filter(r => toDecimal(r.quantityOnHandDiff || 0).compare(0) > 0 && r.assetId !== asset.assetId)
-                .map(r => r.assetId)
-        )
-    ].sort()
-    for (const assetId of successors) {
-        const next = one(ASSET, {assetId})
-        if (next) out.push(...heldBy(next, lock, depth + 1))
-    }
+    for (const next of successors(asset, org)) out.push(...heldBy(next, org, lock, visited))
+    return out
+}
+// What left a chain of assets by issue (a transfer to another facility of the organization stays held): to work, and
+// otherwise (a sale, a return to a supplier).
+function issuedByKind(chain) {
+    const out = {run: toDecimal(0), other: toDecimal(0)}
+    for (const asset of chain)
+        for (const issue of rows("mantle.product.issuance.AssetIssuance", {assetId: asset.assetId})) {
+            const quantity = toDecimal(issue.quantity ?? 0).subtract(toDecimal(issue.quantityCancelled ?? 0))
+            if (quantity.compare(0) <= 0) continue
+            if (
+                issue.shipmentId &&
+                one("mantle.shipment.Shipment", {shipmentId: issue.shipmentId})?.shipmentTypeEnumId === "ShpTpTransfer"
+            )
+                continue
+            if (issue.workEffortId) out.run = out.run.add(quantity)
+            else out.other = out.other.add(quantity)
+        }
     return out
 }
 function measure(receipt, asset, basis) {
@@ -176,14 +207,10 @@ function assetAccounts(org, asset) {
         classEnumId: asset.classEnumId,
         assetId: asset.assetId
     }).assetTypeGlAccount
-    const toRun = find("mantle.product.issuance.AssetIssuance", {assetId: asset.assetId})
-        .condition("workEffortId", "is-not-null", null)
-        .count()
     return {
         assetGlAccountId: mapping?.assetGlAccountId || defaultAccount(org, "GatInventory"),
-        issuedGlAccountId: toRun
-            ? defaultAccount(org, "GatProductionVariance")
-            : mapping?.issuanceGlAccountId || defaultAccount(org, "GatCogs")
+        cogsGlAccountId: mapping?.issuanceGlAccountId || defaultAccount(org, "GatCogs"),
+        varianceGlAccountId: defaultAccount(org, "GatProductionVariance")
     }
 }
 // The allocation of a charge line over receipts, with the findings that keep it from posting.
@@ -255,7 +282,14 @@ function calculate(p, lock = false) {
     const totalBasis = measured.reduce((sum, r) => sum.add(r.basisValue), toDecimal(0))
     if (measured.length && totalBasis.compare(0) <= 0) finding(bill.invoiceId, "The receipts' basis adds up to zero")
     const allocationRows = []
-    const assetRows = []
+    const holderShares = new Map()
+    const debitRows = []
+    const debit = (glAccountId, amount, assetId, productId, facilityId) => {
+        if (amount.compare(0) === 0) return
+        const row = debitRows.find(r => r.glAccountId === glAccountId && r.assetId === assetId)
+        if (row) row.amount = row.amount.add(amount)
+        else debitRows.push({glAccountId, amount, assetId, productId, facilityId: facilityId || null})
+    }
     let remaining = toDecimal(line.amount)
     measured.forEach((m, index) => {
         const last = index === measured.length - 1
@@ -267,16 +301,29 @@ function calculate(p, lock = false) {
                 : toDecimal(0)
         remaining = remaining.subtract(share)
         const accepted = toDecimal(m.receipt.quantityAccepted)
-        const holders = heldBy(m.asset, lock).filter(a => toDecimal(a.quantityOnHandTotal || 0).compare(0) > 0)
+        const chain = heldBy(m.asset, org, lock)
+        const holders = chain.filter(a => toDecimal(a.quantityOnHandTotal || 0).compare(0) > 0)
         let onHand = holders.reduce((sum, a) => sum.add(a.quantityOnHandTotal), toDecimal(0))
         if (onHand.compare(accepted) > 0) onHand = accepted
         const issued = accepted.subtract(onHand)
         const onHandAmount = lib.lib.money(share.multiply(onHand).divide(accepted, 12, "HALF_UP"), currency)
         const issuedAmount = share.subtract(onHandAmount)
         const accounts = assetAccounts(org, m.asset)
-        if (issuedAmount.compare(0) !== 0 && !accounts.issuedGlAccountId)
-            finding(m.receipt.assetReceiptId, "Map the cost of goods sold or production variance account")
-        // the on-hand share raises the cost of each asset holding the receipt's stock, by its on-hand quantity
+        // the issued share by what took the stock: work to production variance, the rest to cost of goods sold
+        const kinds = issuedByKind(chain)
+        const kindTotal = kinds.run.add(kinds.other)
+        const runAmount =
+            kindTotal.compare(0) > 0 && issuedAmount.compare(0) !== 0
+                ? lib.lib.money(issuedAmount.multiply(kinds.run).divide(kindTotal, 12, "HALF_UP"), currency)
+                : toDecimal(0)
+        const cogsAmount = issuedAmount.subtract(runAmount)
+        if (runAmount.compare(0) !== 0 && !accounts.varianceGlAccountId)
+            finding(m.receipt.assetReceiptId, "Map the production variance account")
+        if (cogsAmount.compare(0) !== 0 && !accounts.cogsGlAccountId)
+            finding(m.receipt.assetReceiptId, "Map the cost of goods sold account")
+        debit(accounts.varianceGlAccountId, runAmount, m.asset.assetId, m.receipt.productId)
+        debit(accounts.cogsGlAccountId, cogsAmount, m.asset.assetId, m.receipt.productId)
+        // the on-hand share goes to the assets holding the receipt's stock, by their quantity
         let left = onHandAmount,
             leftQuantity = onHand
         for (const holder of holders) {
@@ -291,22 +338,10 @@ function calculate(p, lock = false) {
                     : lib.lib.money(onHandAmount.multiply(quantity).divide(onHand, 12, "HALF_UP"), currency)
             left = left.subtract(amount)
             leftQuantity = leftQuantity.subtract(quantity)
-            const held = assetAccounts(org, holder)
-            if (!held.assetGlAccountId) finding(holder.assetId, "Map the inventory account")
-            const previous = toDecimal(holder.acquireCost ?? 0)
-            const perUnit = amount.divide(toDecimal(holder.quantityOnHandTotal), 6, "HALF_UP")
-            assetRows.push({
-                assetId: holder.assetId,
-                assetReceiptId: m.receipt.assetReceiptId,
-                productId: holder.productId,
-                facilityId: holder.facilityId,
-                quantity: holder.quantityOnHandTotal,
-                amount,
-                previousUnitCost: previous,
-                newUnitCost: previous.add(perUnit),
-                assetGlAccountId: held.assetGlAccountId
-            })
-            evidence.push(lib.pick(map(holder), ["assetId", "quantityOnHandTotal", "acquireCost", "lastUpdatedStamp"]))
+            const held = holderShares.get(holder.assetId) || {holder, amount: toDecimal(0), receiptIds: []}
+            held.amount = held.amount.add(amount)
+            held.receiptIds.push(m.receipt.assetReceiptId)
+            holderShares.set(holder.assetId, held)
         }
         allocationRows.push({
             assetReceiptId: m.receipt.assetReceiptId,
@@ -325,15 +360,52 @@ function calculate(p, lock = false) {
             issuedAmount,
             amountUomId: currency,
             assetGlAccountId: accounts.assetGlAccountId,
-            issuedGlAccountId: accounts.issuedGlAccountId,
-            previousUnitCost: toDecimal(m.asset.acquireCost ?? 0),
-            newUnitCost: assetRows.find(r => r.assetId === m.asset.assetId)?.newUnitCost ?? toDecimal(m.asset.acquireCost ?? 0)
+            issuedGlAccountId:
+                runAmount.compare(0) !== 0 && cogsAmount.compare(0) === 0
+                    ? accounts.varianceGlAccountId
+                    : accounts.cogsGlAccountId,
+            runIssuedAmount: runAmount,
+            previousUnitCost: toDecimal(m.asset.acquireCost ?? 0)
         })
+        // the receipt's own asset is evidence even when it holds no stock: a sale from it changes the split
+        evidence.push(lib.pick(map(m.asset), ["assetId", "quantityOnHandTotal", "acquireCost", "lastUpdatedStamp"]))
+        for (const asset of chain.slice(1))
+            evidence.push(lib.pick(map(asset), ["assetId", "quantityOnHandTotal", "acquireCost", "lastUpdatedStamp"]))
         evidence.push(lib.pick(map(m.receipt), ["assetReceiptId", "quantityAccepted", "lastUpdatedStamp"]))
     })
+    // each holding asset's new cost from the sum of its shares; the inventory posts quantity x unit change, and the
+    // rounding left goes to cost of goods sold, so the stock value and the inventory account move alike
+    const assetRows = []
+    for (const [assetId, held] of [...holderShares.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+        const holder = held.holder
+        const quantity = toDecimal(holder.quantityOnHandTotal)
+        const perUnit = held.amount.divide(quantity, COST_SCALE, "HALF_UP")
+        const posted = lib.lib.money(perUnit.multiply(quantity), currency)
+        const accounts = assetAccounts(org, holder)
+        if (!accounts.assetGlAccountId) finding(assetId, "Map the inventory account")
+        const previous = toDecimal(holder.acquireCost ?? 0)
+        assetRows.push({
+            assetId,
+            assetReceiptIds: held.receiptIds,
+            productId: holder.productId,
+            facilityId: holder.facilityId,
+            quantity,
+            amount: posted,
+            previousUnitCost: previous,
+            newUnitCost: previous.add(perUnit),
+            assetGlAccountId: accounts.assetGlAccountId
+        })
+        debit(accounts.assetGlAccountId, posted, assetId, holder.productId, holder.facilityId)
+        const residue = held.amount.subtract(posted)
+        if (residue.compare(0) !== 0) {
+            if (!accounts.cogsGlAccountId) finding(assetId, "Map the cost of goods sold account")
+            debit(accounts.cogsGlAccountId, residue, assetId, holder.productId)
+        }
+    }
+    for (const row of allocationRows)
+        row.newUnitCost = assetRows.find(r => r.assetId === row.assetId)?.newUnitCost ?? row.previousUnitCost
     // every account the posting would use must be an active posting account of the organization
-    const accounts = new Set([line.chargeGlAccountId, ...assetRows.map(r => r.assetGlAccountId)])
-    for (const row of allocationRows) if (row.issuedAmount.compare(0) !== 0) accounts.add(row.issuedGlAccountId)
+    const accounts = new Set([line.chargeGlAccountId, ...debitRows.map(r => r.glAccountId)])
     for (const glAccountId of [...accounts].filter(Boolean).sort())
         try {
             lib.account(org, glAccountId, ec.l10n.parseTimestamp(day + " 12:00:00", "yyyy-MM-dd HH:mm:ss"))
@@ -349,11 +421,29 @@ function calculate(p, lock = false) {
         chargeGlAccountId: line.chargeGlAccountId,
         allocationRows,
         assetRows,
+        debitRows,
         findings,
         complete: findings.length === 0 && allocationRows.length > 0,
         totalAmount: total,
         amountUomId: currency,
-        inputFingerprint: lib.hash({request, evidence, allocationRows: allocationRows.map(r => lib.pick(r, ["amount"]))})
+        inputFingerprint: lib.hash({
+            request,
+            evidence,
+            allocationRows: allocationRows.map(r =>
+                lib.pick(r, [
+                    "assetReceiptId",
+                    "amount",
+                    "onHandQuantity",
+                    "onHandAmount",
+                    "issuedAmount",
+                    "runIssuedAmount",
+                    "assetGlAccountId",
+                    "issuedGlAccountId"
+                ])
+            ),
+            assetRows: assetRows.map(r => lib.pick(r, ["assetId", "amount", "newUnitCost", "assetGlAccountId"])),
+            debitRows: debitRows.map(r => lib.pick(r, ["glAccountId", "amount", "assetId"]))
+        })
     }
 }
 function shape(out) {
@@ -416,25 +506,15 @@ function post(p) {
     const acctgTransId = transaction.acctgTransId
     const entry = values =>
         call("mantle.ledger.LedgerServices.create#AcctgTransEntry", Object.assign({acctgTransId, description: why}, values))
-    for (const row of out.assetRows)
-        if (row.amount.compare(0) !== 0)
-            entry({
-                glAccountId: row.assetGlAccountId,
-                debitCreditFlag: "D",
-                amount: row.amount,
-                assetId: row.assetId,
-                productId: row.productId,
-                facilityId: row.facilityId
-            })
-    for (const row of out.allocationRows)
-        if (row.issuedAmount.compare(0) !== 0)
-            entry({
-                glAccountId: row.issuedGlAccountId,
-                debitCreditFlag: "D",
-                amount: row.issuedAmount,
-                assetId: row.assetId,
-                productId: row.productId
-            })
+    for (const row of out.debitRows)
+        entry({
+            glAccountId: row.glAccountId,
+            debitCreditFlag: "D",
+            amount: row.amount,
+            assetId: row.assetId,
+            productId: row.productId,
+            facilityId: row.facilityId
+        })
     entry({
         glAccountId: out.chargeGlAccountId,
         debitCreditFlag: "C",
@@ -533,6 +613,26 @@ function repair(p) {
     if (p.facilityId) query = query.condition("facilityId", p.facilityId)
     const assets = Array.from(query.orderBy("assetId").forUpdate(true).list())
     if (!assets.length) denied("ASSETS_NONE", "The organization holds no inventory of this product")
+    // a repair reposts receipts and issues at the new cost, and does not know the forward cost changes a revaluation or
+    // a landed cost posted beside them: refused, naming those transactions, so they are reversed first
+    const bookEvents = Array.from(
+        find("mantle.product.asset.AssetBookEvent")
+            .condition(
+                "assetId",
+                "in",
+                assets.map(a => a.assetId)
+            )
+            .condition("eventTypeEnumId", "in", ["AbeInventoryRevaluation", "AbeLandedCost"])
+            .orderBy("acctgTransId")
+            .list()
+    )
+    if (bookEvents.length)
+        denied(
+            "BOOK_EVENTS",
+            "The product's stock has revaluation or landed cost postings (transactions " +
+                [...new Set(bookEvents.map(r => r.acctgTransId))].join(", ") +
+                "); a repair would leave them wrong"
+        )
     const posted = Array.from(
         find("mantle.ledger.transaction.AcctgTrans", {organizationPartyId: org, isPosted: "Y"})
             .condition(
