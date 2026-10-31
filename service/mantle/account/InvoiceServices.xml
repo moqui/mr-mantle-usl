@@ -2212,7 +2212,12 @@ along with this software (see the LICENSE.md file). If not, see
             organization; the credits of an original stay within its total; the credit is a draft on the original's side (a
             customer credit is a receivable draft). With allocateToLines the amount is split over the original's lines, each
             on the account its line posted to, instead of one item. With an operationKey the same request answers the first
-            result.</description>
+            result.
+
+            With linkToOriginal and promptDiscount the credit is the prompt-payment discount the original's due schedule
+            offers on the credit's date (at most that, DISCOUNT_NOT_AVAILABLE), on the side's discount account unless one is
+            given: it is issued at once, finalized as the organization's own credit with no approval step, for a user with
+            the side's edit permission or PAYMENT_EDIT (a payment run's executor).</description>
         <in-parameters>
             <parameter name="originalInvoiceId" required="true"/>
             <parameter name="invoiceDate" type="Timestamp"/>
@@ -2227,6 +2232,7 @@ along with this software (see the LICENSE.md file). If not, see
 
             <parameter name="linkToOriginal" type="Boolean" default="false"/>
             <parameter name="allocateToLines" type="Boolean" default="false"/>
+            <parameter name="promptDiscount" type="Boolean" default="false"/>
             <parameter name="organizationPartyId"/>
             <parameter name="operationKey"/>
         </in-parameters>
@@ -2239,7 +2245,17 @@ along with this software (see the LICENSE.md file). If not, see
             <if condition="linkToOriginal">
                 <set field="workflow" value="component://mr-mantle/service/mantle/account/InvoiceWorkflow.js"/>
                 <set field="scope" from="ec.resource.script(workflow).execute('scope',
-                    {invoiceId:originalInvoiceId, organizationPartyId:organizationPartyId, need:'write'})"/>
+                    {invoiceId:originalInvoiceId, organizationPartyId:organizationPartyId,
+                        need:promptDiscount ? 'read' : 'write'})"/>
+                <if condition="promptDiscount">
+                    <set field="paymentTerms" value="component://mr-mantle/service/mantle/account/PaymentTerms.js"/>
+                    <set field="checkedDiscount" from="ec.resource.script(paymentTerms).checkPromptDiscount({
+                        invoiceId:originalInvoiceId, editPermission:scope.editPermission, receivable:scope.receivable,
+                        organizationPartyId:scope.organizationPartyId, amount:amount, onDate:invoiceDate,
+                        glAccountId:overrideGlAccountId})"/>
+                    <set field="itemTypeEnumId" value="ItemPromptDiscount"/>
+                    <set field="overrideGlAccountId" from="checkedDiscount.discountGlAccountId"/>
+                </if>
                 <set field="unissuedStatuses"
                         from="['InvoiceInProcess', 'InvoiceIncoming', 'InvoiceReceived', 'InvoiceCancelled']"/>
                 <if condition="unissuedStatuses.includes(scope.invoice.statusId)">
@@ -2281,7 +2297,7 @@ along with this software (see the LICENSE.md file). If not, see
                             description:description || ('Credit for ' + originalInvoiceId),
                             financeOrganizationPartyId:scope.organizationPartyId,
                             financeDirection:(scope.receivable ? 'receivable' : 'payable'),
-                            statusId:(scope.receivable ? 'InvoiceInProcess' : 'InvoiceIncoming')}"/>
+                            statusId:(scope.receivable || promptDiscount ? 'InvoiceInProcess' : 'InvoiceIncoming')}"/>
             </if>
             <if condition="allocation"><then>
                 <iterate list="allocation.creditLineList" entry="creditLine">
@@ -2295,6 +2311,11 @@ along with this software (see the LICENSE.md file). If not, see
             </else></if>
             <if condition="linkToOriginal">
                 <script>ec.resource.script(workflow).execute('check', {check:'creditCap', invoiceId:invoiceId})</script>
+                <if condition="promptDiscount">
+                    <service-call name="update#mantle.account.invoice.Invoice" disable-authz="true"
+                            in-map="{invoiceId:invoiceId, statusId:'InvoiceFinalized',
+                                statusId_changeReason:description || 'Prompt payment discount'}"/>
+                </if>
                 <if condition="operationKey">
                     <script>ec.resource.script(workflow).execute('record', {operationKey:operationKey,
                         operationType:'InvoiceCredit', organizationPartyId:scope.organizationPartyId,
@@ -4549,6 +4570,52 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="holdRows" from="read.holdRows"/>
             <set field="openHoldCount" from="read.openHoldCount"/>
             <set field="payableCapabilities" from="read.payableCapabilities"/>
+        </actions>
+    </service>
+
+    <!-- ========== Payment terms: the due schedule (PaymentTerms.js) ========== -->
+    <service verb="store" noun="InvoiceDueSchedule" allow-remote="false">
+        <description>Write an issued invoice's due schedule from its term's lines in effect on the invoice date, once: the
+            InvoiceIssuedDueSchedule SECA calls it when an invoice is finalized or a bill approved. Nothing for a credit
+            memo, an invoice without a date or total, or one that has its schedule; a later term change never changes
+            it.</description>
+        <in-parameters><parameter name="invoiceId" required="true"/></in-parameters>
+        <out-parameters><parameter name="written" type="Boolean"/></out-parameters>
+        <actions>
+            <script>ec.resource.script('component://mr-mantle/service/mantle/account/PaymentTerms.js')
+                .execute('writeSchedule', {invoiceId:invoiceId})</script>
+        </actions>
+    </service>
+    <service verb="clear" noun="InvoiceDueSchedule" allow-remote="false">
+        <description>Remove the due schedule of an issued invoice changed back for edits (the InvoiceResumedDueSchedule
+            SECA), so issuing it again writes the schedule of what it then is.</description>
+        <in-parameters><parameter name="invoiceId" required="true"/></in-parameters>
+        <out-parameters><parameter name="cleared" type="Integer"/></out-parameters>
+        <actions>
+            <script>ec.resource.script('component://mr-mantle/service/mantle/account/PaymentTerms.js')
+                .execute('clearSchedule', {invoiceId:invoiceId})</script>
+        </actions>
+    </service>
+    <service verb="get" noun="InvoiceDueSchedule" allow-remote="false">
+        <description>An invoice's due schedule: each portion's due date and amount and its discount, open or not on the day
+            given (today by default), and the discount still available then, less prompt-payment discounts already
+            credited and at most the unpaid total. An invoice issued before its term had lines, or not yet issued, shows the
+            schedule its term gives without storing it. Needs a read of the invoice (its side's view permission or
+            ACCOUNTING_VIEW).</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="onDate" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="scheduleRows" type="List"/>
+            <parameter name="scheduleStored" type="Boolean"/>
+            <parameter name="discountAvailable" type="BigDecimal"/>
+            <parameter name="discountDateText"/>
+        </out-parameters>
+        <actions>
+            <script>ec.resource.script('component://mr-mantle/service/mantle/account/PaymentTerms.js')
+                .execute('dueSchedule', context)</script>
         </actions>
     </service>
 </services>

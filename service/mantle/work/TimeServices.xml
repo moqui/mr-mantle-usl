@@ -333,6 +333,23 @@ along with this software (see the LICENSE.md file). If not, see
                     </if>
                 </else-if></if>
             </if>
+            <!-- an entry of an approved week, or one whose cost was posted, has its project cost posting brought to its cost
+                (mantle.ledger.OtherAutoPostServices.post#WorkEffortCost, with the organization's projectCostPostingEnabled) -->
+            <entity-find-one entity-name="mantle.work.time.TimeEntry" value-field="costEntry" disable-authz="true"/>
+            <set field="costSheet" from="null"/>
+            <if condition="costEntry?.timesheetId">
+                <entity-find-one entity-name="mantle.work.time.Timesheet" value-field="costSheet" disable-authz="true">
+                    <field-map field-name="timesheetId" from="costEntry.timesheetId"/>
+                </entity-find-one>
+            </if>
+            <entity-find-one entity-name="mantle.ledger.transaction.PostingOperation" value-field="costOperation"
+                    disable-authz="true">
+                <field-map field-name="operationKey" from="'wec:' + timeEntryId"/>
+            </entity-find-one>
+            <if condition="costSheet?.statusId == 'TmshApproved' || costOperation">
+                <service-call name="mantle.ledger.OtherAutoPostServices.post#WorkEffortCost" disable-authz="true"
+                        in-map="{timeEntryIdList:[timeEntryId]}"/>
+            </if>
         </actions>
     </service>
     <service verb="create" noun="TimeEntryClockIn">
@@ -450,6 +467,19 @@ along with this software (see the LICENSE.md file). If not, see
                     <else>
                         <return error="true" message="Cannot delete time entry ${timeEntryId}. Found child Time Entry."/></else></if>
             </iterate>
+            <!-- an entry whose project cost was posted has it reversed first (OtherAutoPostServices.post#WorkEffortCost) -->
+            <entity-find-one entity-name="mantle.ledger.transaction.PostingOperation" value-field="costOperation"
+                    disable-authz="true">
+                <field-map field-name="operationKey" from="'wec:' + timeEntryId"/>
+            </entity-find-one>
+            <if condition="costOperation">
+                <service-call name="mantle.ledger.OtherAutoPostServices.post#WorkEffortCost" disable-authz="true"
+                        in-map="{timeEntryIdList:[timeEntryId], deleting:true}" out-map="costOut"/>
+                <if condition="costOut.failedTimeEntryIdList?.length">
+                    <return error="true" message="Time entry ${timeEntryId} has a project cost posting waiting to post; ${
+                            ''}post it before deleting the entry"/>
+                </if>
+            </if>
             <service-call name="delete#mantle.work.time.TimeEntry" in-map="context"/>
         </actions>
     </service>
