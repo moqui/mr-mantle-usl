@@ -23,6 +23,10 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="documentLocale" type="text-medium" enable-audit-log="update"/>
         <field name="documentFooter" type="text-medium" enable-audit-log="update"/>
         <field name="invoiceEmailTemplateId" type="text-medium" enable-audit-log="update"/>
+        <field name="rateProviderServiceName" type="text-medium" enable-audit-log="update">
+            <description>The exchange rate provider refresh#Rates calls: the enumCode (a service implementing
+                CurrencyServices.define#RateProvider) of an ExchangeRateProvider enumeration; none, no
+                fetch.</description></field>
     </extend-entity>
     <extend-entity entity-name="GlAccountOrganization" package="mantle.ledger.account">
         <field name="fromDate" type="date-time" enable-audit-log="update"/>
@@ -117,6 +121,78 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="contentLocation" type="text-long" enable-audit-log="true"/>
         <field name="description" type="text-medium" enable-audit-log="true"/>
         <field name="userId" type="id" enable-audit-log="true"/>
+    </entity>
+    <!-- Base-currency posting (AC-19): the decimal rate a posting applied, with its date and source. The rate is text
+        holding the exact decimal, since number-decimal keeps 6 places (a JPY to USD rate needs more). -->
+    <extend-entity entity-name="AcctgTrans" package="mantle.ledger.transaction">
+        <field name="exchangeRate" type="text-short" enable-audit-log="update">
+            <description>One unit of originalCurrencyUomId in amountUomId (the base currency), as decimal text; set by
+                post#AcctgTrans when it converts a transaction from its document's currency.</description></field>
+        <field name="exchangeRateDate" type="date-time" enable-audit-log="update"/>
+        <field name="exchangeRateSource" type="text-medium" enable-audit-log="update"/>
+    </extend-entity>
+    <extend-entity entity-name="Invoice" package="mantle.account.invoice">
+        <field name="exchangeRate" type="text-short" enable-audit-log="update">
+            <description>The decimal rate the invoice posted at, to exchangeRateToUomId; kept so its applications and
+                adjustments use the same rate. Later rate changes affect later documents only.</description></field>
+        <field name="exchangeRateDate" type="date-time" enable-audit-log="update"/>
+        <field name="exchangeRateSource" type="text-medium" enable-audit-log="update"/>
+        <field name="exchangeRateToUomId" type="id" enable-audit-log="update"/>
+    </extend-entity>
+    <extend-entity entity-name="Payment" package="mantle.account.payment">
+        <field name="exchangeRate" type="text-short" enable-audit-log="update">
+            <description>The decimal rate the payment posted at, to exchangeRateToUomId.</description></field>
+        <field name="exchangeRateDate" type="date-time" enable-audit-log="update"/>
+        <field name="exchangeRateSource" type="text-medium" enable-audit-log="update"/>
+        <field name="exchangeRateToUomId" type="id" enable-audit-log="update"/>
+    </extend-entity>
+    <extend-entity entity-name="Asset" package="mantle.product.asset">
+        <field name="exchangeRate" type="text-short" enable-audit-log="update">
+            <description>The decimal rate of acquireCostUomId to exchangeRateToUomId the asset's first posting took (its
+                receipt's); every later posting of the asset's cost in that currency converts at it, so its inventory
+                account clears (impl-accounting F417).</description></field>
+        <field name="exchangeRateDate" type="date-time" enable-audit-log="update"/>
+        <field name="exchangeRateSource" type="text-medium" enable-audit-log="update"/>
+        <field name="exchangeRateToUomId" type="id" enable-audit-log="update"/>
+    </extend-entity>
+    <!-- A rate a provider proposed (refresh#Rates); it is active only when a finance user accepts it (store#Rate). -->
+    <entity entity-name="CurrencyRateProposal" package="mantle.ledger.config" cache="never">
+        <field name="rateProposalId" type="id" is-pk="true"/>
+        <field name="organizationPartyId" type="id"/>
+        <field name="uomId" type="id"/>
+        <field name="toUomId" type="id"/>
+        <field name="conversionFactor" type="text-short"><description>The proposed decimal rate, as text</description></field>
+        <field name="rateDate" type="date-time"><description>The day the provider's rate is for, from its
+            start</description></field>
+        <field name="rateSource" type="text-medium"/>
+        <field name="providerServiceName" type="text-medium"/>
+        <field name="statusId" type="id"><description>RateProposed, RateAccepted or RateRejected</description></field>
+        <field name="fetchedDate" type="date-time"/>
+        <field name="fetchedByUserId" type="id"/>
+        <field name="decidedDate" type="date-time"/>
+        <field name="decidedByUserId" type="id"/>
+        <field name="uomConversionId" type="id"/>
+        <relationship type="one" related="mantle.party.Party">
+            <key-map field-name="organizationPartyId" related="partyId"/></relationship>
+        <relationship type="one" related="moqui.basic.StatusItem"/>
+        <index name="RATE_PROPOSAL_ORG"><index-field name="organizationPartyId"/><index-field name="statusId"/></index>
+        <seed-data>
+            <moqui.basic.StatusType statusTypeId="CurrencyRateProposal" description="Exchange rate proposal"/>
+            <moqui.basic.StatusItem statusId="RateProposed" statusTypeId="CurrencyRateProposal" description="Proposed"
+                    sequenceNum="1"/>
+            <moqui.basic.StatusItem statusId="RateAccepted" statusTypeId="CurrencyRateProposal" description="Accepted"
+                    sequenceNum="2"/>
+            <moqui.basic.StatusItem statusId="RateRejected" statusTypeId="CurrencyRateProposal" description="Rejected"
+                    sequenceNum="3"/>
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="RateProposed" toStatusId="RateAccepted"
+                    transitionName="Accept"/>
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="RateProposed" toStatusId="RateRejected"
+                    transitionName="Reject"/>
+            <moqui.basic.EnumerationType enumTypeId="ExchangeRateProvider" description="Exchange rate provider"/>
+            <moqui.basic.Enumeration enumId="ErpEcb" enumTypeId="ExchangeRateProvider"
+                    description="European Central Bank daily reference rates"
+                    enumCode="mantle.ledger.CurrencyServices.get#EcbRates"/>
+        </seed-data>
     </entity>
     <entity entity-name="CurrencyRateImport" package="mantle.ledger.config" cache="never">
         <field name="importId" type="id" is-pk="true"/>

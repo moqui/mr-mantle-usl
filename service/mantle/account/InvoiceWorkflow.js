@@ -168,8 +168,6 @@ function issue(scope, p, preference, action) {
         denied("INVOICE_EMPTY", "An invoice needs at least one line")
     if (lib.totals(record).invoiceTotal.compare(0) < 0) denied("INVOICE_NEGATIVE", "Reverse a negative draft before finalizing")
     creditCap(record)
-    if (preference.singleCurrencyDocumentsOnly === "Y" && record.currencyUomId !== preference.baseCurrencyUomId)
-        denied("FOREIGN_CURRENCY_DISABLED", "The invoice currency must match the organization's base currency")
     // A sales invoice gets its tax lines before it is issued; one whose tax cannot be calculated is refused (AC-08).
     if (scope.receivable) call("mantle.other.TaxServices.calculate#InvoiceSalesTax", {invoiceId: record.invoiceId})
     if (action === "approve" || !scope.receivable) approve(scope, preference)

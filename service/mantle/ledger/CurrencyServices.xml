@@ -37,6 +37,8 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <set field="policy" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')"/>
             <script>policy.organization(context, 'admin')</script>
+            <!-- a rate is every organization's: finance administration of all of them (impl-accounting F420) -->
+            <script>ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js').ratesAdmin()</script>
             <set field="changeReason" from="policy.reason(context)"/>
             <script>policy.currency(uomId)</script>
             <script>policy.currency(toUomId)</script>
@@ -172,6 +174,163 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <script>ec.context.putAll(ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
                 .execute('importRates', context))</script>
+        </actions>
+    </service>
+    <!-- ========== Provider rates (AC-16): proposed by refresh#Rates, active once a finance user accepts them ========== -->
+    <service verb="define" noun="RateProvider" type="interface">
+        <description>An exchange rate provider: the rates of one currency (fromUomId) in others, for one day. Named by an
+            ExchangeRateProvider enumeration's enumCode, which PartyAcctgPreference.rateProviderServiceName holds.</description>
+        <in-parameters>
+            <parameter name="sourceText" allow-html="any"><description>The provider's file, already fetched (an upload
+                where the server has no outbound access); without it the provider fetches its own.</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="fromUomId"><description>The currency the rates are of: one fromUomId is rate uomId</description>
+            </parameter>
+            <parameter name="rateDay"><description>The day the rates are for, yyyy-MM-dd</description></parameter>
+            <parameter name="rates" type="List"><description>Maps of uomId and rate (decimal text)</description></parameter>
+            <parameter name="rateSource"/>
+        </out-parameters>
+    </service>
+    <service verb="get" noun="EcbRates" allow-remote="false" transaction="ignore">
+        <description>The European Central Bank's daily euro reference rates (free, no key), from its daily file or the
+            copy given. Refuses a file over 1 MiB or without its day or rates, and an answer of the bank that is not a
+            success.</description>
+        <implements service="mantle.ledger.CurrencyServices.define#RateProvider"/>
+        <out-parameters>
+            <parameter name="fromUomId"/>
+            <parameter name="rateDay"/>
+            <parameter name="rates" type="List"/>
+            <parameter name="rateSource"/>
+        </out-parameters>
+        <actions>
+            <set field="fetched" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                    .execute('ecbRates', context)"/>
+            <set field="fromUomId" from="fetched.fromUomId"/>
+            <set field="rateDay" from="fetched.rateDay"/>
+            <set field="rates" from="fetched.rates"/>
+            <set field="rateSource" from="fetched.rateSource"/>
+        </actions>
+    </service>
+    <service verb="refresh" noun="Rates" allow-remote="false" transaction="ignore">
+        <description>Ask the organization's rate provider (rateProviderServiceName) for the day's rates and propose a rate
+            to the base currency for each currency the organization deals in (its invoices and payments), or each of
+            uomIdList: a cross rate through the provider's currency. A proposal is not active until accept#RateProposals;
+            the same pair and day proposed or accepted before answers that proposal. Refuses a user without finance
+            administration, no base currency, no provider or one that is not an ExchangeRateProvider, and a provider without
+            the base currency. It runs outside a transaction: the provider is asked first, then propose#Rates writes the
+            proposals in their own.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="uomIdList" type="List"/>
+            <parameter name="sourceText" allow-html="any"><description>The provider's file, uploaded instead of
+                fetched; read, never shown</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="proposals" type="List"/>
+            <parameter name="skippedUomIds" type="List"/>
+            <parameter name="rateDay"/>
+        </out-parameters>
+        <actions>
+            <set field="refreshed" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                    .execute('refreshRates', context)"/>
+            <set field="proposals" from="refreshed.proposals"/>
+            <set field="skippedUomIds" from="refreshed.skippedUomIds"/>
+            <set field="rateDay" from="refreshed.rateDay"/>
+        </actions>
+    </service>
+    <service verb="propose" noun="Rates" allow-remote="false">
+        <description>The proposals of refresh#Rates from a provider's answer, in their own transaction. Refuses a user
+            without finance administration and no base currency or base rate.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="uomIdList" type="List"/>
+            <parameter name="fromUomId" required="true"/>
+            <parameter name="rateDay" required="true"/>
+            <parameter name="rates" type="List"/>
+            <parameter name="rateSource"/>
+            <parameter name="providerServiceName" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="proposals" type="List"/>
+            <parameter name="skippedUomIds" type="List"/>
+            <parameter name="rateDay"/>
+        </out-parameters>
+        <actions>
+            <set field="proposed" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                    .execute('proposeRates', context)"/>
+            <set field="proposals" from="proposed.proposals"/>
+            <set field="skippedUomIds" from="proposed.skippedUomIds"/>
+        </actions>
+    </service>
+    <service verb="get" noun="RateProposals" allow-remote="false">
+        <description>The organization's proposed rates still to decide, by day and currency, at most 200. Refuses a user
+            without finance administration.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="proposals" type="List"/>
+        </out-parameters>
+        <actions>
+            <set field="proposals" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                    .execute('getProposals', context).proposals"/>
+        </actions>
+    </service>
+    <service verb="accept" noun="RateProposals" allow-remote="false">
+        <description>Accept proposed rates: each becomes an active dated rate through store#Rate, in its own transaction; a
+            refused one (decided already, another organization's, or a rate already starting then) is named in the results
+            and the others go on. Refuses a user without finance administration and an empty selection.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="rateProposalIdList" type="List"/>
+            <parameter name="changeReason"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="results" type="List"/>
+            <parameter name="complete" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="decided" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                    .execute('acceptProposals', context)"/>
+            <set field="results" from="decided.results"/>
+            <set field="complete" from="decided.complete"/>
+        </actions>
+    </service>
+    <service verb="reject" noun="RateProposals" allow-remote="false">
+        <description>Reject proposed rates, each in its own transaction; a refused one is named in the results. Refuses a
+            user without finance administration and an empty selection.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="rateProposalIdList" type="List"/>
+            <parameter name="changeReason"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="results" type="List"/>
+            <parameter name="complete" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="decided" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                    .execute('rejectProposals', context)"/>
+            <set field="results" from="decided.results"/>
+            <set field="complete" from="decided.complete"/>
+        </actions>
+    </service>
+    <service verb="decide" noun="RateProposal" allow-remote="false">
+        <description>One proposal of accept#RateProposals or reject#RateProposals, locked with its organization. Refuses a
+            user without finance administration, another organization's proposal and one decided already.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="rateProposalId" required="true"/>
+            <parameter name="accept" type="Boolean" required="true"/>
+            <parameter name="changeReason"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="uomConversionId"/>
+        </out-parameters>
+        <actions>
+            <set field="uomConversionId" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                    .execute('decideProposal', context).uomConversionId"/>
         </actions>
     </service>
     <service verb="get" noun="ImportResult" allow-remote="false">

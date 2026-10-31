@@ -115,9 +115,17 @@ feature("active organization selection narrows an otherwise authorized child for
         )
     }
 })
-feature("foreign currency is refused only for an adopted organization; every invoice gets its book day", {
+feature("another currency with no rate is refused at finalize; every invoice gets its book day", {
     when() {
-        const foreign = helper().draft(f, "25", "EUR")
+        // XTS, the ISO code reserved for testing: a currency no other spec gives a rate
+        if (!helper().lib.one("moqui.basic.Uom", {uomId: "XTS"}))
+            helper().call("create#moqui.basic.Uom", {
+                uomId: "XTS",
+                uomTypeEnumId: "UT_CURRENCY_MEASURE",
+                description: "Testing currency",
+                abbreviation: "XTS"
+            })
+        const foreign = helper().draft(f, "25", "XTS")
         const adopted = helper().rejected("mantle.account.InvoiceServices.change#InvoiceState", {
             invoiceId: foreign.invoiceId,
             action: "finalize",
@@ -126,10 +134,11 @@ feature("foreign currency is refused only for an adopted organization; every inv
         const legacyFixture = helper().fixtures("NATIVE_LEGACY_AR")
         helper().call("update#mantle.ledger.config.PartyAcctgPreference", {
             organizationPartyId: legacyFixture.org,
-            singleCurrencyDocumentsOnly: "N",
             postingGuardEnabled: "N"
         })
-        const legacyInvoice = helper().draft(legacyFixture, "25", "EUR")
+        // without the guard a document with no rate cannot finalize either (its posting must complete), so this one is
+        // in the base currency
+        const legacyInvoice = helper().draft(legacyFixture, "25", "USD")
         const legacyPrimitive = helper().call("mantle.account.InvoiceServices.create#Invoice", {
             fromPartyId: legacyFixture.org,
             toPartyId: legacyFixture.customer,
@@ -144,7 +153,7 @@ feature("foreign currency is refused only for an adopted organization; every inv
         return {adopted, legacy, explicit: legacyInvoice, primitive}
     },
     then({adopted, legacy, explicit, primitive}) {
-        adopted.includes("FOREIGN_CURRENCY_DISABLED")
+        adopted.includes("RATE_MISSING")
         legacy.statusId == "InvoiceFinalized"
         !!explicit.accountingDate
         !!explicit.draftedByUserId

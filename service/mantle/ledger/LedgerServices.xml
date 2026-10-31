@@ -586,6 +586,20 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="findings" type="List"/>
         </out-parameters>
         <actions>
+            <!-- base-currency posting (AC-19): a transaction in another currency than its organization's base currency is
+                converted first, so the guard and the GL summaries see the base currency; one with no rate is left as it is
+                (refused by the guard, else held in the error journal below) -->
+            <set field="currencyOut" from="null"/>
+            <entity-find-one entity-name="mantle.ledger.transaction.AcctgTrans" value-field="currencyTrans"/>
+            <if condition="currencyTrans &amp;&amp; currencyTrans.isPosted != 'Y' &amp;&amp; currencyTrans.amountUomId">
+                <service-call name="mantle.ledger.LedgerServices.find#PartyAcctgPreference" out-map="currencyPreferenceOut"
+                        in-map="{organizationPartyId:currencyTrans.organizationPartyId}"/>
+                <set field="baseCurrencyUomId" from="currencyPreferenceOut.partyAcctgPreference?.baseCurrencyUomId"/>
+                <if condition="baseCurrencyUomId &amp;&amp; currencyTrans.amountUomId != baseCurrencyUomId">
+                    <set field="currencyOut" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                            .execute(verifyOnly ? 'convertible' : 'convert', {acctgTransId:acctgTransId})"/>
+                </if>
+            </if>
             <script><![CDATA[
                 const checked = ec.resource.script('component://mr-mantle/service/mantle/ledger/PostingGuard.js').check({
                     acctgTransId, verifyOnly, reviewed, closingTimePeriodId})
@@ -616,6 +630,10 @@ along with this software (see the LICENSE.md file). If not, see
             <service-call name="mantle.ledger.LedgerServices.calculate#AcctgTransTrialBalance" out-map="context" in-map="{acctgTransId:acctgTransId}"/>
             <if condition="!toDecimal(debitTotal).eq(creditTotal)">
                 <message type="danger">Not posting transaction ${acctgTransId}, credit total ${creditTotal} and debit total ${debitTotal} not equal.</message>
+                <set field="useErrorJournal" from="true"/>
+            </if>
+            <if condition="currencyOut?.missing">
+                <message type="danger">Not posting transaction ${acctgTransId}: ${currencyOut.message}.</message>
                 <set field="useErrorJournal" from="true"/>
             </if>
             <!-- get GlAccount records, make sure accounts allow posting -->

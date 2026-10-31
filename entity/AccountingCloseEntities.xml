@@ -171,6 +171,7 @@ along with this software (see the LICENSE.md file). If not, see
         <alias entity-alias="INV" name="toPartyId"/>
         <alias entity-alias="INV" name="statusId"/>
         <alias entity-alias="INV" name="invoiceDate"/>
+        <alias entity-alias="INV" name="currencyUomId"/>
         <alias entity-alias="INV" name="invoiceTotalSum" field="invoiceTotal" function="sum"/>
     </view-entity>
     <view-entity entity-name="InvoiceAppliedSum" package="mantle.account.payment">
@@ -181,6 +182,7 @@ along with this software (see the LICENSE.md file). If not, see
         <alias entity-alias="INV" name="toPartyId"/>
         <alias entity-alias="INV" name="statusId"/>
         <alias entity-alias="INV" name="invoiceDate"/>
+        <alias entity-alias="INV" name="currencyUomId"/>
         <alias entity-alias="PAPP" name="appliedDate"/>
         <alias entity-alias="PAPP" name="amountAppliedSum" field="amountApplied" function="sum"/>
     </view-entity>

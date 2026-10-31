@@ -59,6 +59,24 @@ along with this software (see the LICENSE.md file). If not, see
             <!-- keep track of if we should put in the error journal or post -->
             <set field="useErrorJournal" from="false"/>
 
+            <!-- base-currency posting (AC-19): an invoice in another currency than a posting organization's base currency
+                posts at its rate, kept on the invoice; post#AcctgTrans converts the transaction at it -->
+            <set field="fromRate" from="null"/>
+            <set field="toRate" from="null"/>
+            <if condition="fromPartyAcctgPreference?.baseCurrencyUomId &amp;&amp;
+                    invoice.currencyUomId != fromPartyAcctgPreference.baseCurrencyUomId">
+                <set field="fromRate" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                        .documentRate('invoice', invoiceId, invoice.fromPartyId)"/>
+            </if>
+            <if condition="toPartyAcctgPreference?.baseCurrencyUomId &amp;&amp;
+                    invoice.currencyUomId != toPartyAcctgPreference.baseCurrencyUomId">
+                <set field="toRate" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                        .documentRate('invoice', invoiceId, invoice.toPartyId)"/>
+            </if>
+            <if condition="fromRate || toRate">
+                <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice" for-update="true"/>
+            </if>
+
             <!-- ==== create the main tx record(s) ==== -->
             <if condition="fromPartyAcctgPreference != null">
                 <service-call name="mantle.ledger.InvoiceAutoPostServices.get#InvoiceTypeTransType" out-map="fromInvoiceTypeTransTypeOut"
@@ -69,7 +87,9 @@ along with this software (see the LICENSE.md file). If not, see
                 <service-call name="mantle.ledger.LedgerServices.create#AcctgTrans" out-map="context"
                         in-map="{acctgTransTypeEnumId:fromInvoiceTypeTransTypeOut.acctgTransTypeEnumId,
                             organizationPartyId:invoice.fromPartyId, otherPartyId:invoice.toPartyId,
-                            amountUomId:invoice.currencyUomId, invoiceId:invoice.invoiceId, transactionDate:invoice.invoiceDate}"/>
+                            amountUomId:invoice.currencyUomId, invoiceId:invoice.invoiceId, transactionDate:invoice.invoiceDate,
+                            exchangeRate:fromRate?.exchangeRate, exchangeRateDate:fromRate?.exchangeRateDate,
+                            exchangeRateSource:fromRate?.exchangeRateSource}"/>
                 <entity-find-one entity-name="mantle.ledger.transaction.AcctgTrans" value-field="fromAcctgTrans"/>
             </if>
             <if condition="toPartyAcctgPreference != null">
@@ -81,7 +101,9 @@ along with this software (see the LICENSE.md file). If not, see
                 <service-call name="mantle.ledger.LedgerServices.create#AcctgTrans" out-map="context"
                         in-map="{acctgTransTypeEnumId:toInvoiceTypeTransTypeOut.acctgTransTypeEnumId,
                             organizationPartyId:invoice.toPartyId, otherPartyId:invoice.fromPartyId,
-                            amountUomId:invoice.currencyUomId, invoiceId:invoice.invoiceId, transactionDate:invoice.invoiceDate}"/>
+                            amountUomId:invoice.currencyUomId, invoiceId:invoice.invoiceId, transactionDate:invoice.invoiceDate,
+                            exchangeRate:toRate?.exchangeRate, exchangeRateDate:toRate?.exchangeRateDate,
+                            exchangeRateSource:toRate?.exchangeRateSource}"/>
                 <entity-find-one entity-name="mantle.ledger.transaction.AcctgTrans" value-field="toAcctgTrans"/>
             </if>
 
@@ -402,13 +424,28 @@ along with this software (see the LICENSE.md file). If not, see
             <!-- ==== create the main tx record(s) ==== -->
             <!-- TODO: don't allow date change for invoice adjust items, or update tx date (unpost, update, post) automatically? would be the first/only like that... -->
             <set field="transactionDate" from="invoiceItem.itemDate || invoice.invoiceDate"/>
+            <!-- an adjustment of an invoice in another currency posts at the invoice's rate (AC-19) -->
+            <set field="fromRate" from="null"/>
+            <set field="toRate" from="null"/>
+            <if condition="fromPartyAcctgPreference?.baseCurrencyUomId &amp;&amp;
+                    invoice.currencyUomId != fromPartyAcctgPreference.baseCurrencyUomId">
+                <set field="fromRate" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                        .documentRate('invoice', invoiceId, invoice.fromPartyId)"/>
+            </if>
+            <if condition="toPartyAcctgPreference?.baseCurrencyUomId &amp;&amp;
+                    invoice.currencyUomId != toPartyAcctgPreference.baseCurrencyUomId">
+                <set field="toRate" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                        .documentRate('invoice', invoiceId, invoice.toPartyId)"/>
+            </if>
             <if condition="fromPartyAcctgPreference">
                 <service-call name="mantle.ledger.InvoiceAutoPostServices.get#InvoiceTypeTransType" out-map="fromInvoiceTypeTransTypeOut"
                         in-map="{invoiceTypeEnumId:invoice.invoiceTypeEnumId, organizationPartyId:invoice.fromPartyId, isPayable:'N'}"/>
                 <service-call name="mantle.ledger.LedgerServices.create#AcctgTrans" out-map="context"
                         in-map="{acctgTransTypeEnumId:'AttInvoiceAdjust',
                             organizationPartyId:invoice.fromPartyId, otherPartyId:invoice.toPartyId,
-                            amountUomId:invoice.currencyUomId, invoiceId:invoiceId, transactionDate:transactionDate}"/>
+                            amountUomId:invoice.currencyUomId, invoiceId:invoiceId, transactionDate:transactionDate,
+                            exchangeRate:fromRate?.exchangeRate, exchangeRateDate:fromRate?.exchangeRateDate,
+                            exchangeRateSource:fromRate?.exchangeRateSource}"/>
                 <entity-find-one entity-name="mantle.ledger.transaction.AcctgTrans" value-field="fromAcctgTrans"/>
             </if>
             <if condition="toPartyAcctgPreference">
@@ -417,7 +454,9 @@ along with this software (see the LICENSE.md file). If not, see
                 <service-call name="mantle.ledger.LedgerServices.create#AcctgTrans" out-map="context"
                         in-map="{acctgTransTypeEnumId:'AttInvoiceAdjust',
                             organizationPartyId:invoice.toPartyId, otherPartyId:invoice.fromPartyId,
-                            amountUomId:invoice.currencyUomId, invoiceId:invoiceId, transactionDate:transactionDate}"/>
+                            amountUomId:invoice.currencyUomId, invoiceId:invoiceId, transactionDate:transactionDate,
+                            exchangeRate:toRate?.exchangeRate, exchangeRateDate:toRate?.exchangeRateDate,
+                            exchangeRateSource:toRate?.exchangeRateSource}"/>
                 <entity-find-one entity-name="mantle.ledger.transaction.AcctgTrans" value-field="toAcctgTrans"/>
             </if>
 

@@ -264,24 +264,23 @@ const checks = {
         }
         return result(found, item => item)
     },
-    // Documents of the period in a currency other than the organization's base currency with no rate on their day.
+    // Documents of the period in a currency other than the organization's base currency with no rate: none kept from their
+    // posting and none in effect on their book day (Currencies.rateOn, the rate posting converts at).
     PccMissingRates(c) {
         const baseCurrency = lib.preference(c.s.organizationPartyId).baseCurrencyUomId
         if (!baseCurrency) return {count: 0, items: []}
         const found = []
-        const hasRate = (currency, date) =>
-            !!Array.from(
-                find("moqui.basic.UomConversion", {uomId: currency, toUomId: baseCurrency})
-                    .condition("fromDate", "less-equals", date)
-                    .list()
-            ).find(rate => rate.thruDate == null || ms(rate.thruDate) > ms(date))
+        const currencies = ec.resource.script("component://mr-mantle/service/mantle/ledger/Currencies.js")
+        const hasRate = (currency, date, record) =>
+            (!!record.exchangeRate && record.exchangeRateToUomId === baseCurrency) ||
+            !!currencies.rateOn(currency, baseCurrency, lib.lib.bookDay(record.accountingDate, date))
         for (const invoice of find("mantle.account.invoice.Invoice")
             .condition(either(["fromPartyId", "toPartyId"], c.organizations))
             .condition("currencyUomId", "not-equals", baseCurrency)
             .condition("statusId", "not-in", ["InvoiceCancelled"])
             .condition(inPeriod(c, "invoiceDate"))
             .list())
-            if (!hasRate(invoice.currencyUomId, invoice.invoiceDate))
+            if (!hasRate(invoice.currencyUomId, invoice.invoiceDate, invoice))
                 found.push({
                     recordKind: c.organizations.includes(invoice.fromPartyId) ? "invoices" : "bills",
                     recordId: invoice.invoiceId,
@@ -294,7 +293,7 @@ const checks = {
             .condition("statusId", "not-in", ["PmntCancelled", "PmntVoid"])
             .condition(stampInPeriod(c, "effectiveDate"))
             .list())
-            if (!hasRate(payment.amountUomId, payment.effectiveDate))
+            if (!hasRate(payment.amountUomId, payment.effectiveDate, payment))
                 found.push({
                     recordKind: "payments",
                     recordId: payment.paymentId,

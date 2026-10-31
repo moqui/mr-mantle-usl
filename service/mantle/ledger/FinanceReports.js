@@ -242,6 +242,16 @@ function report(op, p) {
 // the period's end. The organization's own records only, and a period of the organization.
 const RECEIVABLE_STATUSES = ["InvoiceFinalized", "InvoiceSent", "InvoiceAcked", "InvoicePmtRecvd", "InvoiceWriteOff"]
 const PAYABLE_STATUSES = ["InvoiceApproved", "InvoicePmtSent", "InvoiceBilledThrough"]
+// An invoice's open amount in the base currency: its own in the base currency; one in another currency at the rate it
+// posted at (its total and what was applied each at that rate, as its posting and its applications' postings hold them);
+// null when it kept no rate to the base currency.
+function openInBase(invoice, applied, currency) {
+    const total = toDecimal(invoice.invoiceTotal ?? 0)
+    if (!currency || !invoice.currencyUomId || invoice.currencyUomId === currency) return total.subtract(applied)
+    if (!invoice.exchangeRate || invoice.exchangeRateToUomId !== currency) return null
+    const rate = toDecimal(invoice.exchangeRate)
+    return lib.lib.money(total.multiply(rate), currency).subtract(lib.lib.money(applied.multiply(rate), currency))
+}
 function invoiceReconciliation(p) {
     const s = lib.organization(p, "reportRead")
     if (!p.timePeriodId) throw new Error("PERIOD_REQUIRED: Choose a fiscal period")
@@ -346,7 +356,11 @@ function invoiceReconciliation(p) {
     const invoiceGl = glNet("invoiceId", invoiceIds),
         invoiceApplied = appliedThroughEnd("invoiceId", invoiceIds)
     for (const invoice of invoices) {
-        const open = toDecimal(invoice.invoiceTotal ?? 0).subtract(invoiceApplied[invoice.invoiceId] || toDecimal(0))
+        const open = openInBase(invoice, invoiceApplied[invoice.invoiceId] || toDecimal(0), currency)
+        if (open == null) {
+            if (!incompleteChecks.includes("invoiceVsGl")) incompleteChecks.push("invoiceVsGl")
+            continue
+        }
         const gl = invoiceGl[invoice.invoiceId] || toDecimal(0)
         if (!open.eq(gl))
             add(
@@ -376,6 +390,12 @@ function invoiceReconciliation(p) {
     const paymentGl = glNet("paymentId", paymentIds),
         paymentApplied = appliedThroughEnd("paymentId", paymentIds)
     for (const payment of payments) {
+        // a payment in another currency clears its invoices at their rates (post#PaymentApplication), so the ledger holds
+        // no amount of its own to compare; it is left out and the check is named incomplete
+        if (payment.amountUomId && currency && payment.amountUomId !== currency) {
+            if (!incompleteChecks.includes("paymentVsGl")) incompleteChecks.push("paymentVsGl")
+            continue
+        }
         const applied = paymentApplied[payment.paymentId] || toDecimal(0)
         const gl = (paymentGl[payment.paymentId] || toDecimal(0)).negate()
         if (!applied.eq(gl))
@@ -474,19 +494,48 @@ function invoiceReconciliation(p) {
     const side = payable ? "toPartyId" : "fromPartyId"
     const statuses = payable ? PAYABLE_STATUSES : RECEIVABLE_STATUSES
     const issued = lib
-        .find("mantle.account.invoice.InvoiceTotalSum", {[side]: org})
+        .find("mantle.account.invoice.InvoiceTotalSum", {[side]: org, currencyUomId: currency})
         .condition("statusId", "in", statuses)
         .condition("invoiceDate", "less", afterStamp)
         .selectField("invoiceTotalSum")
         .one()
     const applied = lib
-        .find("mantle.account.payment.InvoiceAppliedSum", {[side]: org})
+        .find("mantle.account.payment.InvoiceAppliedSum", {[side]: org, currencyUomId: currency})
         .condition("statusId", "in", statuses)
         .condition("invoiceDate", "less", afterStamp)
         .condition("appliedDate", "less", afterStamp)
         .selectField("amountAppliedSum")
         .one()
-    const agingOpen = toDecimal(issued?.invoiceTotalSum ?? 0).subtract(toDecimal(applied?.amountAppliedSum ?? 0))
+    let agingOpen = toDecimal(issued?.invoiceTotalSum ?? 0).subtract(toDecimal(applied?.amountAppliedSum ?? 0))
+    // invoices in other currencies at the rates they posted at, as the ledger holds them; at most 5,000, else unavailable
+    const foreign = Array.from(
+        lib
+            .find("mantle.account.invoice.Invoice", {[side]: org})
+            .condition("currencyUomId", "not-equals", currency)
+            .condition("statusId", "in", statuses)
+            .condition("invoiceDate", "less", afterStamp)
+            .orderBy("invoiceId")
+            .limit(5001)
+            .list()
+    )
+    if (foreign.length > 5000) {
+        incompleteChecks.push("agingVsLedger")
+        agingOpen = null
+    } else {
+        const foreignApplied = appliedThroughEnd(
+            "invoiceId",
+            foreign.map(row => row.invoiceId)
+        )
+        for (const invoice of foreign) {
+            const open = openInBase(invoice, foreignApplied[invoice.invoiceId] || toDecimal(0), currency)
+            if (open == null) {
+                incompleteChecks.push("agingVsLedger")
+                agingOpen = null
+                break
+            }
+            agingOpen = agingOpen.add(open)
+        }
+    }
     let ledgerBalance = toDecimal(0)
     for (const row of lib
         .find("mantle.ledger.transaction.AcctgTransAndEntryGlaSummary", {organizationPartyId: org, isPosted: "Y"})
@@ -498,7 +547,12 @@ function invoiceReconciliation(p) {
         ledgerBalance = ledgerBalance.add(toDecimal(row.amount ?? 0).multiply(row.debitCreditFlag === "D" ? sign : -sign))
     return {
         reportRows,
-        summary: {agingOpen, ledgerBalance, difference: agingOpen.subtract(ledgerBalance), currencyUomId: currency},
+        summary: {
+            agingOpen,
+            ledgerBalance,
+            difference: agingOpen == null ? null : agingOpen.subtract(ledgerBalance),
+            currencyUomId: currency
+        },
         complete: !incompleteChecks.length,
         incompleteChecks,
         period: Object.assign(lib.display(period), {fromDay, thruDay: lib.calendarDateText(period.thruDate)}),

@@ -441,14 +441,22 @@ feature("statements are by customer and currency, for a receivables editor", {
         const statementFixture = helper().fixtures("NATIVE_STMT")
         helper().call("update#mantle.ledger.config.PartyAcctgPreference", {
             organizationPartyId: statementFixture.org,
-            postingGuardEnabled: "N",
-            singleCurrencyDocumentsOnly: "N"
+            postingGuardEnabled: "N"
         })
         for (const [amount, currency] of [
             ["31", "USD"],
             ["24", "EUR"]
         ]) {
-            const invoice = helper().draft(statementFixture, amount, currency)
+            let invoice = helper().draft(statementFixture, amount, currency)
+            // the euro invoice carries its rate, so it posts in the base currency whatever rates other specs left
+            if (currency == "EUR")
+                helper().call("update#mantle.account.invoice.Invoice", {
+                    invoiceId: invoice.invoiceId,
+                    exchangeRate: "1.1",
+                    exchangeRateToUomId: "USD",
+                    exchangeRateSource: "Spec rate"
+                })
+            invoice = helper().lib.one("mantle.account.invoice.Invoice", {invoiceId: invoice.invoiceId})
             native("change#InvoiceState", {
                 invoiceId: invoice.invoiceId,
                 action: "finalize",

@@ -57,6 +57,29 @@ along with this software (see the LICENSE.md file). If not, see
                     payment.amount != null &amp;&amp; toDecimal(paymentApplicationList[0].amountApplied).eq(payment.amount) &amp;&amp;
                     Number(paymentApplicationList[0].appliedDate) &lt;= Number(payment.effectiveDate)"/>
 
+            <!-- base-currency posting (AC-19): a payment in another currency than a posting organization's base currency
+                posts at its rate, kept on the payment; post#AcctgTrans converts the transaction at it. Such a payment posts
+                unapplied and each application on its own, where post#PaymentApplication books the realized difference
+                against the invoice's rate. -->
+            <set field="fromRate" from="null"/>
+            <set field="toRate" from="null"/>
+            <set field="fromForeign" from="!!fromPartyAcctgPreference?.baseCurrencyUomId &amp;&amp;
+                    payment.amountUomId != fromPartyAcctgPreference.baseCurrencyUomId"/>
+            <set field="toForeign" from="!!toPartyAcctgPreference?.baseCurrencyUomId &amp;&amp;
+                    payment.amountUomId != toPartyAcctgPreference.baseCurrencyUomId"/>
+            <if condition="fromForeign">
+                <set field="fromRate" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                        .documentRate('payment', paymentId, payment.fromPartyId)"/>
+            </if>
+            <if condition="toForeign">
+                <set field="toRate" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                        .documentRate('payment', paymentId, payment.toPartyId)"/>
+            </if>
+            <if condition="fromForeign || toForeign">
+                <set field="isFullSinglePa" from="false"/>
+                <entity-find-one entity-name="mantle.account.payment.Payment" value-field="payment" for-update="true"/>
+            </if>
+
             <!-- ==== create the main tx record(s) ==== -->
 
             <if condition="fromPartyAcctgPreference">
@@ -65,7 +88,8 @@ along with this software (see the LICENSE.md file). If not, see
                             otherPartyId:payment.toPartyId, amountUomId:payment.amountUomId, paymentId:payment.paymentId,
                             invoiceId:(isFullSinglePa ? paymentApplicationList[0].invoiceId : null),
                             paymentApplicationId:(isFullSinglePa ? paymentApplicationList[0].paymentApplicationId : null),
-                            transactionDate:payment.effectiveDate}"/>
+                            transactionDate:payment.effectiveDate, exchangeRate:fromRate?.exchangeRate,
+                            exchangeRateDate:fromRate?.exchangeRateDate, exchangeRateSource:fromRate?.exchangeRateSource}"/>
                 <entity-find-one entity-name="mantle.ledger.transaction.AcctgTrans" value-field="fromAcctgTrans"/>
             </if>
             <if condition="toPartyAcctgPreference">
@@ -74,7 +98,8 @@ along with this software (see the LICENSE.md file). If not, see
                             otherPartyId:payment.fromPartyId, amountUomId:payment.amountUomId, paymentId:payment.paymentId,
                             invoiceId:(isFullSinglePa ? paymentApplicationList[0].invoiceId : null),
                             paymentApplicationId:(isFullSinglePa ? paymentApplicationList[0].paymentApplicationId : null),
-                            transactionDate:payment.effectiveDate}"/>
+                            transactionDate:payment.effectiveDate, exchangeRate:toRate?.exchangeRate,
+                            exchangeRateDate:toRate?.exchangeRateDate, exchangeRateSource:toRate?.exchangeRateSource}"/>
                 <entity-find-one entity-name="mantle.ledger.transaction.AcctgTrans" value-field="toAcctgTrans"/>
             </if>
 
@@ -683,6 +708,28 @@ along with this software (see the LICENSE.md file). If not, see
                                 glAccountId:toToInvoiceTypeTransTypeOut.glAccountId}"/>
                 </else></if>
             </if>
+
+            <!-- ==== convert the tx (AC-19) ==== -->
+            <!-- an application in another currency than a posting organization's base currency converts each line at its
+                document's rate and books the realized exchange difference; with no rate or exchange account it is refused
+                (posting guard on) or held in the error journal -->
+            <iterate list="[fromPartyAcctgPreference ? fromAcctgTrans : null, toPartyAcctgPreference ? toAcctgTrans : null]
+                    .filter(tx =&gt; tx)" entry="applicationTrans">
+                <set field="applicationPreference" from="applicationTrans.organizationPartyId == fromPartyId ?
+                        fromPartyAcctgPreference : toPartyAcctgPreference"/>
+                <if condition="!useErrorJournal &amp;&amp; applicationPreference?.baseCurrencyUomId &amp;&amp;
+                        applicationTrans.amountUomId != applicationPreference.baseCurrencyUomId">
+                    <set field="exchangeOut" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Currencies.js')
+                            .execute('convertApplication', {acctgTransId:applicationTrans.acctgTransId})"/>
+                    <if condition="exchangeOut.missing">
+                        <if condition="applicationPreference.postingGuardEnabled == 'Y'">
+                            <return error="true" message="${exchangeOut.code}: ${exchangeOut.message}"/>
+                        </if>
+                        <message type="danger">Not posting application ${paymentApplicationId}: ${exchangeOut.message}.</message>
+                        <set field="useErrorJournal" from="true"/>
+                    </if>
+                </if>
+            </iterate>
 
             <!-- ==== post the tx ==== -->
 

@@ -43,9 +43,11 @@ spec({
             ["USD", 100],
             ["EUR", 50],
         ]) {
+            // a transaction in another currency carries its rate; post#AcctgTrans converts it to the base currency
             const id = call("LedgerServices.create#AcctgTrans", {
                 organizationPartyId: org,
                 amountUomId,
+                exchangeRate: amountUomId == "EUR" ? "1.2" : null,
                 acctgTransTypeEnumId: "AttInternal",
             }).acctgTransId
             for (const [glAccountId, debitCreditFlag] of [
@@ -67,7 +69,7 @@ spec({
         ec.user.setTimeZone(savedTimeZone)
     },
 })
-feature("live trial balance and ledger never combine document currencies", {
+feature("live trial balance and ledger hold the base currency, another currency converted at its rate", {
     when() {
         return {
             trial: call("FinanceReportServices.run#TrialBalance", {
@@ -83,14 +85,12 @@ feature("live trial balance and ledger never combine document currencies", {
         }
     },
     then({ trial, ledger }) {
-        trial.reportRows.length == 4
+        trial.reportRows.length == 2
         ledger.reportRows.length == 4
+        trial.reportRows.every((r) => r.amountUomId == "USD")
         trial.reportRows
             .find((r) => r.glAccountId == "111100000" && r.amountUomId == "USD")
-            .ending.eq(100)
-        trial.reportRows
-            .find((r) => r.glAccountId == "111100000" && r.amountUomId == "EUR")
-            .ending.eq(50)
+            .ending.eq(160)
     },
 })
 feature(
@@ -106,7 +106,7 @@ feature(
             })
         },
         then({ reportRows }) {
-            reportRows.length == 4
+            reportRows.length == 2
             reportRows.every(
                 (r) => r.comparisonEnding.isZero() && r.change.eq(r.ending),
             )

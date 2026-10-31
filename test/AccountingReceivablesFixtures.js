@@ -19,8 +19,7 @@ function fixtures(prefix) {
     })
     call("update#mantle.ledger.config.PartyAcctgPreference", {
         organizationPartyId: org,
-        postingGuardEnabled: "Y",
-        singleCurrencyDocumentsOnly: "Y"
+        postingGuardEnabled: "Y"
     })
     call("create#mantle.party.Party", {partyId: customer, partyTypeEnumId: "PtyOrganization"})
     call("create#mantle.party.Organization", {partyId: customer, organizationName: prefix + " customer"})
