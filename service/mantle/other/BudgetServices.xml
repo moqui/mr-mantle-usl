@@ -107,13 +107,16 @@ along with this software (see the LICENSE.md file). If not, see
 
     <service verb="create" noun="Budget">
         <description>Create a draft budget on a period of its organization; the creator is recorded, and another user
-            approves it (change#BudgetState).</description>
+            approves it (change#BudgetState). Needs BUDGET_EDIT in the period's organization.</description>
         <in-parameters>
+            <parameter name="budgetId"><description>A fixed id (demo and import data); else a sequenced one.</description>
+            </parameter>
             <auto-parameters entity-name="mantle.other.budget.Budget" include="nonpk"/>
             <parameter name="timePeriodId" required="true"/>
         </in-parameters>
         <out-parameters><parameter name="budgetId"/></out-parameters>
         <actions>
+            <script>ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js').execute('editScope', {timePeriodId:timePeriodId})</script>
             <!-- a budget starts as a draft; approval is change#BudgetState's -->
             <set field="statusId" value="BudgetDraft"/>
             <set field="createdByUserId" from="ec.user.userId"/>
@@ -137,6 +140,7 @@ along with this software (see the LICENSE.md file). If not, see
         </in-parameters>
         <out-parameters><parameter name="budgetItemSeqId"/></out-parameters>
         <actions>
+            <script>ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js').execute('editScope', {budgetId:budgetId})</script>
             <entity-find-one entity-name="mantle.other.budget.Budget" value-field="draftBudget"/>
             <if condition="draftBudget?.statusId &amp;&amp; draftBudget.statusId != 'BudgetDraft'">
                 <return error="true" message="BUDGET_NOT_DRAFT: An approved budget changes only by revise#Budget"/></if>
@@ -223,6 +227,7 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="amountPer10" type="BigDecimal"/><parameter name="amountPer11" type="BigDecimal"/><parameter name="amountPer12" type="BigDecimal"/>
         </in-parameters>
         <actions>
+            <script>ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js').execute('editScope', {budgetId:budgetId})</script>
             <entity-find-one entity-name="mantle.other.budget.Budget" value-field="budget"/>
             <if condition="!budget.timePeriodId || !budget.subTimePeriodTypeId">
                 <return error="true" message="Budget must have a Time Period and a Sub-Period Type"/></if>
@@ -304,6 +309,7 @@ along with this software (see the LICENSE.md file). If not, see
         </in-parameters>
         <out-parameters><parameter name="budgetItemDetailId"/></out-parameters>
         <actions>
+            <script>ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js').execute('editScope', {budgetId:budgetId})</script>
             <entity-find-one entity-name="mantle.other.budget.Budget" value-field="draftBudget"/>
             <if condition="draftBudget?.statusId &amp;&amp; draftBudget.statusId != 'BudgetDraft'">
                 <return error="true" message="BUDGET_NOT_DRAFT: An approved budget changes only by revise#Budget"/></if>
@@ -329,6 +335,7 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <if condition="!assetId &amp;&amp; !facilityId"><return message="Not storing budget item details, no assetId or facilityId specified"/></if>
 
+            <script>ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js').execute('editScope', {budgetId:budgetId})</script>
             <entity-find-one entity-name="mantle.other.budget.Budget" value-field="budget"/>
             <if condition="!budget.timePeriodId || !budget.subTimePeriodTypeId">
                 <return error="true" message="Budget must have a Time Period and a Sub-Period Type"/></if>
@@ -599,8 +606,8 @@ along with this software (see the LICENSE.md file). If not, see
             (BUDGET_EXCEEDED) and kept as a blocked commitment, whose BudgetOverride notice goes to the organization's
             users holding BUDGET_OVERRIDE, unless such a user gives an override reason; a Warn reserves with a warning. The
             same source revision answers the first commitment (a different amount or account is refused); a new revision
-            releases the open commitment of the earlier one. Needs INVOICE_APPROVE, PAYABLE_EDIT, BUDGET_EDIT or
-            ACCOUNTING_ADMIN in the organization.</description>
+            releases the open commitment of the earlier one and holds its amount less what the earlier ones passed on to
+            later stages. Needs INVOICE_APPROVE, BUDGET_EDIT or ACCOUNTING_ADMIN in the organization.</description>
         <implements service="mantle.other.BudgetServices.define#CommitmentSource"/>
         <out-parameters>
             <parameter name="budgetCommitmentId"/>
@@ -619,10 +626,11 @@ along with this software (see the LICENSE.md file). If not, see
     <service verb="convert" noun="Commitment" allow-remote="false">
         <description>Pass a reserved commitment on to its next stage: a request's to its purchase order (reserved), an
             order line's to its expense (actual), naming the commitment (fromCommitmentId) or its source line; the parent is
-            converted once later stages hold all of it, so nothing counts twice. With invoiceId, every posted line of the
-            approved bill becomes an actual commitment, converting its purchase order lines' open commitments (through
-            their billing links) first; an account's lines are decided together, keyed by the bill's approved version
-            (approve#Payable calls this). The control policy decides the part not already held, as reserve#Commitment
+            converted once later stages hold all of it, so nothing counts twice; a commitment on another account than the
+            spending gives up its share instead. With invoiceId, every posted line of the approved bill (its posting in
+            effect) becomes an actual commitment, converting its purchase order lines' open commitments (through their
+            billing links, each used once) first; an account's lines are decided together, keyed by the bill's approved
+            version (change#InvoiceState's approval of a bill calls this). The control policy decides the part not already held, as reserve#Commitment
             does. Needs INVOICE_APPROVE, PAYABLE_EDIT, BUDGET_EDIT or ACCOUNTING_ADMIN in the organization.</description>
         <implements service="mantle.other.BudgetServices.define#CommitmentSource"/>
         <in-parameters>
@@ -648,8 +656,9 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
     <service verb="release" noun="Commitment" allow-remote="false">
         <description>Release what is left of a source's open commitments (a closed order, a cancelled request): optionally
-            one line, stage or revision. Releasing again releases nothing. Needs INVOICE_APPROVE, PAYABLE_EDIT, BUDGET_EDIT
-            or ACCOUNTING_ADMIN in the organization.</description>
+            one line, stage or revision. Releasing again releases nothing. Refuses a source still open (SOURCE_OPEN)
+            unless the user holds BUDGET_OVERRIDE or ACCOUNTING_ADMIN. Needs INVOICE_APPROVE, BUDGET_EDIT or
+            ACCOUNTING_ADMIN in the organization.</description>
         <in-parameters>
             <parameter name="organizationPartyId" required="true"/>
             <parameter name="sourceEntityName" required="true"/>
@@ -683,6 +692,17 @@ along with this software (see the LICENSE.md file). If not, see
                 .execute('recordBlocked', context)"/>
             <set field="budgetCommitmentId" from="recorded.budgetCommitmentId"/>
             <set field="notified" from="recorded.notified"/>
+        </actions>
+    </service>
+    <service verb="reverse" noun="InvoiceActuals" allow-remote="false">
+        <description>Internal to the invoice SECAs that revert a bill's posting (its approval undone, or the bill
+            cancelled): its actual budget commitments are reversed, and the order commitments they converted are open
+            again. The state change that runs it was checked by its own service.</description>
+        <in-parameters><parameter name="invoiceId" required="true"/></in-parameters>
+        <out-parameters><parameter name="reversedCount" type="Integer"/></out-parameters>
+        <actions>
+            <set field="reversedCount" from="ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js')
+                .execute('reverseInvoice', context).reversedCount"/>
         </actions>
     </service>
 </services>

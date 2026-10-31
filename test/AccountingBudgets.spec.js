@@ -90,7 +90,8 @@ spec({
         otherYearId = organization(otherOrg, "Other budget organization")
         party(supplier, "Budget supplier", "Supplier")
         user("gl", ["BUDGET_EDIT", "ACCOUNTING_VIEW"])
-        user("approver", ["BUDGET_APPROVE", "ACCOUNTING_VIEW", "INVOICE_APPROVE"])
+        // the approver also drafts, for the self-approval refusal
+        user("approver", ["BUDGET_APPROVE", "BUDGET_EDIT", "ACCOUNTING_VIEW", "INVOICE_APPROVE"])
         user("overrider", ["INVOICE_APPROVE", "BUDGET_OVERRIDE", "ACCOUNTING_VIEW"])
         user("admin", ["ACCOUNTING_ADMIN", "ACCOUNTING_VIEW"])
         user("ap", ["PAYABLE_EDIT", "PAYABLE_VIEW", "PAYABLE_IMPORT"])
@@ -340,7 +341,10 @@ feature("a purchase order's commitment converts to actual when its bill is appro
         }
         login(users.read)
         const reader = refused("mantle.other.BudgetServices.reserve#Commitment", reserve)
+        // a bill editor converts at approval but neither reserves nor releases
         login(users.ap)
+        const editor = refused("mantle.other.BudgetServices.reserve#Commitment", reserve)
+        login(users.approver)
         const reserved = budgets("reserve#Commitment", reserve)
         const again = budgets("reserve#Commitment", reserve)
         const changed = refused("mantle.other.BudgetServices.reserve#Commitment", Object.assign({}, reserve, {amount: 310}))
@@ -355,23 +359,34 @@ feature("a purchase order's commitment converts to actual when its bill is appro
         const approval = approveBill(billId)
         login(users.read)
         const actual = row(report({budgetId}), controlAccount)
-        // a second commitment released on the order's close, once
-        login(users.ap)
-        budgets("reserve#Commitment", Object.assign({}, reserve, {sourceId: orderId + "-B", amount: 50}))
+        // a second commitment of an open order: released only with override or administration, once
+        login(users.approver)
+        budgets("reserve#Commitment", Object.assign({}, reserve, {sourceId: orderId, sourceItemId: "B", amount: 50}))
+        const stillOpen = refused("mantle.other.BudgetServices.release#Commitment", {
+            organizationPartyId: org,
+            sourceEntityName: reserve.sourceEntityName,
+            sourceId: orderId,
+            sourceItemId: "B"
+        })
+        login(users.admin)
         const released = budgets("release#Commitment", {
             organizationPartyId: org,
             sourceEntityName: reserve.sourceEntityName,
-            sourceId: orderId + "-B"
+            sourceId: orderId,
+            sourceItemId: "B"
         })
         const releasedAgain = budgets("release#Commitment", {
             organizationPartyId: org,
             sourceEntityName: reserve.sourceEntityName,
-            sourceId: orderId + "-B"
+            sourceId: orderId,
+            sourceItemId: "B"
         })
         login(users.read)
         const afterRelease = row(report({budgetId}), controlAccount)
         return {
             reader,
+            editor,
+            stillOpen,
             reserved,
             again,
             changed,
@@ -385,8 +400,25 @@ feature("a purchase order's commitment converts to actual when its bill is appro
             afterRelease
         }
     },
-    then({reader, reserved, again, changed, committed, approval, actual, released, releasedAgain, order, actuals, afterRelease}) {
+    then({
+        reader,
+        editor,
+        stillOpen,
+        reserved,
+        again,
+        changed,
+        committed,
+        approval,
+        actual,
+        released,
+        releasedAgain,
+        order,
+        actuals,
+        afterRelease
+    }) {
         reader.includes("PERMISSION_DENIED")
+        editor.includes("PERMISSION_DENIED")
+        stillOpen.includes("SOURCE_OPEN")
         reserved.statusId == "BcReserved"
         reserved.decisionEnumId == "BcdWithin"
         again.existing == true
@@ -509,5 +541,248 @@ feature("the variance report and a bill's budget details stay in the reader's or
         detail.budgetRows.length == 1
         detail.budgetRows[0].decisionText == "Over budget, overridden"
         n(detail.budgetRows[0].amount) == 800
+    }
+})
+
+// An approved purchase order of one expense line, quantity × price, as the spec's administrator.
+function orderLine(quantity, unitAmount) {
+    login("john.doe")
+    const order = svc("mantle.order.OrderServices.create#Order", {
+        customerPartyId: org,
+        vendorPartyId: supplier,
+        currencyUomId: "USD"
+    })
+    const line = svc("mantle.order.OrderServices.create#OrderItem", {
+        orderId: order.orderId,
+        orderPartSeqId: order.orderPartSeqId,
+        itemTypeEnumId: "ItemExpense",
+        quantity,
+        unitAmount,
+        itemDescription: "Budget spec repairs"
+    })
+    svc("mantle.order.OrderServices.place#Order", {orderId: order.orderId})
+    svc("mantle.order.OrderServices.approve#Order", {orderId: order.orderId})
+    return {orderId: order.orderId, orderItemSeqId: line.orderItemSeqId}
+}
+function reserveLine(line, amount, glAccountId = controlAccount, sourceRevision = "1") {
+    login(users.approver)
+    return budgets("reserve#Commitment", {
+        organizationPartyId: org,
+        glAccountId,
+        amount,
+        currencyUomId: "USD",
+        stageEnumId: "BcsOrder",
+        sourceEntityName: "mantle.order.OrderHeader",
+        sourceId: line.orderId,
+        sourceItemId: line.orderItemSeqId,
+        sourceRevision
+    })
+}
+// What a commitment has left: its amount less what later stages hold (not blocked or reversed).
+function openOf(budgetCommitmentId) {
+    const parent = one("mantle.other.budget.BudgetCommitment", {budgetCommitmentId})
+    const used = rows("mantle.other.budget.BudgetCommitment", {convertedFromId: budgetCommitmentId})
+        .filter(row => !["BcBlocked", "BcReversed"].includes(row.statusId))
+        .reduce((sum, row) => sum + n(row.amount), 0)
+    return {open: n(parent.amount) - used, statusId: parent.statusId}
+}
+const actualSum = invoiceId =>
+    rows("mantle.other.budget.BudgetCommitment", {sourceId: invoiceId, statusId: "BcActual"}).reduce(
+        (sum, row) => sum + n(row.amount),
+        0
+    )
+
+feature("a bill whose approval is undone reverses its actuals; approved again it holds 600 of the order's 1000", {
+    when() {
+        const line = orderLine(10, 100)
+        const reserved = reserveLine(line, 1000)
+        login(users.ap)
+        const billId = svc("mantle.account.InvoiceServices.create#InvoiceFromSource", {
+            orderId: line.orderId,
+            organizationPartyId: org
+        }).invoiceId
+        login("john.doe")
+        const item = rows("mantle.account.invoice.InvoiceItem", {invoiceId: billId})[0]
+        svc("update#mantle.account.invoice.InvoiceItem", {
+            invoiceId: billId,
+            invoiceItemSeqId: item.invoiceItemSeqId,
+            quantity: 6
+        })
+        login(users.approver)
+        const first = approveBill(billId)
+        const afterFirst = {actual: actualSum(billId), order: openOf(reserved.budgetCommitmentId)}
+        // Resume Changes: the approval undone, its posting reverted
+        login("john.doe")
+        svc("update#mantle.account.invoice.Invoice", {invoiceId: billId, statusId: "InvoiceReceived"})
+        const resumed = {actual: actualSum(billId), order: openOf(reserved.budgetCommitmentId)}
+        login(users.approver)
+        const second = approveBill(billId)
+        return {first, afterFirst, resumed, second, actual: actualSum(billId), order: openOf(reserved.budgetCommitmentId)}
+    },
+    then({first, afterFirst, resumed, second, actual, order}) {
+        first == ""
+        afterFirst.actual == 600
+        afterFirst.order.open == 400
+        resumed.actual == 0
+        resumed.order.open == 1000
+        resumed.order.statusId == "BcReserved"
+        second == ""
+        actual == 600
+        order.open == 400
+    }
+})
+
+feature("two bill lines against one order line use its 1000 once, and the excess 200 meets the Stop", {
+    when() {
+        const line = orderLine(10, 100)
+        const reserved = reserveLine(line, 1000)
+        login(users.ap)
+        const billId = svc("mantle.account.InvoiceServices.import#Bill", {
+            organizationPartyId: org,
+            supplierPartyId: supplier,
+            referenceNumber: "BUDGET-TWO-LINES"
+        }).invoiceId
+        login("john.doe")
+        for (const seq of ["01", "02"]) {
+            svc("mantle.account.InvoiceServices.create#InvoiceItem", {
+                invoiceId: billId,
+                invoiceItemSeqId: seq,
+                itemTypeEnumId: "ItemExpense",
+                quantity: 6,
+                amount: 100,
+                description: "Repairs " + seq
+            })
+            svc("create#mantle.order.OrderItemBilling", {
+                orderId: line.orderId,
+                orderItemSeqId: line.orderItemSeqId,
+                invoiceId: billId,
+                invoiceItemSeqId: seq,
+                quantity: 6,
+                amount: 100
+            })
+        }
+        login(users.approver)
+        const stopped = approveBill(billId)
+        login(users.overrider)
+        const overridden = approveBill(billId, {budgetOverrideReason: "Second repair crew"})
+        const actuals = rows("mantle.other.budget.BudgetCommitment", {sourceId: billId, statusId: "BcActual"})
+        return {
+            stopped,
+            overridden,
+            converted: actuals
+                .filter(row => row.convertedFromId == reserved.budgetCommitmentId)
+                .reduce((sum, row) => sum + n(row.amount), 0),
+            own: actuals.filter(row => !row.convertedFromId).reduce((sum, row) => sum + n(row.amount), 0),
+            order: openOf(reserved.budgetCommitmentId)
+        }
+    },
+    then({stopped, overridden, converted, own, order}) {
+        stopped.includes("BUDGET_EXCEEDED")
+        overridden == ""
+        converted == 1000
+        own == 200
+        order.open == 0
+        order.statusId == "BcConverted"
+    }
+})
+
+feature("a revised order line reserves its new amount less what it already passed on", {
+    when() {
+        const line = {orderId: "BUDGET-REVISED-ORDER", orderItemSeqId: "01"}
+        const first = reserveLine(line, 1000, spreadAccount, "1")
+        login(users.approver)
+        const converted = budgets("convert#Commitment", {
+            organizationPartyId: org,
+            fromCommitmentId: first.budgetCommitmentId,
+            sourceEntityName: "mantle.account.invoice.Invoice",
+            sourceId: "BUDGET-REVISED-BILL",
+            sourceItemId: "01",
+            sourceRevision: "1",
+            stageEnumId: "BcsExpense",
+            amount: 400
+        })
+        const second = reserveLine(line, 1200, spreadAccount, "2")
+        const retry = reserveLine(line, 1200, spreadAccount, "2")
+        const open = rows("mantle.other.budget.BudgetCommitment", {sourceId: line.orderId, statusId: "BcReserved"})
+        return {
+            converted,
+            second,
+            retry,
+            committed: open.reduce((sum, row) => sum + n(row.amount), 0),
+            actual: actualSum("BUDGET-REVISED-BILL"),
+            firstStatus: one("mantle.other.budget.BudgetCommitment", {budgetCommitmentId: first.budgetCommitmentId}).statusId
+        }
+    },
+    then({converted, second, retry, committed, actual, firstStatus}) {
+        converted.statusId == "BcActual"
+        n(one("mantle.other.budget.BudgetCommitment", {budgetCommitmentId: second.budgetCommitmentId}).amount) == 800
+        retry.existing == true
+        retry.budgetCommitmentId == second.budgetCommitmentId
+        committed == 800
+        actual == 400
+        firstStatus == "BcReleased"
+    }
+})
+
+feature("an order commitment on another account gives up its share; the bill line counts in full on its own account", {
+    when() {
+        const line = orderLine(1, 100)
+        const reserved = reserveLine(line, 100, spreadAccount)
+        login(users.ap)
+        const billId = svc("mantle.account.InvoiceServices.create#InvoiceFromSource", {
+            orderId: line.orderId,
+            organizationPartyId: org
+        }).invoiceId
+        login(users.approver)
+        const stopped = approveBill(billId)
+        login(users.overrider)
+        const overridden = approveBill(billId, {budgetOverrideReason: "Repair billed to the other account"})
+        return {
+            stopped,
+            overridden,
+            actuals: rows("mantle.other.budget.BudgetCommitment", {sourceId: billId, statusId: "BcActual"}),
+            share: rows("mantle.other.budget.BudgetCommitment", {convertedFromId: reserved.budgetCommitmentId}),
+            order: openOf(reserved.budgetCommitmentId)
+        }
+    },
+    then({stopped, overridden, actuals, share, order}) {
+        stopped.includes("BUDGET_EXCEEDED")
+        overridden == ""
+        actuals.length == 1
+        actuals[0].glAccountId == controlAccount
+        actuals[0].convertedFromId == null
+        n(actuals[0].amount) == 100
+        share.length == 1
+        share[0].statusId == "BcReleased"
+        share[0].glAccountId == spreadAccount
+        order.open == 0
+        order.statusId == "BcConverted"
+    }
+})
+
+feature("budget writers need BUDGET_EDIT in the budget's organization, and the control reads only revised numbers", {
+    when() {
+        login(users.read)
+        const readerCreate = refused("mantle.other.BudgetServices.create#Budget", {timePeriodId: yearId, description: "Reader"})
+        login(users.gl)
+        const foreignItem = refused("mantle.other.BudgetServices.store#BudgetItem", {
+            budgetId: otherBudgetId,
+            glAccountId: controlAccount,
+            amount: 5
+        })
+        // an item written around revise#Budget (as an entity write) does not reach the control
+        login("john.doe")
+        const item = rows("mantle.other.budget.BudgetItem", {budgetId, glAccountId: controlAccount})[0]
+        svc("update#mantle.other.budget.BudgetItem", {budgetId, budgetItemSeqId: item.budgetItemSeqId, amount: 999999})
+        login(users.read)
+        const preview = budgets("check#Budget", {organizationPartyId: org, glAccountId: controlAccount, amount: 1}).checkList[0]
+        login("john.doe")
+        svc("update#mantle.other.budget.BudgetItem", {budgetId, budgetItemSeqId: item.budgetItemSeqId, amount: item.amount})
+        return {readerCreate, foreignItem, preview}
+    },
+    then({readerCreate, foreignItem, preview}) {
+        readerCreate.includes("PERMISSION_DENIED")
+        foreignItem.includes("ORGANIZATION_DENIED")
+        n(preview.budgetAmount) == 1000
     }
 })

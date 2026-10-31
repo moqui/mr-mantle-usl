@@ -66,9 +66,10 @@ along with this software (see the LICENSE.md file). If not, see
         <description>Spending of a source document line held against a budget: a request or purchase order line reserves
             (BcReserved), a later stage converts it (a new commitment whose convertedFromId names it: BcConverted once its
             amount is used up), a bill line records the actual (BcActual) and a close or cancel releases what is left
-            (BcReleased). A refused Stop is kept as BcBlocked with the decision, for the exceptions list. Each is keyed by
-            its source line, revision and stage, so a retry answers the first. Its relationships carry no foreign keys:
-            a refused Stop is recorded in its own transaction while the caller holds its locks.</description>
+            (BcReleased); a bill whose approval is undone reverses its actuals (BcReversed). A refused Stop is kept as
+            BcBlocked with the decision, for the exceptions list. Each is keyed by its source line, revision and stage, so
+            a retry answers the first. Its relationships carry no foreign keys: a refused Stop is recorded in its own
+            transaction while the caller holds its locks.</description>
         <field name="budgetCommitmentId" type="id" is-pk="true"/>
         <field name="organizationPartyId" type="id"/>
         <field name="budgetId" type="id"/>
@@ -127,10 +128,20 @@ along with this software (see the LICENSE.md file). If not, see
                     sequenceNum="4"/>
             <moqui.basic.StatusItem statusId="BcBlocked" statusTypeId="BudgetCommitment" description="Blocked"
                     sequenceNum="5"/>
+            <moqui.basic.StatusItem statusId="BcReversed" statusTypeId="BudgetCommitment" description="Reversed"
+                    sequenceNum="6"/>
             <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="BcReserved" toStatusId="BcConverted"
                     transitionName="Convert"/>
             <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="BcReserved" toStatusId="BcReleased"
                     transitionName="Release"/>
+            <!-- a bill whose approval is undone or which is cancelled reverses its actuals, and the order's share is open
+                again -->
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="BcActual" toStatusId="BcReversed"
+                    transitionName="Reverse"/>
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="BcConverted" toStatusId="BcReserved"
+                    transitionName="Reopen"/>
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="BcReleased" toStatusId="BcReversed"
+                    transitionName="Reverse"/>
             <moqui.basic.EnumerationType description="Budget Commitment Decision" enumTypeId="BudgetCommitmentDecision"/>
             <moqui.basic.Enumeration description="Within budget" enumId="BcdWithin" enumTypeId="BudgetCommitmentDecision"
                     sequenceNum="1"/>

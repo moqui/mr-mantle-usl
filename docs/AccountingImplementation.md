@@ -496,10 +496,12 @@ first release has local sales tax and the US 1099 data.
 party (`TimePeriod.partyId`); its other parties are `BudgetParty` rows (`store#BudgetParty`, `BUDGET_EDIT`).
 
 - **States.** Draft, Approved, Closed and Cancelled (`StatusFlowTransition`). `create#Budget` makes a draft and records
-  its creator. `change#BudgetState` approves (`BUDGET_APPROVE`; not by the creator unless `allowAccountingSelfApproval`;
-  each account's sub periods must add up to its total), closes an approved budget or cancels a draft (`BUDGET_EDIT`, with
-  a reason). The item writers (`store#BudgetItem`, `store#BudgetItemsSubPeriods`, `store#BudgetItemDetail`,
-  `store#BudgetItemDetailsSubPeriods`) refuse a budget that is not a draft (`BUDGET_NOT_DRAFT`).
+  its creator; it and the item writers need `BUDGET_EDIT` in the budget's organization. `change#BudgetState` approves
+  (`BUDGET_APPROVE`; a self-approval is stamped on the review; not by the creator unless `allowAccountingSelfApproval`;
+  each account's sub periods must add up to its total), closes an approved budget or cancels a draft (`BUDGET_EDIT`,
+  with a reason). The item writers (`store#BudgetItem`, `store#BudgetItemsSubPeriods`, `store#BudgetItemDetail`,
+  `store#BudgetItemDetailsSubPeriods`) refuse a budget that is not a draft (`BUDGET_NOT_DRAFT`). The control and the
+  BOSS lists read an approved budget as of its latest revision, never items written around `revise#Budget`.
 - **Revisions.** Approval is revision `000`: a `BudgetRevision`, a `BudgetReview` and a `BudgetRevisionImpact` holding
   each item's amount. `revise#Budget` (`BUDGET_EDIT`) changes an approved budget's amounts (lines by item or by account
   and sub period, or the matrix form `glAccountId` with `amountMain` and `amountPer1`–`12`) as the next revision with its
@@ -517,17 +519,24 @@ party (`TimePeriod.partyId`); its other parties are `BudgetParty` rows (`store#B
   gives an override reason. `check#Budget` previews it.
 - **Commitments.** `reserve#Commitment` (request or order line), `convert#Commitment` (to the next stage; with
   `invoiceId`, a bill's posted debit lines) and `release#Commitment`, each idempotent per source line, revision and
-  stage (a different amount or account under the same key is `SOURCE_REVISION_REUSED`); a new revision of a source line
-  releases the earlier one's open commitment. A converted commitment's open amount is its amount less what later stages
-  hold, and it is Converted when none is left, so committed and actual never count the same spending. They need
-  `INVOICE_APPROVE`, `PAYABLE_EDIT`, `BUDGET_EDIT` or `ACCOUNTING_ADMIN` in the organization. A refused Stop is kept as a
-  `BcBlocked` commitment, in its own transaction (`record#BlockedCommitment`; the commitment's relationships carry no
-  foreign keys for this), and the `BudgetOverride` notification goes once to the organization's users holding
-  `BUDGET_OVERRIDE`; it is marked read when the source passes.
-- **Bills.** `approve#Payable` (P6) calls `convert#Commitment` with the bill after its posting: each posted debit line
-  converts its purchase order line's open commitment (`OrderItemBilling`) and becomes an actual commitment, keyed by the
-  bill's `approvedSourceVersion`; an account's lines are decided together, and `budgetOverrideReason` passes a Stop.
-  `get#InvoiceFinanceDetail`'s `budgetRows` are the invoice's commitments (F75).
+  stage (a different amount or account under the same key is `SOURCE_REVISION_REUSED`; retries are checked again under
+  the budget's lock). A new revision of a source line releases the earlier one's open commitment and holds its amount
+  less what the earlier ones passed on. A converted commitment's open amount is its amount less what later stages hold
+  (not blocked or reversed), and it is Converted when none is left, so committed and actual never count the same
+  spending; a commitment converts only on its own account, and on another it gives up its share (a released child).
+  Reserve and release need `INVOICE_APPROVE`, `BUDGET_EDIT` or `ACCOUNTING_ADMIN` in the organization, convert also
+  `PAYABLE_EDIT`; release takes only a closed or cancelled source's commitments unless the user holds `BUDGET_OVERRIDE`
+  or `ACCOUNTING_ADMIN`. A refused Stop is kept as a `BcBlocked` commitment, in its own transaction
+  (`record#BlockedCommitment`, ordered by the budget item's lock; the commitment's relationships carry no foreign keys
+  for this), and the `BudgetOverride` notification goes once to the organization's users holding `BUDGET_OVERRIDE`; the
+  line's notice is marked read when it passes.
+- **Bills.** `change#InvoiceState`'s approval of a bill (so `approve#Payable` too) calls `convert#Commitment` with the
+  bill after its posting: each debit line of the posting in effect converts its purchase order line's open commitment
+  (`OrderItemBilling`; each commitment's open amount used once across the bill's lines) and becomes an actual
+  commitment, keyed by the bill's `approvedSourceVersion`; an account's lines are decided together, with the budgets
+  locked in order, and `budgetOverrideReason` passes a Stop. When the approval is undone (Approved to Received) or the
+  bill cancelled, the revert SECAs call `reverse#InvoiceActuals`: its actuals are Reversed and the order commitments
+  open again. `get#InvoiceFinanceDetail`'s `budgetRows` are the invoice's commitments (F75).
 - **Variance.** `run#BudgetVariance` (`ACCOUNTING_VIEW`) checks the organization and that the period is the budget's own
   or one of its sub periods (F6), and answers each account's budget as of the revision, committed, actual, remaining,
   variance and its percent (none for a zero budget). `run#BudgetExpenseReport` and `run#BudgetExpenseDetailReport` stay

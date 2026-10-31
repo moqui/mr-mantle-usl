@@ -11,8 +11,16 @@ const COMMITMENT = "mantle.other.budget.BudgetCommitment"
 const POLICY = "mantle.other.budget.BudgetControlPolicy"
 const ORDER = "mantle.order.OrderHeader"
 const INVOICE = "mantle.account.invoice.Invoice"
-// who may hold spending against a budget: the approvers and editors of the documents that spend, and budget editors
-const commitPermissions = ["INVOICE_APPROVE", "PAYABLE_EDIT", "BUDGET_EDIT", "ACCOUNTING_ADMIN"]
+// who may reserve and release spending against a budget: the approvers of the documents that spend, budget editors and
+// finance administrators; converting is also a bill editor's, since a bill's approval converts its order's commitment
+const reservePermissions = ["INVOICE_APPROVE", "BUDGET_EDIT", "ACCOUNTING_ADMIN"]
+const commitPermissions = reservePermissions.concat(["PAYABLE_EDIT"])
+// a source document whose open commitments a user releases without BUDGET_OVERRIDE: closed or cancelled
+const closedSources = {
+    "mantle.order.OrderHeader": ["orderId", ["OrderCompleted", "OrderCancelled", "OrderRejected"]],
+    "mantle.request.Request": ["requestId", ["ReqCompleted", "ReqCancelled", "ReqRejected"]],
+    "mantle.account.invoice.Invoice": ["invoiceId", ["InvoiceCancelled"]]
+}
 const readPermissions = ["ACCOUNTING_VIEW", "ACCOUNTING_ADMIN"]
 const zero = () => toDecimal(0)
 const dec = value => toDecimal(value ?? 0)
@@ -43,6 +51,13 @@ function budgetScope(budgetId, permission = null, lock = false) {
     const organizationPartyId = wf.organization(period.partyId, permission, lock)
     if (lock) budget = find(BUDGET, {budgetId}).forUpdate(true).one()
     return {budget, period, organizationPartyId, statusId: budget.statusId || "BudgetDraft"}
+}
+// create#Budget and the item writers: BUDGET_EDIT in the organization of the budget's period (or of the period given).
+function editScope(p) {
+    if (p.budgetId) return budgetScope(p.budgetId, "BUDGET_EDIT")
+    const period = p.timePeriodId && one("mantle.party.time.TimePeriod", {timePeriodId: p.timePeriodId})
+    if (!period?.partyId) denied("PERIOD_UNAVAILABLE", "Choose a period of the organization")
+    return {organizationPartyId: wf.organization(period.partyId, "BUDGET_EDIT", false)}
 }
 function readScope(budgetId) {
     const scope = budgetScope(budgetId)
@@ -169,7 +184,8 @@ function approve(p) {
     if (!items.length) denied("BUDGET_EMPTY", "A budget needs an amount for at least one account")
     requireDistribution(items, scope.budget.currencyUomId)
     const preference = policy.preference(scope.organizationPartyId)
-    if (scope.budget.createdByUserId === ec.user.userId && preference.allowAccountingSelfApproval !== "Y")
+    const selfApproved = scope.budget.createdByUserId === ec.user.userId
+    if (selfApproved && preference.allowAccountingSelfApproval !== "Y")
         denied("SELF_APPROVAL_DENIED", "Another finance approver must approve this budget")
     if (scope.budget.statusId !== "BudgetDraft") call("update#" + BUDGET, {budgetId: p.budgetId, statusId: "BudgetDraft"})
     call("update#" + BUDGET, {budgetId: p.budgetId, statusId: "BudgetApproved"})
@@ -177,7 +193,8 @@ function approve(p) {
         budgetId: p.budgetId,
         partyId: ec.user.userAccount?.partyId || null,
         budgetReviewResultEnumId: "BrrApproved",
-        reviewDate: ec.user.nowTimestamp
+        reviewDate: ec.user.nowTimestamp,
+        isSelfApproved: selfApproved ? "Y" : "N"
     })
     const revisionSeqId = nextRevisionSeqId(p.budgetId)
     recordRevision(p.budgetId, revisionSeqId, p.changeReason || "Approved")
@@ -316,10 +333,13 @@ function storeDocument(scope, revisionSeqId) {
     const budgetId = scope.budget.budgetId
     try {
         const items = itemsAsOf(budgetId, {revisionSeqId})
+        const accountIds = [...new Set(items.map(item => item.glAccountId).filter(Boolean))]
         const accounts = Object.fromEntries(
-            rows("mantle.ledger.account.GlAccount", {})
-                .filter(row => items.some(item => item.glAccountId === row.glAccountId))
-                .map(row => [row.glAccountId, (row.accountCode || row.glAccountId) + " " + (row.accountName || "")])
+            Array.from(
+                find("mantle.ledger.account.GlAccount")
+                    .condition("glAccountId", "in", accountIds.length ? accountIds : ["_NA_"])
+                    .list()
+            ).map(row => [row.glAccountId, (row.accountCode || row.glAccountId) + " " + (row.accountName || "")])
         )
         const periods = Object.fromEntries(subPeriods(scope.budget).map(row => [row.timePeriodId, row.periodName]))
         const currency = scope.budget.currencyUomId
@@ -464,7 +484,10 @@ function budgetLine(organizationPartyId, glAccountId, bookDay) {
         find(BUDGET, {statusId: "BudgetApproved"}).condition("timePeriodId", "in", periodIds).orderBy("budgetId").list()
     )
     for (const budget of budgets) {
-        const items = rows(ITEM, {budgetId: budget.budgetId, glAccountId}).filter(row => row.amount != null)
+        // an approved budget's numbers are its latest revision's; one approved without a revision controls nothing
+        const latest = revisions(budget.budgetId).pop()
+        if (!latest) continue
+        const items = itemsAsOf(budget.budgetId, latest).filter(row => row.glAccountId === glAccountId && row.amount != null)
         if (!items.length) continue
         for (const item of items.filter(row => row.subTimePeriodId)) {
             const sub = one("mantle.party.time.TimePeriod", {timePeriodId: item.subTimePeriodId})
@@ -515,13 +538,13 @@ function actualAmount(organizationPartyId, glAccountIds, fromDay, thruDay) {
     }
     return totals
 }
-// What each commitment has passed on to later stages: the commitments converted from it (except blocked ones).
+// What each commitment has passed on to later stages: the commitments converted from it (except blocked and reversed ones).
 function consumedAmounts(commitmentIds) {
     const consumed = {}
     if (!commitmentIds.length) return consumed
     for (const child of find(COMMITMENT)
         .condition("convertedFromId", "in", commitmentIds)
-        .condition("statusId", "not-equals", "BcBlocked")
+        .condition("statusId", "not-in", ["BcBlocked", "BcReversed"])
         .list())
         consumed[child.convertedFromId] = (consumed[child.convertedFromId] || zero()).add(dec(child.amount))
     return consumed
@@ -660,6 +683,9 @@ function commitmentFields(evaluation, key, statusId) {
 // record#BlockedCommitment: one blocked row per source key, and the BudgetOverride notice when it is first recorded.
 function recordBlocked(p) {
     const fields = p.fields
+    // two refusals of the same line at once record one row: the budget item orders them (the caller holds the budget,
+    // and its posting the accounts)
+    find(ITEM, {budgetId: fields.budgetId, budgetItemSeqId: fields.budgetItemSeqId}).forUpdate(true).one()
     const existing = rows(COMMITMENT, {
         sourceEntityName: fields.sourceEntityName,
         sourceId: fields.sourceId,
@@ -696,18 +722,18 @@ function keyed(key) {
         stageEnumId: key.stageEnumId
     }).filter(
         row =>
-            row.statusId !== "BcBlocked" &&
+            !["BcBlocked", "BcReversed"].includes(row.statusId) &&
             (row.sourceItemId || null) === (key.sourceItemId || null) &&
             (key.sourceRevision == null || row.sourceRevision === key.sourceRevision)
     )
 }
-// Overriders' notices about a source are read once it passes.
-function clearBlocked(key) {
+// Overriders' notices about a source line are read once it passes.
+function clearBlocked(key, glAccountId) {
     const blocked = rows(COMMITMENT, {
         sourceEntityName: key.sourceEntityName,
         sourceId: key.sourceId,
         statusId: "BcBlocked"
-    })
+    }).filter(row => (row.sourceItemId || null) === (key.sourceItemId || null) && row.glAccountId === glAccountId)
     const payables = ec.resource.script("component://mr-mantle/service/mantle/account/Payables.js")
     for (const row of blocked)
         payables.execute("clearNotices", {
@@ -716,8 +742,8 @@ function clearBlocked(key) {
             recordId: row.budgetCommitmentId
         })
 }
-function commitScope(p) {
-    requireAny(commitPermissions, "Budget commitment")
+function commitScope(p, permissions = commitPermissions) {
+    requireAny(permissions, "Budget commitment")
     if (!p.organizationPartyId) denied("ORGANIZATION_REQUIRED", "Choose an internal organization")
     return wf.organization(p.organizationPartyId, null, false)
 }
@@ -759,46 +785,78 @@ function answer(row, existing) {
 }
 
 function reserve(p) {
-    const organizationPartyId = commitScope(p)
+    const organizationPartyId = commitScope(p, reservePermissions)
     const stageEnumId = p.stageEnumId || "BcsRequest"
     if (stageEnumId === "BcsExpense") denied("STAGE_INVALID", "An expense is recorded by convert#Commitment")
     const key = sourceKey(p, organizationPartyId, stageEnumId)
     if (!p.glAccountId || !policy.accountAssignment(organizationPartyId, p.glAccountId))
         denied("ACCOUNT_UNAVAILABLE", "Choose an account of the organization")
+    // what the source line's earlier revisions already passed on to later stages stays there: the new revision holds
+    // the rest
+    const earlier = () =>
+        keyed(Object.assign({}, key, {sourceRevision: null})).filter(row => row.sourceRevision !== key.sourceRevision)
+    const carried = () => {
+        const before = earlier()
+        const consumed = consumedAmounts(before.map(row => row.budgetCommitmentId))
+        return before.reduce((sum, row) => sum.add(consumed[row.budgetCommitmentId] || zero()), zero())
+    }
     // a retry of the same source revision answers the first
-    const same = keyed(key)[0]
-    if (same) {
-        requireSame(same, key, p.glAccountId)
+    const retry = () => {
+        const same = keyed(key)[0]
+        if (!same) return null
+        requireSame(same, Object.assign({}, key, {amount: key.amount.subtract(carried())}), p.glAccountId)
         return answer(same, true)
     }
+    const first = retry()
+    if (first) return first
+    const amount = key.amount.subtract(carried())
+    let evaluation = evaluate(organizationPartyId, stageEnumId, p.glAccountId, key.commitmentDate, amount)
+    lockBudget(evaluation)
+    const again = retry()
+    if (again) return again
     // a new revision of the source line replaces the open commitment of an earlier one
-    for (const earlier of keyed(Object.assign({}, key, {sourceRevision: null})).filter(row => row.statusId === "BcReserved"))
+    for (const row of earlier().filter(row => row.statusId === "BcReserved"))
         call("update#" + COMMITMENT, {
-            budgetCommitmentId: earlier.budgetCommitmentId,
+            budgetCommitmentId: row.budgetCommitmentId,
             statusId: "BcReleased",
             releasedDate: ec.user.nowTimestamp
         })
-    let evaluation = evaluate(organizationPartyId, stageEnumId, p.glAccountId, key.commitmentDate, key.amount)
-    lockBudget(evaluation)
-    evaluation = decide(evaluate(organizationPartyId, stageEnumId, p.glAccountId, key.commitmentDate, key.amount), p, key)
+    if (amount.compare(0) <= 0)
+        return {
+            budgetCommitmentId: null,
+            statusId: null,
+            decisionEnumId: null,
+            existing: false,
+            message: "Later stages already hold the whole amount of this source line"
+        }
+    const net = Object.assign({}, key, {amount})
+    evaluation = decide(evaluate(organizationPartyId, stageEnumId, p.glAccountId, key.commitmentDate, amount), p, net)
     requireCurrency(evaluation, key)
     if (evaluation.decisionEnumId === "BcdWarned") ec.message.addMessage(evaluation.message, "warning")
-    const created = call("create#" + COMMITMENT, commitmentFields(evaluation, key, "BcReserved"))
-    clearBlocked(key)
+    const created = call("create#" + COMMITMENT, commitmentFields(evaluation, net, "BcReserved"))
+    clearBlocked(key, p.glAccountId)
     return answer(one(COMMITMENT, {budgetCommitmentId: created.budgetCommitmentId}), false)
 }
 function requireCurrency(evaluation, key) {
     if (key.currencyUomId && evaluation.currencyUomId && key.currencyUomId !== evaluation.currencyUomId)
         denied("CURRENCY_MISMATCH", "The budget is in " + evaluation.currencyUomId + ", not " + key.currencyUomId)
 }
-// Mark a reserved commitment converted once later stages hold all of it.
+// A reserved commitment is converted once later stages hold all of it, and reserved again when some comes back.
 function settleParents(parentIds) {
     const consumed = consumedAmounts(parentIds)
     for (const id of parentIds) {
         const parent = one(COMMITMENT, {budgetCommitmentId: id})
-        if (parent?.statusId === "BcReserved" && openAmount(parent, consumed).compare(0) <= 0)
+        const open = parent ? openAmount(parent, consumed).compare(0) > 0 : false
+        if (parent?.statusId === "BcReserved" && !open)
             call("update#" + COMMITMENT, {budgetCommitmentId: id, statusId: "BcConverted"})
+        else if (parent?.statusId === "BcConverted" && open)
+            call("update#" + COMMITMENT, {budgetCommitmentId: id, statusId: "BcReserved"})
     }
+}
+// Lock the budgets of evaluations in budgetId order, so two sessions never wait on each other.
+function lockBudgets(evaluations) {
+    for (const budgetId of [...new Set(evaluations.map(row => row.budgetId).filter(Boolean))].sort())
+        find(BUDGET, {budgetId}).forUpdate(true).one()
 }
 
 // convert#Commitment: a reserved commitment passed on to a later stage (a request to its purchase order, an order line to
@@ -819,17 +877,25 @@ function convert(p) {
     if (!parent || parent.organizationPartyId !== organizationPartyId)
         denied("COMMITMENT_UNAVAILABLE", "No open commitment of the source to convert")
     const glAccountId = p.glAccountId || parent.glAccountId
-    const same = keyed(key)[0]
-    if (same) {
+    const retry = () => {
+        const same = keyed(key)[0]
+        if (!same) return null
         requireSame(same, key, glAccountId)
         return answer(same, true)
     }
+    const first = retry()
+    if (first) return first
+    const posted = stageEnumId === "BcsExpense"
+    lockBudget(evaluate(organizationPartyId, stageEnumId, glAccountId, key.commitmentDate, key.amount, zero(), posted))
+    const again = retry()
+    if (again) return again
     parent = find(COMMITMENT, {budgetCommitmentId: parent.budgetCommitmentId}).forUpdate(true).one()
     if (parent.statusId !== "BcReserved") denied("COMMITMENT_CLOSED", "Commitment " + parent.budgetCommitmentId + " is not open")
     const open = openAmount(parent, consumedAmounts([parent.budgetCommitmentId]))
-    const consumed = open.compare(key.amount) < 0 ? open : key.amount
-    const posted = stageEnumId === "BcsExpense"
-    lockBudget(evaluate(organizationPartyId, stageEnumId, glAccountId, key.commitmentDate, key.amount, consumed, posted))
+    const used = open.compare(key.amount) < 0 ? open : key.amount
+    // a commitment converts only on its own account; on another account its share is released and the spending is new
+    const sameAccount = parent.glAccountId === glAccountId
+    const consumed = sameAccount ? used : zero()
     const evaluation = decide(
         evaluate(organizationPartyId, stageEnumId, glAccountId, key.commitmentDate, key.amount, consumed, posted),
         p,
@@ -837,20 +903,46 @@ function convert(p) {
     )
     requireCurrency(evaluation, key)
     if (evaluation.decisionEnumId === "BcdWarned") ec.message.addMessage(evaluation.message, "warning")
+    if (!sameAccount && used.compare(0) > 0) releaseShare(parent, used, key, glAccountId)
     const fields = commitmentFields(
         evaluation,
-        Object.assign({}, key, {convertedFromId: parent.budgetCommitmentId}),
+        Object.assign({}, key, {convertedFromId: sameAccount ? parent.budgetCommitmentId : null}),
         posted ? "BcActual" : "BcReserved"
     )
     const created = call("create#" + COMMITMENT, fields)
     settleParents([parent.budgetCommitmentId])
-    clearBlocked(key)
+    clearBlocked(key, glAccountId)
     return answer(one(COMMITMENT, {budgetCommitmentId: created.budgetCommitmentId}), false)
 }
+// The share of a commitment that later spending took on another account: released, as a child of the commitment, so the
+// commitment's account no longer holds it and the other account counts the spending itself.
+function releaseShare(parent, amount, key, glAccountId) {
+    call(
+        "create#" + COMMITMENT,
+        Object.assign(
+            commitmentFields(
+                {
+                    glAccountId: parent.glAccountId,
+                    budgetId: parent.budgetId,
+                    budgetItemSeqId: parent.budgetItemSeqId,
+                    timePeriodId: parent.timePeriodId,
+                    currencyUomId: parent.currencyUomId,
+                    decisionEnumId: "BcdNoControl",
+                    message: "Spent on account " + glAccountId + " by " + key.sourceId
+                },
+                Object.assign({}, key, {amount, convertedFromId: parent.budgetCommitmentId}),
+                "BcReleased"
+            ),
+            {releasedDate: ec.user.nowTimestamp}
+        )
+    )
+}
 
-// An approved bill's actuals: each posted debit line with an approved budget or a purchase order line commitment becomes
-// an actual commitment, converting the order line's open commitment (OrderItemBilling) first. The lines of an account are
-// decided together, after the posting, keyed by the bill's approved version.
+// An approved bill's actuals: each posted debit line (not reversed) with an approved budget or a purchase order line
+// commitment becomes an actual commitment, converting the order line's open commitment (OrderItemBilling) first when it
+// is on the line's account. Each order commitment's open amount is used once across the bill's lines. The lines of an
+// account are decided together, after the posting, keyed by the bill's approved version, with the budgets locked in
+// order.
 function convertInvoice(p) {
     const invoice = one(INVOICE, {invoiceId: p.invoiceId})
     if (!invoice) denied("INVOICE_UNAVAILABLE", "Invoice is not available")
@@ -866,14 +958,15 @@ function convertInvoice(p) {
         currencyUomId: invoice.currencyUomId,
         commitmentDate: policy.bookDay(invoice.accountingDate, invoice.invoiceDate)
     }
-    const done = rows(COMMITMENT, {sourceEntityName: INVOICE, sourceId: p.invoiceId, sourceRevision: revision}).filter(
-        row => row.statusId !== "BcBlocked"
-    )
-    if (done.length) return {budgetCommitmentIds: done.map(row => row.budgetCommitmentId), existing: true}
-    // the posted debit lines of the bill, by line and account
-    const transIds = rows("mantle.ledger.transaction.AcctgTrans", {invoiceId: p.invoiceId, isPosted: "Y"}).map(
-        row => row.acctgTransId
-    )
+    const done = () =>
+        rows(COMMITMENT, {sourceEntityName: INVOICE, sourceId: p.invoiceId, sourceRevision: revision}).filter(
+            row => !["BcBlocked", "BcReversed"].includes(row.statusId)
+        )
+    if (done().length) return {budgetCommitmentIds: done().map(row => row.budgetCommitmentId), existing: true}
+    // the posted debit lines of the bill, by line and account, from its posting in effect (as revert#InvoicePost reads it)
+    const transIds = rows("mantle.ledger.transaction.AcctgTrans", {invoiceId: p.invoiceId, isPosted: "Y"})
+        .filter(row => !row.reversedByAcctgTransId && !row.reverseOfAcctgTransId)
+        .map(row => row.acctgTransId)
     const lines = {}
     if (transIds.length)
         for (const entry of find("mantle.ledger.transaction.AcctgTransEntry")
@@ -889,8 +982,12 @@ function convertInvoice(p) {
             })
             line.amount = line.amount.add(dec(entry.amount))
         }
-    // each line's purchase order commitments, open, through its billing links
-    for (const line of Object.values(lines)) {
+    // each line's purchase order commitments through its billing links; what one line takes of a commitment the next
+    // cannot take again
+    const usedOf = {}
+    const consumedOf = {}
+    const lineList = Object.values(lines).sort((a, b) => String(a.invoiceItemSeqId).localeCompare(String(b.invoiceItemSeqId)))
+    for (const line of lineList) {
         line.parents = []
         line.consumed = zero()
         let remaining = line.amount
@@ -905,65 +1002,123 @@ function convertInvoice(p) {
                     sourceItemId: billing.orderItemSeqId,
                     statusId: "BcReserved"
                 })
+                    .orderBy("budgetCommitmentId")
                     .forUpdate(true)
                     .list()
             )
-            const consumed = consumedAmounts(reserved.map(row => row.budgetCommitmentId))
+            Object.assign(
+                consumedOf,
+                consumedAmounts(reserved.map(row => row.budgetCommitmentId).filter(id => !(id in consumedOf)))
+            )
             for (const parent of reserved) {
                 if (remaining.compare(0) <= 0) break
-                const open = openAmount(parent, consumed)
+                const open = openAmount(parent, consumedOf).subtract(usedOf[parent.budgetCommitmentId] || zero())
                 const used = open.compare(remaining) < 0 ? open : remaining
                 if (used.compare(0) <= 0) continue
-                line.parents.push({parent, used})
-                line.consumed = line.consumed.add(used)
+                usedOf[parent.budgetCommitmentId] = (usedOf[parent.budgetCommitmentId] || zero()).add(used)
+                const sameAccount = parent.glAccountId === line.glAccountId
+                line.parents.push({parent, used, sameAccount})
+                if (sameAccount) line.consumed = line.consumed.add(used)
                 remaining = remaining.subtract(used)
             }
         }
     }
-    // decide each account's lines together
+    // decide each account's lines together, the budgets locked first in order
     const byAccount = {}
-    for (const line of Object.values(lines)) (byAccount[line.glAccountId] ??= []).push(line)
+    for (const line of lineList) (byAccount[line.glAccountId] ??= []).push(line)
+    const groups = Object.entries(byAccount).map(([glAccountId, accountLines]) => ({
+        glAccountId,
+        accountLines,
+        amount: accountLines.reduce((sum, line) => sum.add(line.amount), zero()),
+        consumed: accountLines.reduce((sum, line) => sum.add(line.consumed), zero()),
+        linked: accountLines.some(line => line.parents.length)
+    }))
+    const first = groups.map(group =>
+        evaluate(organizationPartyId, "BcsExpense", group.glAccountId, base.commitmentDate, group.amount, group.consumed, true)
+    )
+    lockBudgets(first)
+    if (done().length) return {budgetCommitmentIds: done().map(row => row.budgetCommitmentId), existing: true}
     const created = []
     const parentIds = new Set()
-    for (const [glAccountId, accountLines] of Object.entries(byAccount)) {
-        const amount = accountLines.reduce((sum, line) => sum.add(line.amount), zero())
-        const consumed = accountLines.reduce((sum, line) => sum.add(line.consumed), zero())
-        let evaluation = evaluate(organizationPartyId, "BcsExpense", glAccountId, base.commitmentDate, amount, consumed, true)
-        if (!evaluation.budgetId && consumed.compare(0) === 0) continue
-        lockBudget(evaluation)
+    groups.forEach((group, index) => {
+        if (!first[index].budgetId && !group.linked) return
+        const {glAccountId, accountLines, amount, consumed} = group
         const accountKey = Object.assign({}, base, {amount, sourceItemId: accountLines[0].invoiceItemSeqId})
-        evaluation = decide(
+        const evaluation = decide(
             evaluate(organizationPartyId, "BcsExpense", glAccountId, base.commitmentDate, amount, consumed, true),
             p,
             accountKey
         )
         if (evaluation.decisionEnumId === "BcdWarned") ec.message.addMessage(evaluation.message, "warning")
         for (const line of accountLines) {
-            // the part converted from each order commitment, then any rest of the line on its own
-            const pieces = line.parents.map(({parent, used}) => ({amount: used, convertedFromId: parent.budgetCommitmentId}))
+            const lineKey = Object.assign({}, base, {sourceItemId: line.invoiceItemSeqId})
+            // the part converted from each order commitment on the line's account, then the rest of the line on its own;
+            // a commitment on another account gives up its share
+            const pieces = []
+            for (const {parent, used, sameAccount} of line.parents) {
+                parentIds.add(parent.budgetCommitmentId)
+                if (sameAccount) pieces.push({amount: used, convertedFromId: parent.budgetCommitmentId})
+                else releaseShare(parent, used, lineKey, glAccountId)
+            }
             const rest = line.amount.subtract(line.consumed)
             if (rest.compare(0) > 0 || !pieces.length) pieces.push({amount: rest, convertedFromId: null})
             for (const piece of pieces) {
                 if (piece.amount.compare(0) <= 0) continue
-                const key = Object.assign({}, base, {
-                    sourceItemId: line.invoiceItemSeqId,
-                    amount: piece.amount,
-                    convertedFromId: piece.convertedFromId
-                })
+                const key = Object.assign({}, lineKey, {amount: piece.amount, convertedFromId: piece.convertedFromId})
                 const fields = commitmentFields(Object.assign({}, evaluation, {glAccountId}), key, "BcActual")
                 created.push(call("create#" + COMMITMENT, fields).budgetCommitmentId)
-                if (piece.convertedFromId) parentIds.add(piece.convertedFromId)
             }
         }
-    }
+        clearBlocked(accountKey, glAccountId)
+    })
     settleParents([...parentIds])
-    clearBlocked(base)
     return {budgetCommitmentIds: created, existing: false}
 }
 
+// reverse#InvoiceActuals: a bill whose approval is undone (Approved to Received) or which is cancelled reverses its actual
+// commitments, so the order commitments they converted are open again.
+function reverseInvoice(p) {
+    const actual = Array.from(
+        find(COMMITMENT, {sourceEntityName: INVOICE, sourceId: p.invoiceId, statusId: "BcActual"}).forUpdate(true).list()
+    )
+    // the order shares released to another account by the bill come back too
+    const shares = rows(COMMITMENT, {sourceEntityName: INVOICE, sourceId: p.invoiceId, statusId: "BcReleased"}).filter(
+        row => row.convertedFromId
+    )
+    for (const row of actual)
+        call("update#" + COMMITMENT, {
+            budgetCommitmentId: row.budgetCommitmentId,
+            statusId: "BcReversed",
+            releasedDate: ec.user.nowTimestamp
+        })
+    for (const row of shares)
+        call("update#" + COMMITMENT, {
+            budgetCommitmentId: row.budgetCommitmentId,
+            statusId: "BcReversed",
+            releasedDate: ec.user.nowTimestamp
+        })
+    settleParents([
+        ...new Set(
+            actual
+                .concat(shares)
+                .map(row => row.convertedFromId)
+                .filter(Boolean)
+        )
+    ])
+    return {reversedCount: actual.length}
+}
+
+// release#Commitment: what is left of a closed or cancelled source's open commitments; a source still open needs
+// BUDGET_OVERRIDE or finance administration.
 function release(p) {
-    const organizationPartyId = commitScope(p)
+    const organizationPartyId = commitScope(p, reservePermissions)
     if (!p.sourceEntityName || !p.sourceId) denied("SOURCE_REQUIRED", "Name the source document to release")
+    if (!has("BUDGET_OVERRIDE") && !has("ACCOUNTING_ADMIN")) {
+        const [pkName, statuses] = closedSources[p.sourceEntityName] || []
+        const source = pkName ? one(p.sourceEntityName, {[pkName]: p.sourceId}) : null
+        if (!source || !statuses.includes(source.statusId))
+            denied("SOURCE_OPEN", "Only a closed or cancelled source's commitments are released, or by BUDGET_OVERRIDE")
+    }
     const open = Array.from(
         find(COMMITMENT, {
             organizationPartyId,
@@ -1085,10 +1240,11 @@ function variance(p) {
         isDraft: scope.statusId === "BudgetDraft",
         currencyUomId: scope.budget.currencyUomId,
         varianceRows,
-        totalApproved: totals.approved,
+        // a row without a budget amount (no amount for the sub period) leaves the budget and remaining totals unavailable
+        totalApproved: varianceRows.some(row => row.approvedAmount == null) ? null : totals.approved,
         totalCommitted: totals.committed,
         totalActual: totals.actual,
-        totalRemaining: totals.remaining,
+        totalRemaining: varianceRows.some(row => row.approvedAmount == null) ? null : totals.remaining,
         subTimePeriodList: subs.map(policy.display),
         asOf: ec.l10n.format(ec.user.nowTimestamp, "yyyy-MM-dd HH:mm:ss")
     }
@@ -1128,6 +1284,8 @@ const operations = {
     reserve,
     convert,
     release,
+    reverseInvoice,
+    editScope: p => ({organizationPartyId: editScope(p).organizationPartyId}),
     check,
     recordBlocked,
     variance,
