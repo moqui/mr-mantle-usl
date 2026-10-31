@@ -100,7 +100,8 @@ along with this software (see the LICENSE.md file). If not, see
         <description>Unapply a bill's applied match: each billing link it wrote goes back to its quantity before (zero when
             the match created it); a receipt that names the bill names another bill still linked to it with a quantity,
             even one that bills only part of it, so Mantle's receipt billing does not bill it again, or none when no link
-            remains; the match is ended (ImUnapplied). A hold it placed stays until an approver releases it. Needs INVOICE_MATCH in the organization.</description>
+            remains; the match is ended (ImUnapplied). A hold it placed stays until an approver releases it. Needs
+            INVOICE_MATCH in the organization.</description>
         <in-parameters>
             <parameter name="invoiceId" required="true"/>
             <parameter name="organizationPartyId"/>
