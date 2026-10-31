@@ -28,6 +28,8 @@ const preferenceFields = [
     "invoiceApprovalRequired",
     "inventoryRevaluationEnabled",
     "receiptInvoiceSelfBilledOnly",
+    "returnSettlementRequired",
+    "salesInvoiceFinalizedAtShip",
     "projectCostPostingEnabled",
     "taxGatewayConfigId",
     "invoiceDocumentTemplate",

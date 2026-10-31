@@ -488,6 +488,68 @@ first release has local sales tax and the US 1099 data.
   its format version and records the export; a sales tax statement whose invoices changed since is refused, and an
   exported statement is not deleted (`delete#TaxStatement`). `simulate#SalesTax` explains a sample sale.
 
+## Returns and order changes (P17)
+
+**Flags.** Two audit-logged `PartyAcctgPreference` fields (`entity/ReturnSettlementEntities.xml`), off by default and set
+through `store#Preferences`, since Mantle's ReturnToResponse and OrderToCash flows assert the old behavior:
+- `returnSettlementRequired` (D11): `ReturnApprovedProcess` only creates the return shipment, `ShipmentDeliveredReturnReceive`
+  and `ReturnReceivedProcess` stand aside, and responses come only from `settle#Return`. `ReturnServices.get#ReturnSettlementMode`
+  answers whose return it is (the vendor of a customer return, the customer of a supplier return) and the flag.
+- `salesInvoiceFinalizedAtShip` (D3): `ShipmentOutgoingPackedCreateInvoices` leaves the sales invoice in process with no
+  payment applied, and `ShipmentShippedFinalizeInvoices` (shipped, or delivered unshipped) calls
+  `InvoiceServices.finalize#ShipmentInvoices`, which dates it the ship day (invoice date, book day, due date), finalizes
+  it and applies the order part's payments, as the pack did. A return shipment received through Mantle's own services
+  under `returnSettlementRequired` sets each item's received quantity from its receipts (`sync#ReturnShipmentReceipts`).
+
+**Receipt.** `WarehouseTaskServices.receive#ReturnItems` (`STOCK_RECEIVE`, Warehouse's contract): per return item on a
+customer return shipment, the accepted units as stock (`receive#Asset` on the item's source) and the rejected units as a
+receipt with no stock; `ReturnItem.receivedQuantity` grows, `returnQuantity` never changes, no response is processed.
+The item reaches ReturnReceived (ReturnManResp for a manual response) when all its authorized quantity arrived, the return
+when every item is handled, the shipment ShipDelivered when every source is. It refuses more than authorized
+(`RECEIPT_EXCEEDS_RETURN`) and an organization without `returnSettlementRequired` (`RETURN_SETTLEMENT_OFF`).
+
+**Settlement.** `ReturnServices.preview#ReturnSettlement` and `settle#Return` (logic in `order/ReturnSettlement.js`):
+- Eligibility: a customer item what was received (authorized, for a receiptless credit) less what its standing billing links
+  settled, within what its order line billed less what every return credited; a supplier item what was shipped back
+  (ReturnShipped or later) within what was billed less earlier supplier credits. An item's discount and tax children follow
+  it, prorated by the quantity settled.
+- The preview answers each item's quantities, the lines of the request with their amounts, the credit, refund and
+  replacement totals, the original payment a refund goes to, its `previewVersion` and the first refusal it would meet
+  (`reasonCode`). A reader (the side's view or edit permission, or `ACCOUNTING_VIEW`) previews.
+- `settle#Return` checks the writer's permission first (`FORBIDDEN`: a customer return needs `RECEIVABLE_EDIT`, a refund
+  also `PAYMENT_EDIT`, a receiptless credit also `RETURN_CREDIT_APPROVE`; a supplier return `PAYABLE_EDIT`), answers a
+  retried operation key with the first result, recomputes the plan under lock (organization, return, items) and refuses
+  another version (`RECEIPT_CHANGED`), more than eligible (`CREDIT_CAP_EXCEEDED`), a refund beyond the original's
+  refundable amount (`CREDIT_CAP_EXCEEDED`) or while one is pending (`REFUND_PENDING`), and a closed period or lock
+  (`CLOSED_PERIOD`).
+- A customer return responds through the internal `respond#ReturnItems` with its `settlement` parameter (Mantle's
+  `process#ReturnItemResponses` refuses a return under the flag, `RETURN_SETTLEMENT_REQUIRED`): the quantities given,
+  each billing link with its receipt, original invoice line, receiptless flag, reason, approver, settler and operation key;
+  the credit memo is the organization's receivable credit (F350), issued through `change#InvoiceState` (approved by the
+  settler when invoice approval is required; a receiptless one approved by its settler, who needs `INVOICE_APPROVE` and
+  `allowAccountingSelfApproval`); a credit is the
+  customer credit account; a refund is spread over the order's captured payments, largest first, each a
+  `create#RefundPayment` for the credit memo, delivered at once without a gateway. The settlement commits first
+  (`record#ReturnSettlement`); then each gateway refund (`refund#SinglePayment`, keyed by the settlement's key and index)
+  runs in its own transaction with its attempt recorded before the call (a `PaymentLifecycleEvent`), so a retry calls no
+  gateway twice. A decline marks that refund declined, its amount refundable again, and leaves the credit and the other
+  refunds (`REFUND_DECLINED`); a refund with no gateway answer is declined; a pending or unfinished call stays promised
+  (`REFUND_PENDING`, read from the credit memos' refunds); a replacement is Mantle's replacement order for the quantity given, recorded on `replacedQuantity`.
+- Adjustments are credited by their total times the share of the item credited so far, less what they credited before;
+  a credit's unit is at most the billed unit price; a line asked twice is refused (`DUPLICATE_LINE`).
+- A supplier return makes one credit per item, its adjustments netted in, through `create#InvoiceCreditMemo` linked to
+  its bill (a payable draft),
+  links the billing to the bill line and the PO receipt, and queues the bill's match re-evaluation.
+- An item settled for all it authorizes is completed with its children (`complete#ReturnItem`); a receiptless one first
+  has its remainder closed (ReturnReceived).
+
+**Between pack and ship.** `InvoiceServices.release#ShipmentDraftInvoice` (`RECEIVABLE_EDIT`): before the shipment ships,
+the invoice lines billed for it and their billing links are removed, its sources and issuances no longer name the invoice,
+and an invoice left with no line is cancelled, so packing again bills it again; a shipped shipment (`SHIPMENT_SHIPPED`) or
+an invoice no longer in process (`INVOICE_FINALIZED`) is refused. `PaymentServices.refund#OrderPayment` (`PAYMENT_EDIT`)
+refunds a captured order payment through `create#RefundPayment`, with the gateway's `refund#SinglePayment` when the
+payment has one, within what is unapplied and not refunded (`get#PaymentRefundSummary`). Both take an operation key.
+
 ## Libraries
 
 - `ledger/EntityLib.js`: the helpers the finance modules share: entity reads without artifact authorization (each
@@ -499,8 +561,9 @@ first release has local sales tax and the US 1099 data.
   fields, and asks `ACCOUNTING_GL_POST` of a manual or reversal posting unless its caller passes `reviewed`.
 - `account/InvoiceWorkflowLib.js`: an invoice's scope for a read or a write, and the hold guard. `Payables.js`,
   `InvoiceMatch.js`, `InvoiceWorkflow.js`, `PaymentTerms.js`, `PaymentRuns.js`,
-  `InvoiceAttachments.js`, `PaymentWorkflow.js`, `PaymentLifecycle.js`, `PaymentSettlement.js`, `PaymentOutput.js` and
-  `BankReconciliation.js` hold the logic too involved for XML Actions; the other services are inline XML Actions.
+  `InvoiceAttachments.js`, `PaymentWorkflow.js`, `PaymentLifecycle.js`, `PaymentSettlement.js`, `PaymentOutput.js`,
+  `BankReconciliation.js` and `order/ReturnSettlement.js` hold the logic too involved for XML Actions; the other services
+  are inline XML Actions.
 
 ## The posting guard flag
 
@@ -527,6 +590,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingBankReconciliation,BankFileServices
 ./moq test mr-mantle --spec AccountingPeriodClose,AccountingProjectCost
 ./moq test mr-mantle --spec AccountingTax,TaxStatementServices
+./moq test mr-mantle --spec AccountingReturns,ReturnToResponseBasicFlow,OrderToCashBasicFlow
 ```
 
 The PDF specs need a Chromium for PDF (`pdf_chromium_path`; see [Run-Deploy](../../../../docs/Run-Deploy.md) and
