@@ -283,6 +283,8 @@ along with this software (see the LICENSE.md file). If not, see
               (org.moqui.impl.ChatServices.get#UnreadCounts total: the unread of rooms at notification level all, the
               mentions of rooms at mentions or muted, nothing at none), the Chat badge. The framework's ChatServices publish
               the counts of the users whose chat counts change (publish#ChatCounts), so no entity ECA is needed for it.
+            - calls: the missed calls not seen yet (org.moqui.impl.CallServices.count#MissedCalls); the call services
+              publish the counts when they change (publish#MissedCounts).
             Each part stands alone: one that fails is logged by name, null in counts and named in failedParts. The counts
             read only the user's own rows, with authorization disabled; another user's counts only for internal work, with
             authorization already disabled.
@@ -293,7 +295,7 @@ along with this software (see the LICENSE.md file). If not, see
                 <parameter name="today" type="Integer"/><parameter name="overdue" type="Integer"/>
                 <parameter name="notifications" type="Integer"/><parameter name="approvals" type="Integer"/>
                 <parameter name="updates" type="Integer"/><parameter name="messages" type="Integer"/>
-                <parameter name="email" type="Integer"/><parameter name="chat" type="Integer"/>
+                <parameter name="email" type="Integer"/><parameter name="chat" type="Integer"/><parameter name="calls" type="Integer"/>
             </parameter>
             <parameter name="failedParts" type="List"/>
         </out-parameters>
@@ -344,6 +346,7 @@ along with this software (see the LICENSE.md file). If not, see
                 part('messages', ['messages'], () => ({messages: callService('mantle.party.CommunicationServices.count#UnreadInternalMessages', {userId: userId}).unreadCount}))
                 part('email', ['email'], () => ({email: callService('org.moqui.impl.EmailClientServices.count#UnreadEmail', {userId: userId}).unreadCount}))
                 part('chat', ['chat'], () => ({chat: callService('org.moqui.impl.ChatServices.get#UnreadCounts', {userId: userId}).total}))
+                part('calls', ['calls'], () => ({calls: callService('org.moqui.impl.CallServices.count#MissedCalls', {userId: userId}).missedCount}))
             } finally {
                 if (!wasDisabled) ec.artifactExecution.enableAuthz()
             }
