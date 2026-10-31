@@ -30,8 +30,23 @@ const enabled = org => !!org && lib.preference(org).projectCostPostingEnabled ==
 
 // What a time entry's operation record says was posted: the lines of posted transactions, and whether one is still
 // waiting unposted (in the error journal), when no further delta is posted until it is.
-function postedOf(timeEntryId, lock = false) {
-    const query = find(OP, {operationKey: operationKey(timeEntryId)})
+function postedOf(timeEntryId, lock = false, organizationPartyId = null) {
+    const key = operationKey(timeEntryId)
+    // the first posting of an entry makes its record before locking it, so two requests cannot both post it first
+    if (lock && !one(OP, {operationKey: key}))
+        call("create#" + OP, {
+            operationKey: key,
+            operationType: "WorkEffortCost",
+            organizationPartyId,
+            userId: ec.user.userId,
+            submittedDate: ec.user.nowTimestamp,
+            requestHash: lib.hash({timeEntryId}),
+            status: "complete",
+            resultEntityName: ENTRY,
+            resultId: timeEntryId,
+            resultJson: JSON.stringify({organizationPartyId, lines: []})
+        })
+    const query = find(OP, {operationKey: key})
     const row = (lock ? query.forUpdate(true) : query).one()
     const record = lib.lib.json(row?.resultJson, {lines: []})
     let amount = toDecimal(0)
@@ -40,7 +55,7 @@ function postedOf(timeEntryId, lock = false) {
         const tx = one("mantle.ledger.transaction.AcctgTrans", {acctgTransId: line.acctgTransId})
         if (!tx) continue
         if (tx.isPosted === "Y") amount = amount.add(toDecimal(line.amount))
-        else waiting = tx.acctgTransId
+        else waiting = tx
     }
     return {row, record, amount, waiting}
 }
@@ -65,16 +80,16 @@ function costRate(entry, currency) {
 
 // One entry's cost basis now: its project and organization, the amount that should be posted and the delta to post, or
 // why it cannot be computed (failureCode, failureMessage).
-function basis(entry, lock = false) {
-    const posted = postedOf(entry.timeEntryId, lock)
+function basis(entry, lock = false, removed = false) {
+    const known = postedOf(entry.timeEntryId)
     const project = projectOf(entry.workEffortId)
-    const org = project?.ownerPartyId || posted.record.organizationPartyId || posted.row?.organizationPartyId || null
+    const org = project?.ownerPartyId || known.record.organizationPartyId || known.row?.organizationPartyId || null
     const out = {
         timeEntryId: entry.timeEntryId,
         timesheetId: entry.timesheetId,
-        workEffortId: project?.workEffortId || posted.record.workEffortId || null,
+        workEffortId: project?.workEffortId || known.record.workEffortId || null,
         organizationPartyId: org,
-        posted,
+        posted: known,
         target: toDecimal(0),
         delta: toDecimal(0)
     }
@@ -83,18 +98,28 @@ function basis(entry, lock = false) {
     out.currencyUomId = currency
     const sheet = entry.timesheetId ? one("mantle.work.time.Timesheet", {timesheetId: entry.timesheetId}) : null
     const internal = !entry.vendorPartyId || lib.organizationChain(org).includes(entry.vendorPartyId)
-    if (project && internal && sheet?.statusId === "TmshApproved") {
+    if (!removed && project && internal && sheet?.statusId === "TmshApproved") {
         const rate = costRate(entry, currency)
         if (!rate) return Object.assign(out, {failureCode: "COST_RATE_MISSING", failureMessage: "No cost rate for this time"})
         if (rate.currency !== currency)
             return Object.assign(out, {failureCode: "CURRENCY_MISMATCH", failureMessage: "The cost rate is in " + rate.currency})
         out.target = ec.l10n.roundCurrency(toDecimal(entry.hours ?? 0).multiply(rate.rate), currency)
     }
-    if (posted.waiting)
+    // nothing to post and nothing posted: no record is made
+    if (out.target.isZero() && !known.row) return out
+    const posted = lock ? postedOf(entry.timeEntryId, true, org) : known
+    out.posted = posted
+    if (posted.waiting) {
+        const where = posted.waiting.glJournalId && posted.waiting.glJournalId === lib.preference(org).errorGlJournalId
         return Object.assign(out, {
             failureCode: "POSTING_WAITING",
-            failureMessage: "Transaction " + posted.waiting + " is in the error journal; post it first"
+            failureMessage:
+                "Transaction " +
+                posted.waiting.acctgTransId +
+                (where ? " is in the error journal" : " is not posted") +
+                "; post it first"
         })
+    }
     out.delta = out.target.subtract(posted.amount)
     return out
 }
@@ -169,7 +194,7 @@ function record(entry, acctgTransId) {
         timesheetId: entry.timesheetId,
         lines
     })
-    if (entry.posted.row)
+    if (entry.posted.row || one(OP, {operationKey: operationKey(entry.timeEntryId)}))
         call("update#" + OP, {operationKey: operationKey(entry.timeEntryId), resultJson, completedDate: ec.user.nowTimestamp})
     else
         call("create#" + OP, {
@@ -217,8 +242,10 @@ function post(p) {
                 .list()
         )
     else throw new Error("Choose a timesheet, time entries or a project")
-    const day = lib.bookDay(null, ec.user.nowTimestamp)
-    const bases = entries.sort((a, b) => a.timeEntryId.localeCompare(b.timeEntryId)).map(entry => basis(entry, true))
+    const day = p.accountingDate ? lib.calendarDateText(p.accountingDate) : lib.bookDay(null, ec.user.nowTimestamp)
+    const bases = entries
+        .sort((a, b) => a.timeEntryId.localeCompare(b.timeEntryId))
+        .map(entry => basis(entry, true, !!p.deleting))
     const posted = postDeltas(bases, day, p.timesheetId ? "Project cost of timesheet " + p.timesheetId : null)
     const ids = [...new Set(Object.values(posted))]
     return {
@@ -232,15 +259,36 @@ function post(p) {
 // computed; nothing when project cost posting is off. The checklist row and the project cost period run read it.
 function pending(organizationPartyId, fromStamp, afterStamp, sourceIdList = null) {
     if (!enabled(organizationPartyId)) return []
-    let query = find(ENTRY).condition("fromDate", "greater-equals", fromStamp).condition("fromDate", "less", afterStamp)
+    // the organization's projects and their work first, so only its time is read
+    const projectIds = Array.from(
+        find("mantle.work.effort.WorkEffort", {ownerPartyId: organizationPartyId, workEffortTypeEnumId: "WetProject"})
+            .selectField("workEffortId")
+            .list()
+    ).map(row => row.workEffortId)
+    if (!projectIds.length) return []
+    const workIds = projectIds.concat(
+        Array.from(
+            find("mantle.work.effort.WorkEffort")
+                .condition("rootWorkEffortId", "in", projectIds)
+                .selectField("workEffortId")
+                .list()
+        ).map(row => row.workEffortId)
+    )
     const sourceIds = sourceIdList ? Array.from(sourceIdList) : []
-    if (sourceIds.length) query = query.condition("timeEntryId", "in", sourceIds)
     const out = []
-    for (const entry of query.condition("timesheetId", "is-not-null", null).orderBy("fromDate,timeEntryId").list()) {
-        const entryBasis = basis(entry)
-        if (entryBasis.skipped || entryBasis.organizationPartyId !== organizationPartyId) continue
-        if (!entryBasis.failureCode && entryBasis.delta.isZero()) continue
-        out.push(entryBasis)
+    for (let start = 0; start < workIds.length; start += 500) {
+        let query = find(ENTRY)
+            .condition("workEffortId", "in", workIds.slice(start, start + 500))
+            .condition("fromDate", "greater-equals", fromStamp)
+            .condition("fromDate", "less", afterStamp)
+            .condition("timesheetId", "is-not-null", null)
+        if (sourceIds.length) query = query.condition("timeEntryId", "in", sourceIds)
+        for (const entry of query.orderBy("fromDate,timeEntryId").list()) {
+            const entryBasis = basis(entry)
+            if (entryBasis.skipped || entryBasis.organizationPartyId !== organizationPartyId) continue
+            if (!entryBasis.failureCode && entryBasis.delta.isZero()) continue
+            out.push(entryBasis)
+        }
     }
     return out
 }
@@ -264,29 +312,38 @@ function calculateRun(p) {
     }))
 }
 // Post a previewed project cost run: its ready results' entries brought to their cost on the run's book day.
+// Post a previewed project cost run: each ready result's entry brought to its cost on the run's book day, in its own
+// transaction (define#RunPosting), so one that fails leaves the others posted.
 function postRun(p) {
     const run = one("mantle.ledger.transaction.AccountingPeriodRun", {periodRunId: p.periodRunId})
     const results = rows("mantle.ledger.transaction.AccountingPeriodRunResult", {
         periodRunId: p.periodRunId,
         statusId: "PrrReady"
     })
-    const entries = results.length
-        ? Array.from(
-              find(ENTRY)
-                  .condition(
-                      "timeEntryId",
-                      "in",
-                      results.map(r => r.sourceId)
-                  )
-                  .list()
-          )
-        : []
-    const bases = entries.map(entry => basis(entry, true))
-    const posted = postDeltas(bases, lib.calendarDateText(run.effectiveDate), "Project cost run " + run.periodRunId)
     let postedCount = 0,
         failedCount = 0
     for (const result of results) {
-        const acctgTransId = posted[result.sourceId]
+        let acctgTransId = null,
+            failure = null
+        ec.message.pushErrors()
+        try {
+            const out =
+                ec.service
+                    .sync()
+                    .name("mantle.ledger.OtherAutoPostServices.post#WorkEffortCost")
+                    .parameters({timeEntryIdList: [result.sourceId], accountingDate: run.effectiveDate})
+                    .disableAuthz()
+                    .requireNewTransaction(true)
+                    .call() || {}
+            if (ec.message.hasError()) throw new Error(ec.message.getErrorsString())
+            acctgTransId = out.acctgTransId || null
+        } catch (error) {
+            ec.logger.error("Project cost run " + run.periodRunId + " time entry " + result.sourceId + ": " + error.message)
+            failure = String(error.message)
+        } finally {
+            ec.message.clearErrors()
+            ec.message.popErrors()
+        }
         const tx = acctgTransId ? one("mantle.ledger.transaction.AcctgTrans", {acctgTransId}) : null
         const ok = tx?.isPosted === "Y"
         if (ok) postedCount++
@@ -296,8 +353,8 @@ function postRun(p) {
             resultSeqId: result.resultSeqId,
             statusId: ok ? "PrrPosted" : "PrrFailed",
             acctgTransId: acctgTransId || null,
-            failureCode: ok ? null : tx?.postingFailureCode || "NOTHING_TO_POST",
-            failureMessage: ok ? null : tx?.postingFailureMessage || "The time's cost changed; recalculate"
+            failureCode: ok ? null : tx?.postingFailureCode || (failure ? "POSTING_FAILED" : "NOTHING_TO_POST"),
+            failureMessage: ok ? null : failure || tx?.postingFailureMessage || "The time's cost changed; recalculate"
         })
     }
     return {postedCount, failedCount}

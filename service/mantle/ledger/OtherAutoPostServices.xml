@@ -22,11 +22,16 @@ along with this software (see the LICENSE.md file). If not, see
             cost while the timesheet is approved, else nothing) less what was posted is posted on today's book day, so an
             undone approval or a changed entry posts a reversing delta. Production work and an outside vendor's time are
             not posted. A posting that fails goes to the error journal with its reason, and the entry waits on it.
-            Called by approve#Timesheet, reopen#Timesheet and store#TimeEntry; it checks no permission of its own.</description>
+            Called by approve#Timesheet, reopen#Timesheet, store#TimeEntry and delete#TimeEntry, and per result by the
+            project cost period run; it checks no permission of its own.</description>
         <in-parameters>
             <parameter name="timesheetId"/>
             <parameter name="timeEntryIdList" type="List"/>
             <parameter name="workEffortId"><description>A project: all of its time</description></parameter>
+            <parameter name="accountingDate" type="Date"><description>The book day of the deltas; default today</description>
+            </parameter>
+            <parameter name="deleting" type="Boolean" default="false"><description>The listed entries are being deleted:
+                what was posted for them is reversed (delete#TimeEntry)</description></parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="acctgTransId"/>

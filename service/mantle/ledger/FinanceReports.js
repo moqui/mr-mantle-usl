@@ -320,15 +320,26 @@ function invoiceReconciliation(p) {
             out[row[field]] = (out[row[field]] || toDecimal(0)).add(toDecimal(row.amountApplied ?? 0))
         return out
     }
-    // documents of the period
-    const invoices = Array.from(
-        lib
-            .find("mantle.account.invoice.Invoice", {[payable ? "toPartyId" : "fromPartyId"]: org})
-            .condition("statusId", "in", payable ? PAYABLE_STATUSES : RECEIVABLE_STATUSES)
-            .condition(invoiceInPeriod)
-            .orderBy("invoiceDate,invoiceId")
-            .limit(2000)
-            .list()
+    // documents of the period, at most listLimit of each kind: a longer list is reported incomplete, never as no
+    // differences
+    const limit = Math.max(0, Number(p.listLimit ?? 500))
+    const incompleteChecks = []
+    const bounded = (check, list) => {
+        if (list.length <= limit) return list
+        incompleteChecks.push(check)
+        return list.slice(0, limit)
+    }
+    const invoices = bounded(
+        "invoiceVsGl",
+        Array.from(
+            lib
+                .find("mantle.account.invoice.Invoice", {[payable ? "toPartyId" : "fromPartyId"]: org})
+                .condition("statusId", "in", payable ? PAYABLE_STATUSES : RECEIVABLE_STATUSES)
+                .condition(invoiceInPeriod)
+                .orderBy("invoiceDate,invoiceId")
+                .limit(limit + 1)
+                .list()
+        )
     )
     const invoiceIds = invoices.map(row => row.invoiceId)
     const invoiceGl = glNet("invoiceId", invoiceIds),
@@ -347,15 +358,18 @@ function invoiceReconciliation(p) {
                 gl
             )
     }
-    const payments = Array.from(
-        lib
-            .find("mantle.account.payment.Payment", {[payable ? "fromPartyId" : "toPartyId"]: org})
-            .condition("statusId", "in", ["PmntDelivered", "PmntConfirmed"])
-            .condition("effectiveDate", "greater-equals", fromStamp)
-            .condition("effectiveDate", "less", afterStamp)
-            .orderBy("effectiveDate,paymentId")
-            .limit(2000)
-            .list()
+    const payments = bounded(
+        "paymentVsGl",
+        Array.from(
+            lib
+                .find("mantle.account.payment.Payment", {[payable ? "fromPartyId" : "toPartyId"]: org})
+                .condition("statusId", "in", ["PmntDelivered", "PmntConfirmed"])
+                .condition("effectiveDate", "greater-equals", fromStamp)
+                .condition("effectiveDate", "less", afterStamp)
+                .orderBy("effectiveDate,paymentId")
+                .limit(limit + 1)
+                .list()
+        )
     )
     const paymentIds = payments.map(row => row.paymentId)
     const paymentGl = glNet("paymentId", paymentIds),
@@ -375,15 +389,24 @@ function invoiceReconciliation(p) {
             )
     }
     // transactions of the period
-    for (const tx of lib
-        .find("mantle.ledger.transaction.AcctgTrans", {organizationPartyId: org})
-        .condition(
-            cf.makeCondition([cf.makeCondition("isPosted", "is-null", null), cf.makeCondition("isPosted", "equals", "N")], "or")
+    const unpostedTransactions = bounded(
+        "notPosted",
+        Array.from(
+            lib
+                .find("mantle.ledger.transaction.AcctgTrans", {organizationPartyId: org})
+                .condition(
+                    cf.makeCondition(
+                        [cf.makeCondition("isPosted", "is-null", null), cf.makeCondition("isPosted", "equals", "N")],
+                        "or"
+                    )
+                )
+                .condition(inPeriod)
+                .orderBy("acctgTransId")
+                .limit(limit + 1)
+                .list()
         )
-        .condition(inPeriod)
-        .orderBy("acctgTransId")
-        .limit(500)
-        .list())
+    )
+    for (const tx of unpostedTransactions)
         add(
             "notPosted",
             "Transaction not posted",
@@ -446,23 +469,23 @@ function invoiceReconciliation(p) {
             row.amountApplied,
             null
         )
-    // the aging's open total against the ledger at the period's end
-    let agingOpen = toDecimal(0)
-    const allInvoices = Array.from(
-        lib
-            .find("mantle.account.invoice.Invoice", {[payable ? "toPartyId" : "fromPartyId"]: org})
-            .condition("statusId", "in", payable ? PAYABLE_STATUSES : RECEIVABLE_STATUSES)
-            .condition("invoiceDate", "less", afterStamp)
-            .selectField("invoiceId")
-            .selectField("invoiceTotal")
-            .list()
-    )
-    const allApplied = appliedThroughEnd(
-        "invoiceId",
-        allInvoices.map(row => row.invoiceId)
-    )
-    for (const invoice of allInvoices)
-        agingOpen = agingOpen.add(toDecimal(invoice.invoiceTotal ?? 0).subtract(allApplied[invoice.invoiceId] || toDecimal(0)))
+    // the aging's open total against the ledger at the period's end, summed in the queries
+    const side = payable ? "toPartyId" : "fromPartyId"
+    const statuses = payable ? PAYABLE_STATUSES : RECEIVABLE_STATUSES
+    const issued = lib
+        .find("mantle.account.invoice.InvoiceTotalSum", {[side]: org})
+        .condition("statusId", "in", statuses)
+        .condition("invoiceDate", "less", afterStamp)
+        .selectField("invoiceTotalSum")
+        .one()
+    const applied = lib
+        .find("mantle.account.payment.InvoiceAppliedSum", {[side]: org})
+        .condition("statusId", "in", statuses)
+        .condition("invoiceDate", "less", afterStamp)
+        .condition("appliedDate", "less", afterStamp)
+        .selectField("amountAppliedSum")
+        .one()
+    const agingOpen = toDecimal(issued?.invoiceTotalSum ?? 0).subtract(toDecimal(applied?.amountAppliedSum ?? 0))
     let ledgerBalance = toDecimal(0)
     for (const row of lib
         .find("mantle.ledger.transaction.AcctgTransAndEntryGlaSummary", {organizationPartyId: org, isPosted: "Y"})
@@ -475,6 +498,8 @@ function invoiceReconciliation(p) {
     return {
         reportRows,
         summary: {agingOpen, ledgerBalance, difference: agingOpen.subtract(ledgerBalance), currencyUomId: currency},
+        complete: !incompleteChecks.length,
+        incompleteChecks,
         period: Object.assign(lib.display(period), {fromDay, thruDay: lib.calendarDateText(period.thruDate)}),
         organizationPartyId: org,
         asOf: ec.l10n.format(ec.user.nowTimestamp, "yyyy-MM-dd HH:mm:ss")

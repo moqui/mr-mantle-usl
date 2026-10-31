@@ -188,7 +188,7 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="closeRuns" from="checked.closeRuns"/>
         </actions>
     </service>
-    <service verb="close" noun="Period" allow-remote="false">
+    <service verb="close" noun="Period" allow-remote="false" transaction-timeout="1800">
         <description>Close an organization's fiscal period (FISCAL_CLOSE) in one transaction: under the period's lock the
             checklist again, refused (CLOSE_BLOCKED) naming each blocked or unavailable row; then Mantle's
             close#FinancialTimePeriod, the period's GL summary rows computed from its postings and stored (creating any

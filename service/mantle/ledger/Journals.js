@@ -41,6 +41,7 @@ function draft(p) {
     values.transactionDate = p.transactionDate || old?.transactionDate || ec.user.nowTimestamp
     if (!Number.isFinite(ms(values.transactionDate))) throw new Error("Choose a transaction date")
     if (!values.acctgTransTypeEnumId) values.acctgTransTypeEnumId = old?.acctgTransTypeEnumId || "AttInternal"
+    refuseClosingType(values.acctgTransTypeEnumId)
     lib.counterparty(values.otherPartyId)
     if (
         values.workEffortId &&
@@ -233,9 +234,15 @@ function post(p) {
     })
     return {acctgTransId: tx.acctgTransId, valid: true, alreadyPosted: false}
 }
+// A period's closing entries are posted only by CloseServices.close#Period: no draft, template or reversal takes their type.
+function refuseClosingType(acctgTransTypeEnumId) {
+    if (["AttPeriodClosing", "AttNetIncomeClosing"].includes(acctgTransTypeEnumId))
+        lib.denied("CLOSING_ENTRY", "Closing entries are posted only by closing the period")
+}
 function reverse(p) {
     const initial = transaction(p, false),
         why = lib.reason(p)
+    refuseClosingType(initial.acctgTransTypeEnumId)
     find("mantle.party.Party", {partyId: initial.organizationPartyId}).forUpdate(true).one()
     const tx = transaction(p)
     if (!p.reversalDate || !Number.isFinite(ms(p.reversalDate))) throw new Error("Choose a reversal date")
@@ -486,6 +493,7 @@ function template(p) {
     )
     values.amountUomId = values.amountUomId || lib.preference(s.organizationPartyId).baseCurrencyUomId
     lib.currency(values.amountUomId)
+    refuseClosingType(values.acctgTransTypeEnumId)
     if (copy) {
         values.templateFamilyId = old.templateFamilyId || old.acctgTransTemplateId
         values.replacesTemplateId = old.acctgTransTemplateId
@@ -630,6 +638,7 @@ function instantiate(p) {
     )
     if (header.isPublished !== "Y" || !lib.active(header, p.transactionDate || ec.user.nowTimestamp))
         throw new Error("Choose an effective published template")
+    refuseClosingType(header.acctgTransTypeEnumId)
     const out = draft({
         organizationPartyId: header.organizationPartyId,
         transactionDate: p.transactionDate,

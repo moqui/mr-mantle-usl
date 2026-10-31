@@ -6,6 +6,8 @@ const lib = ec.resource.script("component://mr-mantle/service/mantle/ledger/Acco
 const {find, one, rows, map, call, ms, display, denied} = lib
 const T = "mantle.ledger.transaction.AcctgTrans"
 const ITEM_LIMIT = 20
+// The page of documents a check reads at a time
+const PAGE = 500
 
 // The organization and period of a request, with the period's days: fromDay and thruDay inclusive, afterDay the day after,
 // and their midnights in the user's zone for legacy postings dated by timestamp.
@@ -120,77 +122,84 @@ const checks = {
         }))
     },
     // Invoices and bills of the period that have no posting (drafts, and finalized ones whose posting failed), and
-    // delivered payments without one.
+    // delivered payments without one. The documents are read in pages and checked against their postings a page at a
+    // time, so no query carries more than a page of ids.
     PccUnpostedDocuments(c) {
-        const invoices = Array.from(
-            find("mantle.account.invoice.Invoice")
-                .condition(either(["fromPartyId", "toPartyId"], c.organizations))
-                .condition("statusId", "not-in", ["InvoiceCancelled"])
-                .condition(inPeriod(c, "invoiceDate"))
-                .orderBy("invoiceDate,invoiceId")
-                .list()
-        )
-        const payments = Array.from(
-            find("mantle.account.payment.Payment")
-                .condition(either(["fromPartyId", "toPartyId"], c.organizations))
-                .condition("statusId", "in", ["PmntDelivered", "PmntConfirmed"])
-                .condition(stampInPeriod(c, "effectiveDate"))
-                .orderBy("effectiveDate,paymentId")
-                .list()
-        )
-        const posted = (field, ids) =>
-            ids.length
-                ? new Set(
-                      Array.from(
-                          find(T)
-                              .condition(field, "in", ids)
-                              .condition("isPosted", "Y")
-                              .condition("paymentApplicationId", "is-null", null)
-                              .selectField(field)
-                              .distinct(true)
-                              .list()
-                      ).map(row => row[field])
-                  )
-                : new Set()
-        const postedInvoices = posted(
-            "invoiceId",
-            invoices.map(row => row.invoiceId)
-        )
-        const postedPayments = posted(
-            "paymentId",
-            payments.map(row => row.paymentId)
-        )
         const found = []
-        for (const invoice of invoices) {
-            if (postedInvoices.has(invoice.invoiceId)) continue
-            if (invoice.invoiceTotal != null && toDecimal(invoice.invoiceTotal).isZero()) continue
-            const receivable = c.organizations.includes(invoice.fromPartyId)
-            found.push({
-                recordKind: receivable ? "invoices" : "bills",
-                recordId: invoice.invoiceId,
-                text:
-                    (receivable ? "Invoice " : "Bill ") +
-                    invoice.invoiceId +
-                    (invoice.description ? " · " + invoice.description : ""),
-                detail: [
-                    ec.entity.find("moqui.basic.StatusItem").condition("statusId", invoice.statusId).useCache(true).one()
-                        ?.description,
-                    amountText(invoice.invoiceTotal, invoice.currencyUomId)
-                ]
-                    .filter(Boolean)
-                    .join(" · ")
-            })
+        let count = 0
+        const unpostedOf = (query, field, toItem) => {
+            for (let page = 0; ; page++) {
+                const docs = Array.from(
+                    query()
+                        .offset(page * PAGE)
+                        .limit(PAGE)
+                        .list()
+                )
+                if (!docs.length) break
+                const ids = docs.map(row => row[field])
+                const posted = new Set(
+                    Array.from(
+                        find(T)
+                            .condition(field, "in", ids)
+                            .condition("isPosted", "Y")
+                            .condition("paymentApplicationId", "is-null", null)
+                            .selectField(field)
+                            .distinct(true)
+                            .list()
+                    ).map(row => row[field])
+                )
+                for (const doc of docs) {
+                    if (posted.has(doc[field])) continue
+                    if (field === "invoiceId" && doc.invoiceTotal != null && toDecimal(doc.invoiceTotal).isZero()) continue
+                    count++
+                    if (found.length < ITEM_LIMIT) found.push(toItem(doc))
+                }
+                if (docs.length < PAGE) break
+            }
         }
-        for (const payment of payments) {
-            if (postedPayments.has(payment.paymentId)) continue
-            found.push({
+        unpostedOf(
+            () =>
+                find("mantle.account.invoice.Invoice")
+                    .condition(either(["fromPartyId", "toPartyId"], c.organizations))
+                    .condition("statusId", "not-in", ["InvoiceCancelled"])
+                    .condition(inPeriod(c, "invoiceDate"))
+                    .orderBy("invoiceId"),
+            "invoiceId",
+            invoice => {
+                const receivable = c.organizations.includes(invoice.fromPartyId)
+                return {
+                    recordKind: receivable ? "invoices" : "bills",
+                    recordId: invoice.invoiceId,
+                    text:
+                        (receivable ? "Invoice " : "Bill ") +
+                        invoice.invoiceId +
+                        (invoice.description ? " · " + invoice.description : ""),
+                    detail: [
+                        ec.entity.find("moqui.basic.StatusItem").condition("statusId", invoice.statusId).useCache(true).one()
+                            ?.description,
+                        amountText(invoice.invoiceTotal, invoice.currencyUomId)
+                    ]
+                        .filter(Boolean)
+                        .join(" · ")
+                }
+            }
+        )
+        unpostedOf(
+            () =>
+                find("mantle.account.payment.Payment")
+                    .condition(either(["fromPartyId", "toPartyId"], c.organizations))
+                    .condition("statusId", "in", ["PmntDelivered", "PmntConfirmed"])
+                    .condition(stampInPeriod(c, "effectiveDate"))
+                    .orderBy("paymentId"),
+            "paymentId",
+            payment => ({
                 recordKind: "payments",
                 recordId: payment.paymentId,
                 text: "Payment " + payment.paymentId + (payment.paymentRefNum ? " · " + payment.paymentRefNum : ""),
                 detail: amountText(payment.amount, payment.amountUomId)
             })
-        }
-        return result(found, item => item)
+        )
+        return {count, items: found}
     },
     // Each bank account's lines of the period that no finished statement cleared.
     PccBankStatements(c) {
@@ -278,82 +287,105 @@ const checks = {
                 })
         return result(found, item => item)
     },
-    // Bills of the period with an open hold.
+    // Bills of the period with an open hold: the organization's bills of the period, a page at a time, then their holds.
     PccPayableHolds(c) {
-        const holds = Array.from(
-            find("mantle.account.invoice.InvoiceHold").condition("releasedDate", "is-null", null).orderBy("invoiceId").list()
-        )
-        const ids = [...new Set(holds.map(row => row.invoiceId))]
-        if (!ids.length) return {count: 0, items: []}
-        const bills = Array.from(
-            find("mantle.account.invoice.Invoice")
-                .condition("invoiceId", "in", ids)
-                .condition("toPartyId", "in", c.organizations)
-                .condition(inPeriod(c, "invoiceDate"))
-                .list()
-        )
-        return result(bills, bill => ({
-            recordKind: "bills",
-            recordId: bill.invoiceId,
-            text: "Bill " + bill.invoiceId + (bill.referenceNumber ? " · " + bill.referenceNumber : ""),
-            detail: holds
-                .filter(hold => hold.invoiceId === bill.invoiceId)
-                .map(
-                    hold =>
-                        ec.entity.find("moqui.basic.Enumeration").condition("enumId", hold.holdReasonEnumId).useCache(true).one()
-                            ?.description || hold.holdReasonEnumId
-                )
-                .join(", ")
-        }))
+        const found = []
+        let count = 0
+        for (let page = 0; ; page++) {
+            const bills = Array.from(
+                find("mantle.account.invoice.Invoice")
+                    .condition("toPartyId", "in", c.organizations)
+                    .condition("statusId", "not-in", ["InvoiceCancelled"])
+                    .condition(inPeriod(c, "invoiceDate"))
+                    .orderBy("invoiceId")
+                    .offset(page * PAGE)
+                    .limit(PAGE)
+                    .list()
+            )
+            if (!bills.length) break
+            const holds = Array.from(
+                find("mantle.account.invoice.InvoiceHold")
+                    .condition(
+                        "invoiceId",
+                        "in",
+                        bills.map(bill => bill.invoiceId)
+                    )
+                    .condition("releasedDate", "is-null", null)
+                    .list()
+            )
+            for (const bill of bills) {
+                const own = holds.filter(hold => hold.invoiceId === bill.invoiceId)
+                if (!own.length) continue
+                count++
+                if (found.length < ITEM_LIMIT)
+                    found.push({
+                        recordKind: "bills",
+                        recordId: bill.invoiceId,
+                        text: "Bill " + bill.invoiceId + (bill.referenceNumber ? " · " + bill.referenceNumber : ""),
+                        detail: own
+                            .map(
+                                hold =>
+                                    ec.entity
+                                        .find("moqui.basic.Enumeration")
+                                        .condition("enumId", hold.holdReasonEnumId)
+                                        .useCache(true)
+                                        .one()?.description || hold.holdReasonEnumId
+                            )
+                            .join(", ")
+                    })
+            }
+            if (bills.length < PAGE) break
+        }
+        return {count, items: found}
     },
     // Receipts and issues of the period's stock that posted nothing (no cost, no accounting preference, a failed
     // posting) for the organizations' assets (impl-accounting F10).
     PccStockPostings(c) {
         const failed = ["AtrNoAcquireCost", "AtrNoAcctgPreference", "AtrPostingFailed"]
         const found = []
+        let count = 0
         for (const [entity, idField, dateField, label] of [
-            ["mantle.product.receipt.AssetReceipt", "assetReceiptId", "receivedDate", "Receipt"],
-            ["mantle.product.issuance.AssetIssuance", "assetIssuanceId", "issuedDate", "Issue"]
+            ["mantle.product.receipt.AssetReceiptAndOwner", "assetReceiptId", "receivedDate", "Receipt"],
+            ["mantle.product.issuance.AssetIssuanceAndOwner", "assetIssuanceId", "issuedDate", "Issue"]
         ]) {
-            const movements = Array.from(
+            const query = () =>
                 find(entity)
+                    .condition("ownerPartyId", "in", c.organizations)
                     .condition("acctgTransResultEnumId", "in", failed)
                     .condition(stampInPeriod(c, dateField))
-                    .orderBy(idField)
-                    .list()
-            )
-            const assetIds = [...new Set(movements.map(row => row.assetId).filter(Boolean))]
-            const owned = new Set(
-                assetIds.length
-                    ? Array.from(
-                          find("mantle.product.asset.Asset")
-                              .condition("assetId", "in", assetIds)
-                              .condition("ownerPartyId", "in", c.organizations)
-                              .selectField("assetId")
-                              .list()
-                      ).map(row => row.assetId)
-                    : []
-            )
-            for (const movement of movements.filter(row => owned.has(row.assetId)))
-                found.push({
-                    recordKind: "assets",
-                    recordId: movement.assetId,
-                    text: label + " " + movement[idField] + " of " + (movement.productId || movement.assetId),
-                    detail:
-                        ec.entity
-                            .find("moqui.basic.Enumeration")
-                            .condition("enumId", movement.acctgTransResultEnumId)
-                            .useCache(true)
-                            .one()?.description || movement.acctgTransResultEnumId
-                })
+            count += query().count()
+            for (const movement of query().orderBy(idField).limit(ITEM_LIMIT).list())
+                if (found.length < ITEM_LIMIT)
+                    found.push({
+                        recordKind: "assets",
+                        recordId: movement.assetId,
+                        text: label + " " + movement[idField] + " of " + (movement.productId || movement.assetId),
+                        detail:
+                            ec.entity
+                                .find("moqui.basic.Enumeration")
+                                .condition("enumId", movement.acctgTransResultEnumId)
+                                .useCache(true)
+                                .one()?.description || movement.acctgTransResultEnumId
+                    })
         }
-        return result(found, item => item)
+        return {count, items: found}
     },
     // Kit and repack work completed in the period whose issued stock value differs from the value it received, which
     // leaves WIP open.
     PccOpenWip(c) {
+        const facilityIds = Array.from(
+            find("mantle.facility.Facility").condition("ownerPartyId", "in", c.organizations).selectField("facilityId").list()
+        ).map(row => row.facilityId)
+        const cf = ec.entity.conditionFactory
+        const owned = cf.makeCondition(
+            [cf.makeCondition("ownerPartyId", "in", c.organizations)].concat(
+                facilityIds.length ? [cf.makeCondition("facilityId", "in", facilityIds)] : []
+            ),
+            "or"
+        )
         const efforts = Array.from(
             find("mantle.work.effort.WorkEffort")
+                .condition(owned)
                 .condition("purposeEnumId", "in", ["WepPickAssembly", "WepAssembling"])
                 .condition("statusId", "in", ["WeComplete", "WeClosed"])
                 .condition(stampInPeriod(c, "actualCompletionDate"))
@@ -500,8 +532,7 @@ function checklist(p) {
 // The period's GL summary rows (GlAccountOrgTimePeriod) computed from its posted entries and stored, every account with
 // a posting before or in the period getting its row: the beginning balance from all earlier postings, the period's
 // debits and credits with and without closing entries, and the ending balance, each in the account's own sign.
-function snapshot(c) {
-    const org = c.s.organizationPartyId
+function snapshot(c, org) {
     const totals = {}
     const total = id => {
         if (!totals[id])
@@ -532,7 +563,8 @@ function snapshot(c) {
             amount = toDecimal(row.amount ?? 0),
             debit = row.debitCreditFlag === "D"
         entry[debit ? "debits" : "credits"] = entry[debit ? "debits" : "credits"].add(amount)
-        if (!["AttNetIncomeClosing", "AttPeriodClosing"].includes(row.acctgTransTypeEnumId))
+        // the columns without closing entries leave out net income closing, as Mantle's recalculation does
+        if (row.acctgTransTypeEnumId !== "AttNetIncomeClosing")
             entry[debit ? "debitsNoClosing" : "creditsNoClosing"] =
                 entry[debit ? "debitsNoClosing" : "creditsNoClosing"].add(amount)
     }
@@ -554,6 +586,7 @@ function snapshot(c) {
     )
     let debitTotal = toDecimal(0),
         creditTotal = toDecimal(0)
+    const endings = {}
     for (const id of ids) {
         const entry = totals[id],
             sign = debitAccounts.has(id) ? 1 : -1
@@ -571,15 +604,55 @@ function snapshot(c) {
             balanceLastUpdated: ec.user.nowTimestamp
         }
         call((stored.has(id) ? "update#" : "create#") + "mantle.ledger.account.GlAccountOrgTimePeriod", values)
+        endings[id] = values.endingBalance
         debitTotal = debitTotal.add(entry.debits)
         creditTotal = creditTotal.add(entry.credits)
     }
-    return {accountCount: ids.length, debitTotal, creditTotal}
+    return {accountCount: ids.length, debitTotal, creditTotal, endings}
+}
+// The later periods' existing summary rows begin where the closed period's stored rows end (their own movement kept);
+// no row is made and no period's posted sums are recalculated.
+function carryForward(c, org, endings) {
+    let previousId = c.period.timePeriodId,
+        carried = endings
+    for (let depth = 0; depth < 240; depth++) {
+        const next = one("mantle.party.time.TimePeriod", {previousPeriodId: previousId})
+        if (!next) return
+        const following = {}
+        for (const row of find("mantle.ledger.account.GlAccountOrgTimePeriod", {
+            organizationPartyId: org,
+            timePeriodId: next.timePeriodId
+        })
+            .forUpdate(true)
+            .list()) {
+            const beginning = carried[row.glAccountId]
+            if (beginning == null) {
+                following[row.glAccountId] = toDecimal(row.endingBalance ?? 0)
+                continue
+            }
+            const ending = toDecimal(row.endingBalance ?? 0)
+                .subtract(toDecimal(row.beginningBalance ?? 0))
+                .add(beginning)
+            call("update#mantle.ledger.account.GlAccountOrgTimePeriod", {
+                glAccountId: row.glAccountId,
+                organizationPartyId: org,
+                timePeriodId: next.timePeriodId,
+                beginningBalance: beginning,
+                endingBalance: ending,
+                balanceLastUpdated: ec.user.nowTimestamp
+            })
+            following[row.glAccountId] = ending
+        }
+        previousId = next.timePeriodId
+        carried = following
+    }
 }
 
-// Close the period: under its lock, the checklist again (a blocked or unavailable row refuses, naming each), then Mantle's
-// close#FinancialTimePeriod, the summary rows, a fiscal year's closing entries to the organization's net income account
-// and the summary rows again, and the close run with the checklist it passed; all in one transaction.
+// Close the period, all in one transaction: under its lock, the checklist again (a blocked or unavailable row refuses,
+// naming each); the close run, closing while this transaction runs; Mantle's close#FinancialTimePeriod; the summary rows of
+// the organization and each organization that rolls up to it; for a fiscal year each one's closing entries to its own net
+// income account, every one of them posted or the whole close rolls back, and the summary rows again; the later periods'
+// beginning balances; and the run, closed, with the checklist it passed.
 function close(p) {
     const s = lib.organization(p, "fiscalClose")
     let op = null
@@ -599,44 +672,63 @@ function close(p) {
                 blockers.map(row => row.title + (row.count == null ? " (unavailable)" : " (" + row.count + ")")).join("; ")
         )
     const reason = String(p.changeReason || "").trim() || "Period close"
-    call("mantle.ledger.LedgerServices.close#FinancialTimePeriod", {timePeriodId: c.period.timePeriodId})
-    let summary = snapshot(c)
-    let closingIds = []
-    let netIncomeGlAccountId = null
-    if (c.period.timePeriodTypeId === "FiscalYear") {
-        const closing = call("mantle.ledger.LedgerServices.create#PeriodCloseAcctgTrans", {
-            timePeriodId: c.period.timePeriodId,
-            netIncomeGlAccountId: p.netIncomeGlAccountId || null,
-            reviewed: true
-        })
-        closingIds = Object.values(closing.acctgTransIdByClassId || {})
-        if (closingIds.length) {
-            netIncomeGlAccountId = Array.from(
-                find("mantle.ledger.transaction.AcctgTransEntry", {acctgTransId: closingIds[0]})
-                    .orderBy("-acctgTransEntrySeqId")
-                    .list()
-            )[0]?.glAccountId
-            summary = snapshot(c)
-        }
-    }
-    // the next periods' beginning balances follow the stored ending balances (Mantle's recalculation)
-    call("mantle.ledger.LedgerServices.recalculate#GlAccountOrgTimePeriodAmounts", {timePeriodId: c.period.timePeriodId})
+    // the run, closing: the posting guard lets this close's closing entries into the year (closingInProgress)
     const run = call("create#mantle.ledger.transaction.AccountingCloseRun", {
         organizationPartyId: s.organizationPartyId,
         timePeriodId: c.period.timePeriodId,
-        statusId: "CrnClosed",
+        statusId: "CrnClosing",
         closedByUserId: ec.user.userId,
         closedDate: ec.user.nowTimestamp,
         closeReason: reason.slice(0, 255),
-        operationKey: p.operationKey || null,
+        operationKey: p.operationKey || null
+    })
+    call("mantle.ledger.LedgerServices.close#FinancialTimePeriod", {timePeriodId: c.period.timePeriodId})
+    const summaries = {}
+    for (const org of c.organizations) summaries[org] = snapshot(c, org)
+    const closingIds = []
+    let netIncomeGlAccountId = null
+    if (c.period.timePeriodTypeId === "FiscalYear") {
+        for (const org of c.organizations) {
+            if (!summaries[org].accountCount) continue
+            const closing = call("mantle.ledger.LedgerServices.create#PeriodCloseAcctgTrans", {
+                timePeriodId: c.period.timePeriodId,
+                organizationPartyId: org,
+                netIncomeGlAccountId: org === s.organizationPartyId ? p.netIncomeGlAccountId || null : null,
+                reviewed: true
+            })
+            const ids = Object.values(closing.acctgTransIdByClassId || {})
+            for (const acctgTransId of ids) {
+                const tx = one(T, {acctgTransId})
+                if (tx?.isPosted !== "Y")
+                    denied(
+                        "CLOSE_POSTING_FAILED",
+                        "Closing entry " +
+                            acctgTransId +
+                            " did not post" +
+                            (tx?.postingFailureMessage ? ": " + tx.postingFailureMessage : "")
+                    )
+                if (org === s.organizationPartyId && !netIncomeGlAccountId)
+                    netIncomeGlAccountId = Array.from(
+                        find("mantle.ledger.transaction.AcctgTransEntry", {acctgTransId}).orderBy("-acctgTransEntrySeqId").list()
+                    )[0]?.glAccountId
+            }
+            closingIds.push(...ids)
+            if (ids.length) summaries[org] = snapshot(c, org)
+        }
+    }
+    for (const org of c.organizations) carryForward(c, org, summaries[org].endings)
+    const own = summaries[s.organizationPartyId]
+    call("update#mantle.ledger.transaction.AccountingCloseRun", {
+        closeRunId: run.closeRunId,
+        statusId: "CrnClosed",
         checklistJson: JSON.stringify(checkRows),
         closingAcctgTransIds: closingIds.join(","),
         netIncomeGlAccountId,
-        summaryAccountCount: summary.accountCount,
-        summaryDebitTotal: summary.debitTotal,
-        summaryCreditTotal: summary.creditTotal
+        summaryAccountCount: own.accountCount,
+        summaryDebitTotal: own.debitTotal,
+        summaryCreditTotal: own.creditTotal
     })
-    const answer = {closeRunId: run.closeRunId, closingAcctgTransIdList: closingIds, summaryAccountCount: summary.accountCount}
+    const answer = {closeRunId: run.closeRunId, closingAcctgTransIdList: closingIds, summaryAccountCount: own.accountCount}
     if (op) lib.lib.complete(op, "mantle.ledger.transaction.AccountingCloseRun", run.closeRunId, answer)
     return answer
 }

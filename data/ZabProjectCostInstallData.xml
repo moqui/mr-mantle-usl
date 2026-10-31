@@ -12,12 +12,13 @@ You should have received a copy of the CC0 Public Domain Dedication
 along with this software (see the LICENSE.md file). If not, see
 <http://creativecommons.org/publicdomain/zero/1.0/>.
 -->
-<!-- The default accounts of project cost posting (OtherAutoPostServices.post#WorkEffortCost): cost of services sold, and
-    accrued wages due as the labor clearing account that payroll credits. An organization maps its own in PostingDefaults. -->
+<!-- The default accounts of project cost posting (OtherAutoPostServices.post#WorkEffortCost): cost of services sold, and as
+    the labor clearing account the employee wage expense that payroll debits (631100000, where the payroll earnings items
+    post), so the reclass moves approved project time from wage expense to project cost. An organization whose payroll
+    posts elsewhere, or that keeps an absorbed-labor account, maps its own in PostingDefaults. -->
 <entity-facade-xml type="install">
-    <mantle.ledger.account.GlAccountOrganization glAccountId="221200000" organizationPartyId="DefaultSettings"/>
     <mantle.ledger.config.GlAccountTypeDefault glAccountId="550000000" glAccountTypeEnumId="GatProjectLaborCost"
             organizationPartyId="DefaultSettings"/>
-    <mantle.ledger.config.GlAccountTypeDefault glAccountId="221200000" glAccountTypeEnumId="GatLaborClearing"
+    <mantle.ledger.config.GlAccountTypeDefault glAccountId="631100000" glAccountTypeEnumId="GatLaborClearing"
             organizationPartyId="DefaultSettings"/>
 </entity-facade-xml>

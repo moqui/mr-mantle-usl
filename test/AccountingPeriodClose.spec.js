@@ -77,6 +77,8 @@ spec({
         f.users.closer = h.user(f, "CLOSER", ["ACCOUNTING_VIEW", "FISCAL_CLOSE"])
         f.users.reopener = h.user(f, "REOPENER", ["ACCOUNTING_VIEW", "FISCAL_REOPEN"])
         f.users.gl = h.user(f, "GLPOST", ["ACCOUNTING_VIEW", "ACCOUNTING_GL_POST"])
+        // a user who holds both GL posting and period close, for the refusals of closing entries outside a close
+        f.users.glClose = h.user(f, "GLCLOSE", ["ACCOUNTING_VIEW", "ACCOUNTING_GL_POST", "FISCAL_CLOSE"])
         // last month's work: a draft invoice, a delivered receipt, a bank line no statement cleared
         f.invoiceId = draftInvoice(f.org, f.customer, f.month)
         f.receiptId = h.payment(f, "40", "receivable", {effectiveDate: f.month.noon})
@@ -185,6 +187,13 @@ feature("once the invoice is posted and the statement finished, the period close
                 timePeriodId: f.periodId
             })
         )
+        const truncated = asUser(f.users.read, () =>
+            call("mantle.ledger.LedgerReportServices.run#InvoiceReconciliation", {
+                organizationPartyId: f.org,
+                timePeriodId: f.periodId,
+                listLimit: 0
+            })
+        )
         const otherReport = asUser(f.users.read, () =>
             rejected("mantle.ledger.LedgerReportServices.run#InvoiceReconciliation", {
                 organizationPartyId: other.org,
@@ -196,9 +205,22 @@ feature("once the invoice is posted and the statement finished, the period close
             .condition("closeRunId", closed.closeRunId)
             .disableAuthz()
             .one()
-        return {checklist, closed, again, summaries, trial, reconciliation, otherReport, run, state: period(f.periodId).isClosed}
+        return {
+            checklist,
+            closed,
+            again,
+            summaries,
+            trial,
+            reconciliation,
+            truncated,
+            otherReport,
+            run,
+            state: period(f.periodId).isClosed
+        }
     },
-    then({checklist, closed, again, summaries, trial, reconciliation, otherReport, run, state}) {
+    then({checklist, closed, again, summaries, trial, reconciliation, truncated, otherReport, run, state}) {
+        reconciliation.complete == true
+        truncated.complete == false && truncated.incompleteChecks.includes("invoiceVsGl")
         checklist.blockerCount == 0 && checklist.canClose == true
         state == "Y"
         run.statusId == "CrnClosed" && run.closeReason == "Month end" && run.checklistJson.includes("PccBankStatements")
@@ -333,5 +355,240 @@ feature("a fiscal year's close posts its closing entries to the organization's o
         entries.find(e => e.glAccountId == "412000000").debitCreditFlag == "D"
         entries.find(e => e.glAccountId == "850000000").amount == 70
         revenue.endingBalance == 0 && revenue.postedCreditsNoClosing == 70
+    }
+})
+// Closing entries are posted only by close#Period: a closing-typed draft, template, template instance or reversal is
+// refused, and a closing-typed transaction posted directly into the closed month or a hard-locked one is refused too,
+// for a user who holds GL posting and period close.
+feature("closing-typed entries outside a close are refused, into a closed month or past a hard lock", {
+    when() {
+        const day = f.month.noon
+        const draft = asUser(f.users.glClose, () =>
+            rejected("mantle.ledger.JournalServices.store#DraftEntry", {
+                organizationPartyId: f.org,
+                acctgTransTypeEnumId: "AttNetIncomeClosing",
+                transactionDate: day,
+                description: "Not a close"
+            })
+        )
+        const template = asUser(f.users.glClose, () =>
+            rejected("mantle.ledger.JournalServices.store#Template", {
+                organizationPartyId: f.org,
+                templateName: "Closing template",
+                acctgTransTypeEnumId: "AttNetIncomeClosing"
+            })
+        )
+        call("create#mantle.ledger.transaction.AcctgTransTemplate", {
+            acctgTransTemplateId: "P11_CLOSING_TEMPLATE",
+            organizationPartyId: f.org,
+            templateName: "Old closing template",
+            acctgTransTypeEnumId: "AttNetIncomeClosing",
+            amountUomId: "USD",
+            isPublished: "Y",
+            fromDate: 0,
+            templateVersion: 1
+        })
+        const instance = asUser(f.users.glClose, () =>
+            rejected("mantle.ledger.JournalServices.create#FromTemplate", {
+                organizationPartyId: f.org,
+                acctgTransTemplateId: "P11_CLOSING_TEMPLATE",
+                transactionDate: day
+            })
+        )
+        // a closing-typed transaction made directly, posted into the closed month
+        const raw = type => {
+            const made = call("mantle.ledger.LedgerServices.create#AcctgTrans", {
+                acctgTransTypeEnumId: type,
+                organizationPartyId: f.org,
+                transactionDate: day,
+                description: "Direct closing entry"
+            })
+            call("update#mantle.ledger.transaction.AcctgTrans", {acctgTransId: made.acctgTransId, accountingDate: f.month.mid})
+            for (const [glAccountId, debitCreditFlag] of [
+                ["412000000", "D"],
+                ["850000000", "C"]
+            ])
+                call("mantle.ledger.LedgerServices.create#AcctgTransEntry", {
+                    acctgTransId: made.acctgTransId,
+                    glAccountId,
+                    debitCreditFlag,
+                    amount: "1"
+                })
+            return made.acctgTransId
+        }
+        const closedId = raw("AttNetIncomeClosing")
+        const closedPost = asUser(f.users.glClose, () =>
+            rejected("mantle.ledger.LedgerServices.post#AcctgTrans", {acctgTransId: closedId, closingTimePeriodId: f.periodId})
+        )
+        // a reversal of a closing entry is refused whatever its date
+        call("update#mantle.ledger.transaction.AcctgTrans", {acctgTransId: closedId, isPosted: "Y"})
+        const reversal = asUser(f.users.glClose, () =>
+            rejected("mantle.ledger.JournalServices.reverse#Entry", {
+                organizationPartyId: f.org,
+                acctgTransId: closedId,
+                reversalDate: day,
+                operationKey: "p11-closing-reversal",
+                changeReason: "Undo the close"
+            })
+        )
+        call("update#mantle.ledger.transaction.AcctgTrans", {acctgTransId: closedId, isPosted: "N"})
+        // a hard lock through today, in this month's open period
+        const lock = asUser(f.users.financeadmin, () =>
+            call("mantle.ledger.CloseServices.store#Lock", {
+                organizationPartyId: f.org,
+                lockScope: "all",
+                lockThroughDate: f.day,
+                isHard: "Y",
+                changeReason: "Audit lock"
+            })
+        )
+        const locked = call("mantle.ledger.LedgerServices.create#AcctgTrans", {
+            acctgTransTypeEnumId: "AttNetIncomeClosing",
+            organizationPartyId: f.org,
+            transactionDate: f.timestamp,
+            description: "Closing past a lock"
+        })
+        for (const [glAccountId, debitCreditFlag] of [
+            ["412000000", "D"],
+            ["850000000", "C"]
+        ])
+            call("mantle.ledger.LedgerServices.create#AcctgTransEntry", {
+                acctgTransId: locked.acctgTransId,
+                glAccountId,
+                debitCreditFlag,
+                amount: "1"
+            })
+        const lockedPost = asUser(f.users.glClose, () =>
+            rejected("mantle.ledger.LedgerServices.post#AcctgTrans", {acctgTransId: locked.acctgTransId})
+        )
+        fixtures().base.cleanupLocks(f.org)
+        return {draft, template, instance, closedPost, reversal, lockedPost, lock}
+    },
+    then({draft, template, instance, closedPost, reversal, lockedPost}) {
+        draft.includes("CLOSING_ENTRY")
+        template.includes("CLOSING_ENTRY")
+        instance.includes("CLOSING_ENTRY")
+        closedPost.includes("PERIOD_CLOSED")
+        reversal.includes("CLOSING_ENTRY")
+        lockedPost.includes("HARD_LOCK")
+    }
+})
+// A rollup child posts under its parent's fiscal year: the year's close closes the child to its own net income account
+// and stores the child's summary rows, so the child's trial balance of the closed year reads them.
+feature("a parent's year close closes a rollup child to its own net income account and stores its summary rows", {
+    when() {
+        const child = fixtures().fixtures("ACCT_P11_CHILD")
+        call("create#mantle.party.PartyRelationship", {
+            fromPartyId: child.org,
+            fromRoleTypeId: "OrgInternal",
+            toPartyId: f.org,
+            toRoleTypeId: "OrgInternal",
+            relationshipTypeEnumId: "PrtOrgRollup",
+            fromDate: 0
+        })
+        const yearId = call("mantle.party.TimeServices.create#TimePeriod", {
+            partyId: f.org,
+            timePeriodTypeId: "FiscalYear",
+            fromDate: "2022-01-01",
+            thruDate: "2022-12-31"
+        }).timePeriodId
+        const entry = (org, amount) => {
+            const made = call("mantle.ledger.LedgerServices.create#AcctgTrans", {
+                acctgTransTypeEnumId: "AttInternal",
+                organizationPartyId: org,
+                transactionDate: ec.l10n.parseTimestamp("2022-06-15 12:00:00", "yyyy-MM-dd HH:mm:ss"),
+                description: "Year revenue of " + org
+            })
+            for (const [glAccountId, debitCreditFlag] of [
+                ["111100000", "D"],
+                ["412000000", "C"]
+            ])
+                call("mantle.ledger.LedgerServices.create#AcctgTransEntry", {
+                    acctgTransId: made.acctgTransId,
+                    glAccountId,
+                    debitCreditFlag,
+                    amount
+                })
+            call("mantle.ledger.LedgerServices.post#AcctgTrans", {acctgTransId: made.acctgTransId})
+        }
+        entry(f.org, "30")
+        entry(child.org, "45")
+        const closed = asUser(f.users.closer, () =>
+            call(close + "close#Period", {organizationPartyId: f.org, timePeriodId: yearId, changeReason: "Group year end"})
+        )
+        const closing = Array.from(
+            ec.entity
+                .find("mantle.ledger.transaction.AcctgTrans")
+                .condition("acctgTransId", "in", Array.from(closed.closingAcctgTransIdList))
+                .disableAuthz()
+                .list()
+        )
+        const childRevenue = ec.entity
+            .find("mantle.ledger.account.GlAccountOrgTimePeriod")
+            .condition({organizationPartyId: child.org, timePeriodId: yearId, glAccountId: "412000000"})
+            .disableAuthz()
+            .one()
+        const childTrial = asUser(child.users.read, () =>
+            call("mantle.ledger.FinanceReportServices.run#TrialBalance", {organizationPartyId: child.org, timePeriodId: yearId})
+        )
+        return {child, closing, childRevenue, childTrial}
+    },
+    then({child, closing, childRevenue, childTrial}) {
+        closing
+            .map(tx => tx.organizationPartyId)
+            .sort()
+            .join() == [child.org, f.org].sort().join()
+        childRevenue.postedCreditsNoClosing == 45 && childRevenue.endingBalance == 0
+        childTrial.reportRows.find(r => r.glAccountId == "412000000").closedSummary == true
+        childTrial.reportRows.find(r => r.glAccountId == "850000000").ending == -45
+    }
+})
+// A close that fails after Mantle's close and the summary rows (here, the net income account is no longer the
+// organization's, so the year's closing entry cannot post) rolls back whole: the period stays open, with no run and no
+// summary rows.
+feature("a close that fails midway leaves the period open, with no run and no summary rows", {
+    when() {
+        const h = fixtures()
+        const g = h.fixtures("ACCT_P11_FAIL")
+        const closer = h.user(g, "CLOSER", ["ACCOUNTING_VIEW", "FISCAL_CLOSE"])
+        const yearId = call("mantle.party.TimeServices.create#TimePeriod", {
+            partyId: g.org,
+            timePeriodTypeId: "FiscalYear",
+            fromDate: "2021-01-01",
+            thruDate: "2021-12-31"
+        }).timePeriodId
+        const made = call("mantle.ledger.LedgerServices.create#AcctgTrans", {
+            acctgTransTypeEnumId: "AttInternal",
+            organizationPartyId: g.org,
+            transactionDate: ec.l10n.parseTimestamp("2021-06-15 12:00:00", "yyyy-MM-dd HH:mm:ss"),
+            description: "Revenue without a net income account"
+        })
+        for (const [glAccountId, debitCreditFlag] of [
+            ["111100000", "D"],
+            ["412000000", "C"]
+        ])
+            call("mantle.ledger.LedgerServices.create#AcctgTransEntry", {
+                acctgTransId: made.acctgTransId,
+                glAccountId,
+                debitCreditFlag,
+                amount: "20"
+            })
+        call("mantle.ledger.LedgerServices.post#AcctgTrans", {acctgTransId: made.acctgTransId})
+        call("delete#mantle.ledger.account.GlAccountOrganization", {glAccountId: "850000000", organizationPartyId: g.org})
+        const refused = asUser(closer, () =>
+            rejected(close + "close#Period", {organizationPartyId: g.org, timePeriodId: yearId, changeReason: "Year end"})
+        )
+        const count = entity => ec.entity.find(entity).condition("timePeriodId", yearId).disableAuthz().count()
+        return {
+            refused,
+            state: period(yearId).isClosed,
+            runs: count("mantle.ledger.transaction.AccountingCloseRun"),
+            summaries: count("mantle.ledger.account.GlAccountOrgTimePeriod")
+        }
+    },
+    then({refused, state, runs, summaries}) {
+        refused.includes("NET_INCOME_ACCOUNT_MISSING") || refused.includes("ACCOUNT_INACTIVE")
+        state == "N"
+        runs == 0 && summaries == 0
     }
 })

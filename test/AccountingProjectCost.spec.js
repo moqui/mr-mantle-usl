@@ -151,7 +151,7 @@ feature("approving the week posts its project time at cost from labor clearing, 
         lines.length == 2
         lines.find(l => l.glAccountId == "550000000").debitCreditFlag == "D"
         lines.find(l => l.glAccountId == "550000000").amount == 120
-        lines.find(l => l.glAccountId == "221200000").debitCreditFlag == "C"
+        lines.find(l => l.glAccountId == "631100000").debitCreditFlag == "C"
         lines[0].workEffortId == "P11_PROJECT"
         operation.organizationPartyId == f.org && operation.resultId == "P11_E1"
         others[0] == null && others[1] == null
@@ -241,3 +241,22 @@ feature(
         }
     }
 )
+// Deleting a time entry whose cost was posted reverses its posting on the day of the delete (the week's policy leaves
+// its time open to changes).
+feature("deleting a posted time entry reverses its project cost", {
+    when() {
+        const before = netCost()
+        call("mantle.work.TimeServices.delete#TimeEntry", {timeEntryId: "P11_E1"})
+        const operation = ec.entity
+            .find("mantle.ledger.transaction.PostingOperation")
+            .condition("operationKey", "wec:P11_E1")
+            .disableAuthz()
+            .one()
+        return {before, after: netCost(), lines: JSON.parse(operation.resultJson).lines.length}
+    },
+    then({before, after, lines}) {
+        before == 150
+        after == 0
+        lines >= 4
+    }
+})

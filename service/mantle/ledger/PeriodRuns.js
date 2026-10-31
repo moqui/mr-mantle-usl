@@ -147,13 +147,14 @@ function post(p) {
         calculationVersion: p.calculationVersion
     })
     if (op.old) return lib.lib.previous(op)
-    find("mantle.party.Party", {partyId: s.organizationPartyId}).forUpdate(true).one()
+    // only the run is locked here: each result posts in its own transaction (define#RunPosting), which takes the
+    // organization's and the period's posting locks itself
     const run = find(RUN, {periodRunId: initial.periodRunId}).forUpdate(true).one()
     if (run.statusId !== "PrnPreview") denied("RUN_NOT_PREVIEW", "Only a previewed run is posted")
     if (run.calculationVersion !== p.calculationVersion) denied("RUN_CHANGED", "The run changed; review it again")
     const kind = kindOf(run.runKindEnumId)
     if (!kind.optionValue) denied("RUN_KIND_INVALID", "This kind of run is not posted here")
-    const {period, day} = openPeriod(s, run.timePeriodId, run.effectiveDate, true)
+    const {period, day} = openPeriod(s, run.timePeriodId, run.effectiveDate)
     const sourceIdList = lib.lib.json(run.sourceSelectionJson, [])
     if (versionOf(calculate(kind, s, period, day, sourceIdList)) !== run.calculationVersion)
         denied("RUN_CHANGED", "The sources changed since the preview; recalculate the run")

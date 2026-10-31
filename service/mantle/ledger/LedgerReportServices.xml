@@ -1050,6 +1050,8 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="organizationPartyId"/>
             <parameter name="timePeriodId" required="true"/>
             <parameter name="invoiceType" default-value="receivable"><description>receivable or payable</description></parameter>
+            <parameter name="listLimit" type="Integer" default="500"><description>The most documents or transactions of
+                each kind checked; a check with more is reported incomplete (incompleteChecks)</description></parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="reportRows" type="List"/>
@@ -1057,10 +1059,14 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="period" type="Map"/>
             <parameter name="organizationPartyId"/>
             <parameter name="asOf"/>
+            <parameter name="complete" type="Boolean"/>
+            <parameter name="incompleteChecks" type="List"/>
         </out-parameters>
         <actions>
             <set field="report" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FinanceReports.js')
                     .execute('invoiceReconciliation', context)"/>
+            <set field="complete" from="report.complete"/>
+            <set field="incompleteChecks" from="report.incompleteChecks"/>
             <set field="reportRows" from="report.reportRows"/>
             <set field="summary" from="report.summary"/>
             <set field="period" from="report.period"/>

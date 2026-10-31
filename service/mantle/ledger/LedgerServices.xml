@@ -560,6 +560,9 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="reviewed" type="Boolean" default="false"><description>The caller is Mantle's posting or
                 reverting service of the transaction's source document. With the posting guard on, a manual posting or a
                 reversal from any other caller needs GL posting authority (ACCOUNTING_GL_POST).</description></parameter>
+            <parameter name="closingTimePeriodId"><description>The fiscal year CloseServices.close#Period is closing: with the
+                posting guard on, only a closing entry of that close in progress, on the year's last day, posts past the
+                year's closed-period check (never a lock).</description></parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="valid" type="Boolean"/>
@@ -568,7 +571,7 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <script><![CDATA[
                 const checked = ec.resource.script('component://mr-mantle/service/mantle/ledger/PostingGuard.js').check({
-                    acctgTransId, verifyOnly, reviewed})
+                    acctgTransId, verifyOnly, reviewed, closingTimePeriodId})
                 valid = checked.valid
                 findings = checked.findings
                 postingHandled = checked.handled
@@ -923,6 +926,11 @@ along with this software (see the LICENSE.md file). If not, see
             <script>ec.resource.script('component://mr-mantle/service/mantle/ledger/PostingGuard.js')
                 .assertMutable({acctgTransId:acctgTransId})</script>
             <entity-find-one entity-name="mantle.ledger.transaction.AcctgTrans" value-field="acctgTrans" for-update="true"/>
+            <!-- a period's closing entries are not reversed: reopen the period and close it again -->
+            <if condition="['AttPeriodClosing', 'AttNetIncomeClosing'].includes(acctgTrans?.acctgTransTypeEnumId)">
+                <return error="true"
+                        message="CLOSING_ENTRY: A period's closing entry is not reversed; reopen the period and close it again"/>
+            </if>
             <if condition="acctgTrans.isPosted != 'Y'">
                 <if condition="deleteIfNotPosted">
                     <then>
@@ -1553,14 +1561,17 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="glJournalId"/>
             <parameter name="netIncomeGlAccountId"/>
             <parameter name="reviewed" type="Boolean" default="false"><description>The caller is Mantle's period close
-                (CloseServices.close#Period), which checked its permission</description></parameter>
+                (CloseServices.close#Period), which checked its permission; the entries post as that close's
+                (post#AcctgTrans closingTimePeriodId)</description></parameter>
+            <parameter name="organizationPartyId"><description>The organization whose temporary accounts close: the
+                period's, or one that rolls up to it (default the period's)</description></parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="acctgTransIdByClassId" type="Map"/>
         </out-parameters>
         <actions>
             <entity-find-one entity-name="mantle.party.time.TimePeriod" value-field="timePeriod" for-update="true"/>
-            <set field="organizationPartyId" from="timePeriod.partyId"/>
+            <set field="organizationPartyId" from="organizationPartyId || timePeriod.partyId"/>
             <service-call name="mantle.party.TimeServices.get#TimePeriodInfo" in-map="{timePeriod:timePeriod}" out-map="periodInfo"/>
             <set field="transactionDate" from="periodInfo.thruTimestampLate"/>
             <if condition="Number(ec.user.nowTimestamp) &lt; Number(periodInfo.thruTimestamp)">
@@ -1603,6 +1614,7 @@ along with this software (see the LICENSE.md file). If not, see
                 </if>
                 <!-- find GAOTP records for balances -->
                 <entity-find entity-name="mantle.ledger.report.GlAccountOrgTimePeriodDetail" list="glAccountDetailList">
+                    <econdition field-name="organizationPartyId"/>
                     <econdition field-name="timePeriodId"/>
                     <econdition field-name="glAccountClassEnumId" operator="in" from="descEnumIdSet"/>
                     <select-field field-name="glAccountId,isDebit,endingBalance"/>
@@ -1647,7 +1659,8 @@ along with this software (see the LICENSE.md file). If not, see
                 <log message="Created transaction ${acctgTransId} ${ec.l10n.format(transactionDate, null)} for ${classEnum.description}, total balance ${ec.l10n.format(balanceTotal, '#,##0.00')}"/>
                 <if condition="postTransactions">
                     <service-call name="mantle.ledger.LedgerServices.post#AcctgTrans"
-                            in-map="{acctgTransId:acctgTransId, reviewed:reviewed}"/>
+                            in-map="{acctgTransId:acctgTransId, reviewed:reviewed,
+                                closingTimePeriodId:reviewed ? timePeriodId : null}"/>
                 </if>
             </iterate>
             <!-- recalc this period -->

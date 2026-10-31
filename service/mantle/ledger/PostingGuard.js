@@ -188,6 +188,21 @@ function calendarDay(tx, sources, sourceDatesEnabled) {
     ].find(([source, dateField]) => source?.accountingDate && ms(tx.transactionDate) === ms(source[dateField]))
     return originalSource ? lib.calendarDateText(originalSource[0].accountingDate) : null
 }
+// Whether a transaction is a closing entry of the close in progress: a closing type, on the last day of the fiscal year
+// the caller names, of the posting organization or one it rolls up to, while this user's AccountingCloseRun of that year
+// is closing; that run exists only inside close#Period's own transaction until it commits as closed.
+function closingInProgress(tx, closingTimePeriodId) {
+    if (!closingTimePeriodId || !closingTypes.includes(tx.acctgTransTypeEnumId)) return false
+    const period = one("mantle.party.time.TimePeriod", {timePeriodId: closingTimePeriodId})
+    if (!period || period.timePeriodTypeId !== "FiscalYear") return false
+    if (!lib.organizationChain(tx.organizationPartyId, tx.transactionDate).includes(period.partyId)) return false
+    if (!tx.accountingDate || lib.calendarDateText(tx.accountingDate) !== lib.calendarDateText(period.thruDate)) return false
+    return !!find("mantle.ledger.transaction.AccountingCloseRun", {
+        timePeriodId: closingTimePeriodId,
+        statusId: "CrnClosing",
+        closedByUserId: ec.user.userId
+    }).one()
+}
 function validate(p, lock = false) {
     const tx = (lock ? find(T, {acctgTransId: p.acctgTransId}).forUpdate(true) : find(T, {acctgTransId: p.acctgTransId})).one()
     if (!tx) throw new Error("Accounting transaction is not available")
@@ -302,11 +317,10 @@ function validate(p, lock = false) {
     const lockOut = postingLocks(tx, applicable, lock, sourceDay, enabled)
     const locks = lockOut.locks
     findings.push(...lockOut.findings)
-    // A period's closing entries post into the period being closed, as Mantle's own period check allows them; check asks
-    // FISCAL_CLOSE of them instead.
-    if (closingTypes.includes(tx.acctgTransTypeEnumId))
-        for (let i = findings.length - 1; i >= 0; i--)
-            if (["PERIOD_CLOSED", "HARD_LOCK", "SOFT_LOCK"].includes(findings[i].code)) findings.splice(i, 1)
+    // The closing entries close#Period posts go into the fiscal year it is closing: only those pass its closed-period
+    // finding, never a lock's; check asks FISCAL_CLOSE of them.
+    if (closingInProgress(tx, p.closingTimePeriodId))
+        for (let i = findings.length - 1; i >= 0; i--) if (findings[i].code === "PERIOD_CLOSED") findings.splice(i, 1)
     const evidence = {
         sources: sourceEvidence,
         tx: map(tx),
