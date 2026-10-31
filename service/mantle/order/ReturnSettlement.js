@@ -549,11 +549,17 @@ function plan(p, lock) {
     }
     const refundSourceRows = []
     if (refundTotal.compare(0) > 0) {
-        const pending = items.filter(item => {
-            if (!item.refundPaymentId) return false
-            const refund = one(PAY, {paymentId: item.refundPaymentId})
-            return refund && refund.paymentTypeEnumId === "PtRefund" && !doneRefundStatuses.includes(refund.statusId)
-        })
+        // the refunds of the return's credit memos the gateway has not decided
+        const memoIds = [...new Set(ownBillings.map(row => row.invoiceId))]
+        const pending = memoIds.length
+            ? Array.from(
+                  find(PAY)
+                      .condition("forInvoiceId", "in", memoIds)
+                      .condition("paymentTypeEnumId", "PtRefund")
+                      .condition("statusId", "not-in", doneRefundStatuses)
+                      .list()
+              )
+            : []
         if (pending.length) refuse("REFUND_PENDING", "A refund of this return is waiting for its gateway result")
         // within what the orders' payments hold: the largest first (the latest of equal ones), each to what is left of it
         const orderIds = [...new Set(items.map(row => row.orderId).filter(Boolean))]
@@ -582,12 +588,16 @@ function plan(p, lock) {
         if (!has("RECEIVABLE_EDIT")) missing.push("RECEIVABLE_EDIT")
         if (refundTotal.compare(0) > 0 && !has("PAYMENT_EDIT")) missing.push("PAYMENT_EDIT")
         if (receiptless && !has("RETURN_CREDIT_APPROVE")) missing.push("RETURN_CREDIT_APPROVE")
+        if (receiptless && !has("INVOICE_APPROVE")) missing.push("INVOICE_APPROVE")
     }
     if (missing.length) refuse("FORBIDDEN", missing.join(" and ") + " authority is required")
     // a customer credit memo is issued as the organization issues its invoices: with approval required, by an approver
     // allowed to approve what they drafted; a credit without receipt carries its approver's approval
     const creditMemo = !scope.supplierReturn && creditTotal.add(refundTotal).compare(0) !== 0
     const preference = lib.policy.preference(scope.organizationPartyId)
+    // the settler approves a credit without receipt, which they drafted: only where self-approval is allowed
+    if (creditMemo && receiptless && preference.allowAccountingSelfApproval !== "Y")
+        refuse("SELF_APPROVAL_DENIED", "A credit without receipt is approved by its settler, who drafted it")
     if (
         creditMemo &&
         !receiptless &&
@@ -646,7 +656,54 @@ function preview(p) {
 
 // ---- settlement
 
+// The settlement, then each gateway refund: the credit, the promised refunds and the operation record commit first
+// (record#ReturnSettlement); each gateway call then runs in its own transaction, its attempt recorded before it, so a
+// retry with the same key answers from the record and calls no gateway twice. A decline marks that refund declined, its
+// amount refundable again on the original, and leaves the credit and the other refunds; a call that fails or times out
+// leaves its refund promised for the gateway's lookup (REFUND_PENDING).
 function settle(p) {
+    const result = entityLib.probe("mantle.order.ReturnServices.record#ReturnSettlement", p).result
+    for (const gateway of Array.from(result.gatewayRefunds || [])) gatewayRefund(gateway)
+    result.refundStatusIds = Array.from(result.refundPaymentIds || []).map(paymentId => one(PAY, {paymentId}).statusId)
+    result.refundStatusId = result.refundStatusIds[0] || null
+    result.resultCode = result.refundStatusIds.includes("PmntDeclined")
+        ? "REFUND_DECLINED"
+        : result.refundStatusIds.some(statusId => !["PmntDelivered", "PmntConfirmed"].includes(statusId))
+          ? "REFUND_PENDING"
+          : "SETTLED"
+    return result
+}
+function gatewayRefund(gateway) {
+    const E = "mantle.account.payment.PaymentLifecycleEvent"
+    if (find(E, {paymentId: gateway.refundPaymentId, operationKey: gateway.operationKey}).count() > 0) return
+    entityLib.probe("create#" + E, {
+        paymentId: gateway.refundPaymentId,
+        organizationPartyId: gateway.organizationPartyId,
+        userId: ec.user.userId,
+        action: "Gateway refund",
+        operationKey: gateway.operationKey,
+        createdDate: ec.user.nowTimestamp
+    })
+    try {
+        entityLib.probe("mantle.account.PaymentServices.refund#SinglePayment", {
+            paymentId: gateway.paymentId,
+            refundPaymentId: gateway.refundPaymentId,
+            operationKey: gateway.operationKey
+        })
+    } catch (error) {
+        ec.logger.error("Gateway refund " + gateway.refundPaymentId + " did not finish: " + error.message)
+        return
+    }
+    // a gateway that gave no answer to look up (no refund service, no response) refunded nothing
+    const refund = one(PAY, {paymentId: gateway.refundPaymentId})
+    const answered = rows("mantle.account.method.PaymentGatewayResponse", {refundPaymentId: gateway.refundPaymentId}).some(
+        row => row.referenceNum
+    )
+    if (["PmntPromised", "PmntAuthorized"].includes(refund.statusId) && !answered)
+        entityLib.probe("update#" + PAY, {paymentId: gateway.refundPaymentId, statusId: "PmntDeclined"})
+}
+
+function record(p) {
     const peek = returnScope(p, false)
     const writer = peek.supplierReturn ? "PAYABLE_EDIT" : "RECEIVABLE_EDIT"
     if (!has(writer)) denied("FORBIDDEN", writer + " authority is required")
@@ -699,7 +756,7 @@ function settle(p) {
     if (scope.supplierReturn) supplierCredits(out, scope, billingFields, result)
     else customerResponses(out, planned, billingFields, result)
     completeSettled(out, planned)
-    // the gateway last, under this settlement's key: a decline refuses the whole settlement, so nothing is settled
+    // refunds without a gateway are paid now; a gateway refund stays promised for its own transaction (settle)
     deliverRefunds(out, op, result)
     entityLib.complete(op, RH, out.returnId, result)
     return result
@@ -752,41 +809,31 @@ function issueCredit(invoiceId, out, planned) {
     const originals = [...new Set(out.lineRows.map(row => row.originalInvoiceId).filter(Boolean))]
     const fields = {invoiceId}
     if (originals.length === 1) fields.creditForInvoiceId = originals[0]
-    if (planned.receiptless)
-        Object.assign(fields, {approvedByUserId: ec.user.userId, approvedDate: ec.user.nowTimestamp, isSelfApproved: "Y"})
     call("update#" + INV, fields)
-    if (planned.receiptless) call("update#" + INV, {invoiceId, approvedSourceVersion: lib.fingerprint(one(INV, {invoiceId}))})
-    const record = one(INV, {invoiceId})
+    const memo = one(INV, {invoiceId})
     call("mantle.account.InvoiceServices.change#InvoiceState", {
         invoiceId,
         organizationPartyId: out.organizationPartyId,
-        action: planned.approvalRequired && !planned.receiptless ? "approve" : "finalize",
-        lastUpdatedStamp: record.lastUpdatedStamp,
+        action: planned.approvalRequired || planned.receiptless ? "approve" : "finalize",
+        lastUpdatedStamp: memo.lastUpdatedStamp,
         changeReason: "Return " + out.returnId + " settled"
     })
 }
 
-// Each refund goes back through its original's gateway, keyed by the settlement's operation key, else it is paid now;
-// either applies it to the credit memo. A declined refund refuses the settlement (REFUND_DECLINED); one the gateway has
-// not decided stays promised (REFUND_PENDING).
+// A refund without a gateway is paid now, which applies it to the credit memo; one through a gateway is left for settle.
 function deliverRefunds(out, op, result) {
-    result.refundStatusIds = []
+    result.gatewayRefunds = []
     result.refundPaymentIds.forEach((refundPaymentId, index) => {
         const source = out.refundSourceRows[index]
         if (source.gateway)
-            call("mantle.account.PaymentServices.refund#SinglePayment", {
-                paymentId: source.paymentId,
+            result.gatewayRefunds.push({
                 refundPaymentId,
+                paymentId: source.paymentId,
+                organizationPartyId: out.organizationPartyId,
                 operationKey: op.operationKey + "-" + (index + 1)
             })
         else call("update#" + PAY, {paymentId: refundPaymentId, statusId: "PmntDelivered", effectiveDate: ec.user.nowTimestamp})
-        const refund = one(PAY, {paymentId: refundPaymentId})
-        if (refund.statusId === "PmntDeclined")
-            denied("REFUND_DECLINED", "The gateway declined the refund to payment " + source.paymentId + "; nothing was settled")
-        result.refundStatusIds.push(refund.statusId)
-        if (!["PmntDelivered", "PmntConfirmed"].includes(refund.statusId)) result.resultCode = "REFUND_PENDING"
     })
-    result.refundStatusId = result.refundStatusIds[0] || null
 }
 
 function supplierCredits(out, scope, billingFields, result) {
@@ -887,7 +934,7 @@ function completeSettled(out, planned) {
     }
 }
 
-const operations = {receive, syncReceived, preview, settle}
+const operations = {receive, syncReceived, preview, settle, record}
 ;({
     execute: (operation, parameters) => {
         if (!operations[operation]) throw new Error("Unknown return operation " + operation)

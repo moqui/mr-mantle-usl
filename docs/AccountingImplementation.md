@@ -526,11 +526,15 @@ when every item is handled, the shipment ShipDelivered when every source is. It 
   `process#ReturnItemResponses` refuses a return under the flag, `RETURN_SETTLEMENT_REQUIRED`): the quantities given,
   each billing link with its receipt, original invoice line, receiptless flag, reason, approver, settler and operation key;
   the credit memo is the organization's receivable credit (F350), issued through `change#InvoiceState` (approved by the
-  settler when invoice approval is required; a receiptless one stamped self-approved by its approver); a credit is the
+  settler when invoice approval is required; a receiptless one approved by its settler, who needs `INVOICE_APPROVE` and
+  `allowAccountingSelfApproval`); a credit is the
   customer credit account; a refund is spread over the order's captured payments, largest first, each a
-  `create#RefundPayment` for the credit memo, then, last, `refund#SinglePayment` through its gateway under the
-  settlement's key (a decline refuses the settlement, `REFUND_DECLINED`; a pending one answers `REFUND_PENDING`) or
-  delivered; a replacement is Mantle's replacement order for the quantity given, recorded on `replacedQuantity`.
+  `create#RefundPayment` for the credit memo, delivered at once without a gateway. The settlement commits first
+  (`record#ReturnSettlement`); then each gateway refund (`refund#SinglePayment`, keyed by the settlement's key and index)
+  runs in its own transaction with its attempt recorded before the call (a `PaymentLifecycleEvent`), so a retry calls no
+  gateway twice. A decline marks that refund declined, its amount refundable again, and leaves the credit and the other
+  refunds (`REFUND_DECLINED`); a refund with no gateway answer is declined; a pending or unfinished call stays promised
+  (`REFUND_PENDING`, read from the credit memos' refunds); a replacement is Mantle's replacement order for the quantity given, recorded on `replacedQuantity`.
 - Adjustments are credited by their total times the share of the item credited so far, less what they credited before;
   a credit's unit is at most the billed unit price; a line asked twice is refused (`DUPLICATE_LINE`).
 - A supplier return makes one credit per item, its adjustments netted in, through `create#InvoiceCreditMemo` linked to

@@ -4581,6 +4581,7 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="invoiceIdList" from="[]"/>
             <set field="orderPartsByInvoice" from="{}"/>
             <set field="shipDate" from="ec.user.nowTimestamp"/>
+            <entity-find-one entity-name="mantle.shipment.Shipment" value-field="shipment" disable-authz="true"/>
             <iterate list="shipmentBillingList" entry="billing">
                 <entity-find-one entity-name="mantle.order.OrderItem" value-field="billedOrderItem" disable-authz="true">
                     <field-map field-name="orderId" from="billing.orderId"/>
@@ -4592,7 +4593,9 @@ along with this software (see the LICENSE.md file). If not, see
             <iterate list="Object.keys(orderPartsByInvoice)" entry="invoiceId">
                 <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice" for-update="true"
                         disable-authz="true"/>
-                <if condition="invoice?.statusId != 'InvoiceInProcess'"><continue/></if>
+                <!-- the shipper's sales invoices still in process: a pack invoice -->
+                <if condition="invoice?.statusId != 'InvoiceInProcess' || invoice.invoiceTypeEnumId != 'InvoiceSales' ||
+                        invoice.fromPartyId != shipment.fromPartyId"><continue/></if>
                 <!-- dated the ship day, so revenue, receivable and the due date come at shipment, not at pack -->
                 <service-call name="update#mantle.account.invoice.Invoice" disable-authz="true"
                         in-map="{invoiceId:invoiceId, invoiceDate:shipDate,

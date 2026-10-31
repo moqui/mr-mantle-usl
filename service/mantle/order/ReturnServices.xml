@@ -1575,6 +1575,21 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="settlementRequired" from="preferenceOut.partyAcctgPreference?.returnSettlementRequired == 'Y'"/>
         </actions>
     </service>
+    <service verb="record" noun="ReturnSettlement" allow-remote="false">
+        <description>The settlement of settle#Return in one transaction: the plan under lock, the credit, the promised
+            refunds (those without a gateway delivered) and the operation record. Its result names the gateway refunds that
+            settle#Return then calls, each in its own transaction.</description>
+        <implements service="mantle.order.ReturnServices.define#ReturnSettlementRequest"/>
+        <in-parameters>
+            <parameter name="previewVersion" required="true"/>
+            <parameter name="operationKey" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="result" type="Map"/></out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/order/ReturnSettlement.js"/>
+            <set field="result" from="ec.resource.script(module).execute('record', context)"/>
+        </actions>
+    </service>
     <service verb="sync" noun="ReturnShipmentReceipts" allow-remote="false">
         <description>For an organization with returnSettlementRequired, a return shipment delivered after a receipt through
             Mantle's own services (receive#ShipmentProduct, as a SimpleScreens receipt does): each item's received quantity
@@ -1633,7 +1648,7 @@ along with this software (see the LICENSE.md file). If not, see
             <script>for (const field of Object.keys(answer)) context[field] = answer[field]</script>
         </actions>
     </service>
-    <service verb="settle" noun="Return" allow-remote="false">
+    <service verb="settle" noun="Return" allow-remote="false" transaction="ignore">
         <description>Settle a return as previewed (preview#ReturnSettlement), all or nothing, under lock (the organization,
             the return, its items). Refuses a request whose preview version no longer matches (RECEIPT_CHANGED), more than
             an item may still be settled (CREDIT_CAP_EXCEEDED), a refund beyond the original payment's refundable amount
@@ -1646,7 +1661,11 @@ along with this software (see the LICENSE.md file). If not, see
             refund#SinglePayment; a refund the gateway leaves pending answers REFUND_PENDING) or a replacement order. A
             supplier return makes a supplier credit memo linked to each bill (create#InvoiceCreditMemo) and queues the
             bills' matches for re-evaluation. An item fully settled is completed (complete#ReturnItem). The same
-            operationKey and request answers the first result.</description>
+            operationKey and request answers the first result. The settlement commits first (record#ReturnSettlement); then
+            each gateway refund runs in its own transaction, its attempt recorded before the call, so a retry calls no
+            gateway twice; a declined refund is marked declined, its amount refundable again on the original, and leaves
+            the credit and the other refunds (REFUND_DECLINED); one the gateway has not decided stays promised
+            (REFUND_PENDING), and one with no gateway answer at all is declined.</description>
         <implements service="mantle.order.ReturnServices.define#ReturnSettlementRequest"/>
         <in-parameters>
             <parameter name="previewVersion" required="true"/>
@@ -1654,8 +1673,9 @@ along with this software (see the LICENSE.md file). If not, see
         </in-parameters>
         <out-parameters>
             <parameter name="returnId"/>
-            <parameter name="resultCode"><description>SETTLED, or REFUND_PENDING when a gateway refund is not yet
-                confirmed</description></parameter>
+            <parameter name="resultCode"><description>SETTLED; REFUND_PENDING when a gateway refund is not yet confirmed;
+                REFUND_DECLINED when a gateway declined one</description></parameter>
+            <parameter name="refundStatusIds" type="List"/>
             <parameter name="creditInvoiceIds" type="List"/>
             <parameter name="creditPaymentId"/>
             <parameter name="refundPaymentId"><description>The first refund</description></parameter>

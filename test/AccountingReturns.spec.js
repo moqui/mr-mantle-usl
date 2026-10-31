@@ -173,19 +173,21 @@ spec({
         user("reader", ["RECEIVABLE_VIEW"])
         user("ar", ["RECEIVABLE_EDIT", "RECEIVABLE_VIEW"])
         user("treasury", ["RECEIVABLE_EDIT", "RECEIVABLE_VIEW", "PAYMENT_EDIT", "PAYMENT_VIEW"])
-        user("approver", ["RECEIVABLE_EDIT", "RECEIVABLE_VIEW", "RETURN_CREDIT_APPROVE"])
+        user("approver", ["RECEIVABLE_EDIT", "RECEIVABLE_VIEW", "RETURN_CREDIT_APPROVE", "INVOICE_APPROVE"])
         user("ap", ["PAYABLE_EDIT", "PAYABLE_VIEW"])
         user("issuer", ["RECEIVABLE_EDIT", "RECEIVABLE_VIEW", "INVOICE_APPROVE"])
         // test gateways whose refunds are declined, or left pending
         for (const [id, answer] of [
             [prefix + "_GW_DECLINE", "alwaysDecline"],
-            [prefix + "_GW_PENDING", "alwaysPending"]
+            [prefix + "_GW_PENDING", "alwaysPending"],
+            [prefix + "_GW_APPROVE", "alwaysApprove"],
+            [prefix + "_GW_NONE", null]
         ])
             svc("create#mantle.account.method.PaymentGatewayConfig", {
                 paymentGatewayConfigId: id,
                 paymentGatewayTypeEnumId: "PgtTest",
                 description: "Returns " + answer,
-                refundServiceName: "mantle.account.PaymentTestServices." + answer + "#PaymentRefund"
+                refundServiceName: answer ? "mantle.account.PaymentTestServices." + answer + "#PaymentRefund" : null
             })
         ids.sale = sale(
             [
@@ -365,6 +367,11 @@ feature("a credit without receipt needs a reason and an approver", {
         const notReceived = preview(ids.returnB, lines)
         login(users.approver)
         const noReason = preview(ids.returnB, lines, {receiptless: true})
+        // the settler approves the credit they drafted: only where self-approval is allowed
+        const noSelfApproval = preview(ids.returnB, lines, {receiptless: true, reason: "Lost by the carrier"})
+        login("john.doe")
+        preference({allowAccountingSelfApproval: "Y"})
+        login(users.approver)
         const settled = svc(
             R + "settle#Return",
             settleRequest(ids.returnB, lines, {receiptless: true, reason: "Lost by the carrier"})
@@ -373,17 +380,20 @@ feature("a credit without receipt needs a reason and an approver", {
         const memo = one("mantle.account.invoice.Invoice", {invoiceId: billing.invoiceId})
         const item = one("mantle.order.return.ReturnItem", {returnId: ids.returnB, returnItemSeqId: seq})
         const header = one("mantle.order.return.ReturnHeader", {returnId: ids.returnB})
-        return {notApprover, notReceived, noReason, settled, billing, item, header, memo}
+        login("john.doe")
+        preference({allowAccountingSelfApproval: "N"})
+        return {notApprover, notReceived, noReason, noSelfApproval, settled, billing, item, header, memo}
     },
-    then({notApprover, notReceived, noReason, settled, billing, item, header, memo}) {
+    then({notApprover, notReceived, noReason, noSelfApproval, settled, billing, item, header, memo}) {
         notApprover.reasonCode == "FORBIDDEN"
         notReceived.reasonCode == "NOTHING_TO_SETTLE"
         noReason.reasonCode == "REASON_REQUIRED"
+        noSelfApproval.reasonCode == "SELF_APPROVAL_DENIED"
         settled.resultCode == "SETTLED"
         billing.receiptless == "Y"
         billing.approvedByUserId == users.approver
         billing.assetReceiptId == null
-        // the credit memo carries its approver's approval, stamped self-approved, and is issued
+        // the credit memo is approved through the invoice workflow by its approver, self-approved, and issued
         memo.approvedByUserId == users.approver
         memo.isSelfApproved == "Y"
         memo.statusId == "InvoicePmtRecvd" || memo.statusId == "InvoiceFinalized"
@@ -801,36 +811,87 @@ feature("a refund spreads over the order's payments, the largest first, each wit
     }
 })
 
-feature("a gateway refund goes last: a decline settles nothing, a pending one is reported and holds the next refund", {
+feature("gateway refunds run after the settlement commits: a decline, no answer and a pending answer each keep the credit", {
     when() {
-        const sold = shippedSale([[productB, 2, 20]])
-        login("john.doe")
-        svc("update#mantle.account.payment.Payment", {
-            paymentId: sold.paymentIds[0],
-            paymentGatewayConfigId: prefix + "_GW_DECLINE"
-        })
-        const returnId = customerReturn(sold.orderId, [[productB, 2, "RrspRefund"]])
+        const sold = shippedSale([[productB, 3, 20]])
+        const gateway = id =>
+            svc("update#mantle.account.payment.Payment", {paymentId: sold.paymentIds[0], paymentGatewayConfigId: prefix + id})
+        const returnId = customerReturn(sold.orderId, [[productB, 3, "RrspRefund"]])
         const seq = returnSeq(returnId, productB)
-        receiveBox(returnId, productB, 2)
-        login(users.treasury)
-        const declined = refused(R + "settle#Return", settleRequest(returnId, [{returnItemSeqId: seq, quantity: 1}]))
-        const afterDecline = billings(returnId).length
+        receiveBox(returnId, productB, 3)
         login("john.doe")
-        svc("update#mantle.account.payment.Payment", {
-            paymentId: sold.paymentIds[0],
-            paymentGatewayConfigId: prefix + "_GW_PENDING"
-        })
+        gateway("_GW_DECLINE")
+        const declined = settleAs(users.treasury, returnId, [{returnItemSeqId: seq, quantity: 1}])
+        login("john.doe")
+        gateway("_GW_NONE")
+        const unanswered = settleAs(users.treasury, returnId, [{returnItemSeqId: seq, quantity: 1}])
+        login("john.doe")
+        gateway("_GW_PENDING")
         const pending = settleAs(users.treasury, returnId, [{returnItemSeqId: seq, quantity: 1}])
         login(users.treasury)
         const next = preview(returnId, [])
-        return {declined, afterDecline, pending, next}
+        return {declined, unanswered, pending, next, credited: billings(returnId).length}
     },
-    then({declined, afterDecline, pending, next}) {
-        declined.includes("REFUND_DECLINED")
-        afterDecline == 0
+    then({declined, unanswered, pending, next, credited}) {
+        declined.resultCode == "REFUND_DECLINED"
+        declined.refundStatusId == "PmntDeclined"
+        unanswered.resultCode == "REFUND_DECLINED"
+        unanswered.refundStatusId == "PmntDeclined"
         pending.resultCode == "REFUND_PENDING"
         pending.refundStatusId == "PmntPromised"
-        next.reasonCode == "REFUND_PENDING"
+        // every unit is credited; the refunds stand apart from the credit
+        credited == 3
+        next.reasonCode == "NOTHING_TO_SETTLE"
+    }
+})
+
+feature("a refund over two gateway payments, the second declined: the first refunds once, the second is refundable again", {
+    when() {
+        const sold = shippedSale([[productB, 5, 20]], [60, 40])
+        login("john.doe")
+        svc("update#mantle.account.payment.Payment", {
+            paymentId: sold.paymentIds[0],
+            paymentGatewayConfigId: prefix + "_GW_APPROVE"
+        })
+        svc("update#mantle.account.payment.Payment", {
+            paymentId: sold.paymentIds[1],
+            paymentGatewayConfigId: prefix + "_GW_DECLINE"
+        })
+        const returnId = customerReturn(sold.orderId, [[productB, 4, "RrspRefund"]])
+        receiveBox(returnId, productB, 4)
+        login(users.treasury)
+        const request = settleRequest(returnId, [])
+        const first = svc(R + "settle#Return", request)
+        const retry = svc(R + "settle#Return", request)
+        const responses = paymentId =>
+            rows("mantle.account.method.PaymentGatewayResponse", {paymentId}).filter(
+                row => row.paymentOperationEnumId == "PgoRefund"
+            ).length
+        const live = paymentId =>
+            rows("mantle.account.payment.Payment", {refundForPaymentId: paymentId}).filter(
+                row => !["PmntCancelled", "PmntVoid", "PmntDeclined"].includes(row.statusId)
+            ).length
+        return {
+            first,
+            retry,
+            firstResponses: responses(sold.paymentIds[0]),
+            secondResponses: responses(sold.paymentIds[1]),
+            firstLive: live(sold.paymentIds[0]),
+            secondLive: live(sold.paymentIds[1]),
+            credited: billings(returnId).length
+        }
+    },
+    then({first, retry, firstResponses, secondResponses, firstLive, secondLive, credited}) {
+        first.resultCode == "REFUND_DECLINED"
+        first.refundStatusIds[0] == "PmntDelivered"
+        first.refundStatusIds[1] == "PmntDeclined"
+        retry.alreadyApplied == true
+        retry.resultCode == "REFUND_DECLINED"
+        firstResponses == 1
+        secondResponses == 1
+        firstLive == 1
+        secondLive == 0
+        credited == 1
     }
 })
 
