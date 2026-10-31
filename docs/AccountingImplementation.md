@@ -247,6 +247,7 @@ applied match, linked only from unambiguous evidence: a line's billing links, el
 or receipts of another party, product or several order lines are ambiguous and recorded as `MeAmbiguous` exception lines;
 a line with no evidence is not linked, and what the evidence does not explain stays unmatched. Each bill runs in its own
 transaction (`apply#LegacyMatch`); a failure is named and the others go on. No hold is placed.
+
 ## Banking (P9)
 
 `ReconciliationServices` holds the bank side, on the existing bank lines (`PaymentMethodTrans`): a statement session
