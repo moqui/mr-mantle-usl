@@ -16,7 +16,7 @@ function changedInvoice() {
 }
 
 spec({
-    tempSequences: { start: 57900, banks: { "mantle.party.Party": 10, "mantle.account.invoice.Invoice": 10,
+    tempSequences: { start: 58200, banks: { "mantle.party.Party": 10, "mantle.account.invoice.Invoice": 10,
         "mantle.ledger.transaction.AcctgTrans": 10 } },
     setupSpec() {
         login("john.doe")
