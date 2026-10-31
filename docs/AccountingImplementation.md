@@ -46,9 +46,10 @@ P4 and P5 use Mantle's existing services and extend them with parameters; the re
 
 - **State.** `InvoiceServices.change#InvoiceState` is the guarded status change over Mantle's status flow: finalize
   or approve, resume, cancel, receive and sent. It checks the side's edit permission (`INVOICE_APPROVE` to approve),
-  the revision (`lastUpdatedStamp`), the period and accounting locks, the single-currency and approval preferences
-  and that the posting is done. Drafts are edited through `create#Receivable`, `store#InvoiceDraft`,
-  `store#InvoiceDraftItem` and `delete#InvoiceDraftItem`; `reverse#DraftInvoice` calls `reverse#Invoice`.
+  the revision (`lastUpdatedStamp`), the period and accounting locks, the approval preference and that the posting is
+  done (an invoice in another currency with no rate does not post, so it is refused, `RATE_MISSING`). Drafts are
+  edited through `create#Receivable`, `store#InvoiceDraft`, `store#InvoiceDraftItem` and `delete#InvoiceDraftItem`;
+  `reverse#DraftInvoice` calls `reverse#Invoice`.
 - **Reads.** `find#Receivables`, `get#ReceivableSummary` and `get#InvoiceFinanceDetail` read the stored
   `invoiceTotal` and `unpaidTotal`, and leave out parties another user keeps private.
 - **Print and send.** `get#InvoiceOutput` renders `template/account/Invoice.print.html.fancy` over
@@ -875,38 +876,39 @@ An organization's accounting is activated once, from a setup run (AC-01). `mantl
   debit or credit, in the base currency).
 - **`store#SetupRun`.** An organization with no preference, its own or inherited through its rollup, is set up from the
   template
-  (`init#PartyAccountingConfiguration` with the base currency, fiscal year start and costing basis, the posting guard and
-  single-currency documents on); for one with its own, a changed basis goes through `store#Preferences`; one that
+  (`init#PartyAccountingConfiguration` with the base currency, fiscal year start and costing basis, and the posting guard
+  on); for one with its own, a changed basis goes through `store#Preferences`; one that
   inherits keeps its parent's basis (`BASIS_INHERITED`). It makes the
   fiscal periods of the opening day (`get#OrganizationFiscalTimePeriods`), and replaces the lines (`balances`, or
   `balancesCsvText` with account, debit and credit) or saves one (`balanceLine`; empty amounts remove it). Every save
   raises `runVersion` and needs the version reviewed; an activated run, and a new opening day or migration account once
   open items are imported, are refused.
 - **Open items.** `import#OpenItems` takes rows, a CSV text or a file (direction, partyId, documentNumber, documentDate,
-  dueDate, openAmount; currencyUomId and description optional) and runs `create#OpenItem` for each in its own transaction:
-  a real invoice (`InvoiceSales`; the organization the from or to party by side) with `openingSetupRunId` (the opening
-  flag), dated at its document date, due at its own due date (no term, so its due schedule is one portion then),
-  booked on the opening day (`accountingDate`), with one `ItemOpeningBalance` line on the migration account
+  dueDate, openAmount; currencyUomId and description optional) and runs `create#OpenItem` for each in its own
+  transaction: a real invoice (`InvoiceSales`; the organization the from or to party by side) with `openingSetupRunId`
+  (the opening flag), dated at its document date, due at its own due date (no term, so its due schedule is one portion
+  then), booked on the opening day (`accountingDate`), with one `ItemOpeningBalance` line on the migration account
   (`overrideGlAccountId`); it is finalized or approved through `update#Invoice`, so `InvoiceGlPost` posts it (with the
   guard, on the opening day) and `InvoiceIssuedDueSchedule` writes its schedule, and a posting that does not complete
   refuses the row. A refused row is named with its reason code and the rest are kept; the same organization, side, party
   and number answers the invoice made before (or `OPEN_ITEM_CONFLICT` for another amount or due day); `verifyOnly`
   checks only, without a lock, and keeps its results apart (`lastCheckJson`). The posting guard must be on
   (`POSTING_GUARD_REQUIRED`); a cancelled invoice is not a repeat. An open bill is imported approved, stamped with the
-  importer's approval, so it needs `INVOICE_APPROVE` (the status flow's transition); an
-  internal counterparty, a document after the opening day and a currency other than the base currency (single currency
-  until P20) are refused. No tax, approval workflow, budget or email runs for an opening item. The rows run in their
-  own transactions, so a caller that changed the run in its own open transaction must commit first. A credit memo
-  allocated over an open item's lines takes the account mapped to `ItemOpeningBalance` for the side, never migration
-  clearing (`CREDIT_ACCOUNT_MISSING` without one).
+  importer's approval, so it needs `INVOICE_APPROVE` (the status flow's transition); an internal counterparty and a
+  document after the opening day are refused; one in another currency posts at the rate of the opening day, and with no
+  rate its posting is refused (`RATE_MISSING`). No tax, approval workflow, budget or email runs for an opening item. The
+  rows run in their own transactions, so a caller that changed the run in its own open transaction must commit first. A
+  credit memo allocated over an open item's lines takes the account mapped to `ItemOpeningBalance` for the side, never
+  migration clearing (`CREDIT_ACCOUNT_MISSING` without one).
 - **`preview#OpeningBalances`** answers the run, the templates, the lines with their totals, the tie-out of each
   receivable and payable control account (the AR and AP defaults and what the opening items posted to) against what the
   open items posted there, a page of the open items with each side's count and total, and the last import.
 - **`check#Readiness`** answers a row per check, each `ok`, `warning` or `blocker` with its message and items, one check
   that fails named and the others going on: preferences, chart, the open periods of the opening day, the posting guard,
   the migration account, the AR and AP accounts, mappings, read over the rollup chain, naming a summary account (impl-accounting F71, F251) and
-  mapped accounts not in the chart (F190, F250, F271), the inventory WIP and transfer accounts and costing basis, single
-  currency (open documents, pending payments and active prices in another currency, D18), the sales tax gateway, a bank
+  mapped accounts not in the chart (F190, F250, F271), the inventory WIP and transfer accounts and costing basis, the
+  exchange rates (`EXCHANGE_RATES`: a currency of open documents or pending payments with no rate to the base currency on
+  the opening day blocks; unmapped exchange gain and loss accounts warn), the sales tax gateway, a bank
   account, the paused `send_SalesInvoicePastDueEmails` job, the production cost accounts (a warning), entries already posted (which the opening balances add to),
   balanced lines and the open items' tie-out.
   `get#Readiness` also answers `setupStatus` (unconfigured, inSetup, active or configured) for Home.
@@ -915,6 +917,54 @@ An organization's accounting is activated once, from a setup run (AC-01). `mantl
   `AttOpeningBalance` transaction on the opening day through `post#AcctgTrans` (`reviewed`): each line on its account,
   a control account's line on the migration account, which then nets to zero; the run becomes `AsrActivated`.
 
+## Base-currency posting (P20)
+
+Every posting is in its organization's base currency, `PartyAcctgPreference.baseCurrencyUomId` (AC-19, CX-FX); the
+single-currency refusal of P4 and P19 (D18) is gone. The logic is in `ledger/Currencies.js`.
+
+- **Rates.** `Currencies.rateOn(from, to, day)` is the rate in effect at the end of a calendar day in the user's zone:
+  the pair's own dated `UomConversion` (its float factor read as a decimal), else the inverse of the opposite pair's. A
+  document keeps the rate it posted at as exact decimal text with its date, source and target currency
+  (`Invoice`/`Payment.exchangeRate`, `exchangeRateDate`, `exchangeRateSource`, `exchangeRateToUomId`; `documentRate`):
+  the one already on it, else the rate of its book day, written once, so its adjustments and applications use it and a
+  later rate change affects later documents only.
+- **`post#AcctgTrans`.** Before the posting guard, an unposted transaction whose `amountUomId` is not the base currency
+  is converted (`convert`, locking the organization, then the transaction): at the rate it carries
+  (`AcctgTrans.exchangeRate`, which `post#Invoice`, `post#InvoiceAdjustment` and `post#Payment` pass from their
+  document), else the rate of its book day. Each line's `originalCurrencyAmount` keeps the document amount and `amount`
+  becomes the base amount rounded to the base currency, each side trued up on its largest line to the side's total at
+  the rate (so a control line holds exactly its document's total at the rate); `amountUomId` becomes the base currency,
+  `originalCurrencyUomId` the document's, and the rate, its date and source are kept on the transaction. A base-currency
+  transaction reads one row more and is otherwise posted as before. With no rate the transaction stays as it is: with
+  the guard on it is refused (`RATE_MISSING`; an automatic posting goes to the error journal), with the guard off
+  Mantle's own check holds it in the error journal. `verifyOnly` converts nothing and reports a missing rate.
+- **Payments.** A payment in another currency posts unapplied, never straight to the receivable or payable, and each
+  application posts on its own.
+- **Realized exchange.** `post#PaymentApplication` converts an application in another currency line by line
+  (`convertApplication`): the base record's line (the payment, else the invoice) at its rate and the other document's at
+  its rate. Each line is what brings the document's cleared total, over its posted unreversed application postings, to
+  the cleared amount at its rate, so a document applied in full clears exactly what it posted, whatever each
+  application rounds to. The difference is booked to `GatForExGain` (a credit) or `GatForExLoss` (a debit), mapped by
+  DefaultSettings to 817000000 and 797000000 (with their assignments, which `init#PartyAccountingConfiguration`
+  copies). No rate or no exchange account: `RATE_MISSING`/`MAPPING_MISSING` with the guard on, else the error journal.
+- **Reports.** Summaries and statements hold the base currency; postings made before P20 in another currency stay named
+  incomplete, as P16 built. The invoice reconciliation compares an invoice in another currency at its kept rate and
+  the aging total converted the same way; a payment in another currency is left out of the payment check, which is named
+  incomplete. The close's missing-rate row (`PccMissingRates`) uses the kept or day rate.
+- **Provider rates (AC-16).** `refresh#Rates` calls the service an `ExchangeRateProvider` enumeration names
+  (`PartyAcctgPreference.rateProviderServiceName`, set through `store#Preferences`, which accepts only those
+  enumerations' services; none by default). The shipped provider, `get#EcbRates`, reads the European Central Bank's
+  daily euro reference rates (free, no key) or a copy of its file passed as `sourceText` (for a server without outbound
+  access, and the specs); providers implement `define#RateProvider`. Each currency of the organization's invoices and
+  payments, or of `uomIdList`, gets a `CurrencyRateProposal` to the base currency, a cross rate through the provider's
+  currency (12 places), not active until `accept#RateProposals` stores it through `store#Rate`;
+  `reject#RateProposals` rejects. Each decision runs in its own transaction under the organization's lock; a pair and
+  day already proposed or accepted answers that proposal. All need `ACCOUNTING_ADMIN`.
+- **Kept as they are.** The settlement workbench (`CURRENCY_MISMATCH`), the payment lifecycle drafts, payment runs and
+  internal transfers stay in the base currency; a document in another currency is paid through Mantle's payment and
+  `apply#*` services. Credit exposure stays in the policy's currency (P10's `CURRENCY_DIFFERENT`), and landed costs
+  refuse a bill in another currency (P13).
+
 ## Libraries
 
 - `ledger/EntityLib.js`: the helpers the finance modules share: entity reads without artifact authorization (each
@@ -922,6 +972,8 @@ An organization's accounting is activated once, from a setup run (AC-01). `mantl
   timestamp's day in the user's zone), display values, amounts, refusals with reason codes (`denied`, `reasonCode`),
   party names that leave out private parties, paging and operation keys. Nothing in it authorizes.
 - `ledger/AccountingPolicy.js`: permissions, organization scope and record checks; a refusal has a reason code.
+- `ledger/Currencies.js`: rates by day, document rates, the base-currency conversion of a posting and of an
+  application, the rate CSV import and provider proposals.
 - `ledger/PostingGuard.js`: the posting choke point. It decides an automatic posting from the transaction's source
   fields, and asks `ACCOUNTING_GL_POST` of a manual or reversal posting unless its caller passes `reviewed`.
 - `account/InvoiceWorkflowLib.js`: an invoice's scope for a read or a write, and the hold guard. `Payables.js`,
@@ -958,6 +1010,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingCredit,AccountingCollections,AccountingRecurringAging
 ./moq test mr-mantle --spec AccountingValuation,ProductStandardCosts
 ./moq test mr-mantle --spec AccountingBudgets,BudgetServices
+./moq test mr-mantle --spec AccountingCurrency,AccountingReports
 ./moq test mr-mantle --spec AccountingReturns,ReturnToResponseBasicFlow,OrderToCashBasicFlow
 ./moq test mr-mantle --spec AccountingPortals
 ./moq test mr-mantle --spec AccountingSetup
