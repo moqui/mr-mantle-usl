@@ -704,18 +704,27 @@ feature("a revised order line reserves its new amount less what it already passe
         const second = reserveLine(line, 1200, spreadAccount, "2")
         const retry = reserveLine(line, 1200, spreadAccount, "2")
         const open = rows("mantle.other.budget.BudgetCommitment", {sourceId: line.orderId, statusId: "BcReserved"})
+        const actualBefore = actualSum("BUDGET-REVISED-BILL")
+        // the bill reversed: its 400 goes back to the line's current revision
+        login("john.doe")
+        svc("mantle.other.BudgetServices.reverse#InvoiceActuals", {invoiceId: "BUDGET-REVISED-BILL"})
+        const afterReversal = n(
+            one("mantle.other.budget.BudgetCommitment", {budgetCommitmentId: second.budgetCommitmentId}).amount
+        )
         return {
             converted,
             second,
             retry,
             committed: open.reduce((sum, row) => sum + n(row.amount), 0),
-            actual: actualSum("BUDGET-REVISED-BILL"),
+            actual: actualBefore,
+            afterReversal,
             firstStatus: one("mantle.other.budget.BudgetCommitment", {budgetCommitmentId: first.budgetCommitmentId}).statusId
         }
     },
-    then({converted, second, retry, committed, actual, firstStatus}) {
+    then({converted, second, retry, committed, actual, afterReversal, firstStatus}) {
+        afterReversal == 1200
         converted.statusId == "BcActual"
-        n(one("mantle.other.budget.BudgetCommitment", {budgetCommitmentId: second.budgetCommitmentId}).amount) == 800
+        // before the reversal: 1200 less the 400 the first revision passed on
         retry.existing == true
         retry.budgetCommitmentId == second.budgetCommitmentId
         committed == 800

@@ -484,10 +484,29 @@ function budgetLine(organizationPartyId, glAccountId, bookDay) {
         find(BUDGET, {statusId: "BudgetApproved"}).condition("timePeriodId", "in", periodIds).orderBy("budgetId").list()
     )
     for (const budget of budgets) {
-        // an approved budget's numbers are its latest revision's; one approved without a revision controls nothing
-        const latest = revisions(budget.budgetId).pop()
+        // an approved budget's numbers are its latest revision's; one approved without a revision controls nothing. Only
+        // the account's items and their revision impacts are read.
+        const latest = Array.from(
+            find("mantle.other.budget.BudgetRevision", {budgetId: budget.budgetId}).orderBy("-revisionSeqId").limit(1).list()
+        )[0]
         if (!latest) continue
-        const items = itemsAsOf(budget.budgetId, latest).filter(row => row.glAccountId === glAccountId && row.amount != null)
+        const accountItems = rows(ITEM, {budgetId: budget.budgetId, glAccountId})
+        if (!accountItems.length) continue
+        const revised = {}
+        for (const impact of find("mantle.other.budget.BudgetRevisionImpact", {budgetId: budget.budgetId})
+            .condition(
+                "budgetItemSeqId",
+                "in",
+                accountItems.map(row => row.budgetItemSeqId)
+            )
+            .list()) {
+            if (Number(impact.revisionSeqId) > Number(latest.revisionSeqId)) continue
+            const known = revised[impact.budgetItemSeqId]
+            if (!known || Number(known.revisionSeqId) < Number(impact.revisionSeqId)) revised[impact.budgetItemSeqId] = impact
+        }
+        const items = accountItems
+            .filter(row => revised[row.budgetItemSeqId]?.revisedAmount != null)
+            .map(row => Object.assign(policy.lib.map(row), {amount: revised[row.budgetItemSeqId].revisedAmount}))
         if (!items.length) continue
         for (const item of items.filter(row => row.subTimePeriodId)) {
             const sub = one("mantle.party.time.TimePeriod", {timePeriodId: item.subTimePeriodId})
@@ -572,8 +591,16 @@ function committedAmount(organizationPartyId, glAccountIds, fromDay, thruDay) {
 // The budget decision for spending of an account on a day: requested (new spending less what earlier stages already
 // hold for it), projected (actual and committed after it), and the policy's action when the projection passes the
 // threshold. posted: the spending is already in the actual (a bill approved and posted).
-function evaluate(organizationPartyId, stageEnumId, glAccountId, bookDay, amount, consumed = zero(), posted = false) {
-    const line = budgetLine(organizationPartyId, glAccountId, bookDay)
+function evaluate(
+    organizationPartyId,
+    stageEnumId,
+    glAccountId,
+    bookDay,
+    amount,
+    consumed = zero(),
+    posted = false,
+    line = budgetLine(organizationPartyId, glAccountId, bookDay)
+) {
     const requested = dec(amount).subtract(consumed)
     const result = {glAccountId, requestedAmount: requested, decisionEnumId: "BcdNoControl", over: false, blocked: false}
     if (!line) return Object.assign(result, {message: "No approved budget for account " + glAccountId + " on " + bookDay})
@@ -810,8 +837,9 @@ function reserve(p) {
     const first = retry()
     if (first) return first
     const amount = key.amount.subtract(carried())
-    let evaluation = evaluate(organizationPartyId, stageEnumId, p.glAccountId, key.commitmentDate, amount)
-    lockBudget(evaluation)
+    // the budget is locked before any commitment row: budget, then commitment, everywhere
+    const budgetOf = budgetLine(organizationPartyId, p.glAccountId, key.commitmentDate)
+    lockBudget({budgetId: budgetOf?.budget.budgetId})
     const again = retry()
     if (again) return again
     // a new revision of the source line replaces the open commitment of an earlier one
@@ -830,7 +858,11 @@ function reserve(p) {
             message: "Later stages already hold the whole amount of this source line"
         }
     const net = Object.assign({}, key, {amount})
-    evaluation = decide(evaluate(organizationPartyId, stageEnumId, p.glAccountId, key.commitmentDate, amount), p, net)
+    const evaluation = decide(
+        evaluate(organizationPartyId, stageEnumId, p.glAccountId, key.commitmentDate, amount, zero(), false, budgetOf),
+        p,
+        net
+    )
     requireCurrency(evaluation, key)
     if (evaluation.decisionEnumId === "BcdWarned") ec.message.addMessage(evaluation.message, "warning")
     const created = call("create#" + COMMITMENT, commitmentFields(evaluation, net, "BcReserved"))
@@ -886,7 +918,8 @@ function convert(p) {
     const first = retry()
     if (first) return first
     const posted = stageEnumId === "BcsExpense"
-    lockBudget(evaluate(organizationPartyId, stageEnumId, glAccountId, key.commitmentDate, key.amount, zero(), posted))
+    const budgetOf = budgetLine(organizationPartyId, glAccountId, key.commitmentDate)
+    lockBudgets([{budgetId: budgetOf?.budget.budgetId}, {budgetId: parent.budgetId}])
     const again = retry()
     if (again) return again
     parent = find(COMMITMENT, {budgetCommitmentId: parent.budgetCommitmentId}).forUpdate(true).one()
@@ -897,7 +930,7 @@ function convert(p) {
     const sameAccount = parent.glAccountId === glAccountId
     const consumed = sameAccount ? used : zero()
     const evaluation = decide(
-        evaluate(organizationPartyId, stageEnumId, glAccountId, key.commitmentDate, key.amount, consumed, posted),
+        evaluate(organizationPartyId, stageEnumId, glAccountId, key.commitmentDate, key.amount, consumed, posted, budgetOf),
         p,
         key
     )
@@ -982,19 +1015,44 @@ function convertInvoice(p) {
             })
             line.amount = line.amount.add(dec(entry.amount))
         }
+    const lineList = Object.values(lines).sort((a, b) => String(a.invoiceItemSeqId).localeCompare(String(b.invoiceItemSeqId)))
+    // the budgets first, then the commitment rows (budget, then commitment, everywhere): the budget line of each account
+    // of the bill and the budgets of the order commitments its lines would convert
+    const lineOf = {}
+    for (const line of lineList)
+        if (!(line.glAccountId in lineOf))
+            lineOf[line.glAccountId] = budgetLine(organizationPartyId, line.glAccountId, base.commitmentDate)
+    const billings = {}
+    const parentBudgets = []
+    for (const line of lineList) {
+        billings[line.invoiceItemSeqId] ??= rows("mantle.order.OrderItemBilling", {
+            invoiceId: p.invoiceId,
+            invoiceItemSeqId: line.invoiceItemSeqId
+        })
+        for (const billing of billings[line.invoiceItemSeqId])
+            for (const row of rows(COMMITMENT, {
+                sourceEntityName: ORDER,
+                sourceId: billing.orderId,
+                sourceItemId: billing.orderItemSeqId,
+                statusId: "BcReserved"
+            }))
+                parentBudgets.push({budgetId: row.budgetId})
+    }
+    lockBudgets(
+        Object.values(lineOf)
+            .map(line => ({budgetId: line?.budget.budgetId}))
+            .concat(parentBudgets)
+    )
+    if (done().length) return {budgetCommitmentIds: done().map(row => row.budgetCommitmentId), existing: true}
     // each line's purchase order commitments through its billing links; what one line takes of a commitment the next
     // cannot take again
     const usedOf = {}
     const consumedOf = {}
-    const lineList = Object.values(lines).sort((a, b) => String(a.invoiceItemSeqId).localeCompare(String(b.invoiceItemSeqId)))
     for (const line of lineList) {
         line.parents = []
         line.consumed = zero()
         let remaining = line.amount
-        for (const billing of rows("mantle.order.OrderItemBilling", {
-            invoiceId: p.invoiceId,
-            invoiceItemSeqId: line.invoiceItemSeqId
-        })) {
+        for (const billing of billings[line.invoiceItemSeqId]) {
             const reserved = Array.from(
                 find(COMMITMENT, {
                     sourceEntityName: ORDER,
@@ -1023,7 +1081,7 @@ function convertInvoice(p) {
             }
         }
     }
-    // decide each account's lines together, the budgets locked first in order
+    // decide each account's lines together, each account evaluated once
     const byAccount = {}
     for (const line of lineList) (byAccount[line.glAccountId] ??= []).push(line)
     const groups = Object.entries(byAccount).map(([glAccountId, accountLines]) => ({
@@ -1033,19 +1091,23 @@ function convertInvoice(p) {
         consumed: accountLines.reduce((sum, line) => sum.add(line.consumed), zero()),
         linked: accountLines.some(line => line.parents.length)
     }))
-    const first = groups.map(group =>
-        evaluate(organizationPartyId, "BcsExpense", group.glAccountId, base.commitmentDate, group.amount, group.consumed, true)
-    )
-    lockBudgets(first)
-    if (done().length) return {budgetCommitmentIds: done().map(row => row.budgetCommitmentId), existing: true}
     const created = []
     const parentIds = new Set()
-    groups.forEach((group, index) => {
-        if (!first[index].budgetId && !group.linked) return
+    groups.forEach(group => {
         const {glAccountId, accountLines, amount, consumed} = group
+        if (!lineOf[glAccountId] && !group.linked) return
         const accountKey = Object.assign({}, base, {amount, sourceItemId: accountLines[0].invoiceItemSeqId})
         const evaluation = decide(
-            evaluate(organizationPartyId, "BcsExpense", glAccountId, base.commitmentDate, amount, consumed, true),
+            evaluate(
+                organizationPartyId,
+                "BcsExpense",
+                glAccountId,
+                base.commitmentDate,
+                amount,
+                consumed,
+                true,
+                lineOf[glAccountId]
+            ),
             p,
             accountKey
         )
@@ -1078,6 +1140,14 @@ function convertInvoice(p) {
 // reverse#InvoiceActuals: a bill whose approval is undone (Approved to Received) or which is cancelled reverses its actual
 // commitments, so the order commitments they converted are open again.
 function reverseInvoice(p) {
+    // the budgets first, then the commitment rows
+    const affected = rows(COMMITMENT, {sourceEntityName: INVOICE, sourceId: p.invoiceId}).filter(
+        row => row.statusId === "BcActual" || (row.statusId === "BcReleased" && row.convertedFromId)
+    )
+    const parents = [...new Set(affected.map(row => row.convertedFromId).filter(Boolean))].map(id =>
+        one(COMMITMENT, {budgetCommitmentId: id})
+    )
+    lockBudgets(affected.concat(parents.filter(Boolean)))
     const actual = Array.from(
         find(COMMITMENT, {sourceEntityName: INVOICE, sourceId: p.invoiceId, statusId: "BcActual"}).forUpdate(true).list()
     )
@@ -1085,26 +1155,41 @@ function reverseInvoice(p) {
     const shares = rows(COMMITMENT, {sourceEntityName: INVOICE, sourceId: p.invoiceId, statusId: "BcReleased"}).filter(
         row => row.convertedFromId
     )
-    for (const row of actual)
+    for (const row of actual.concat(shares))
         call("update#" + COMMITMENT, {
             budgetCommitmentId: row.budgetCommitmentId,
             statusId: "BcReversed",
             releasedDate: ec.user.nowTimestamp
         })
-    for (const row of shares)
-        call("update#" + COMMITMENT, {
-            budgetCommitmentId: row.budgetCommitmentId,
-            statusId: "BcReversed",
-            releasedDate: ec.user.nowTimestamp
+    const reopened = new Set()
+    for (const row of actual.concat(shares)) {
+        const parent = row.convertedFromId && one(COMMITMENT, {budgetCommitmentId: row.convertedFromId})
+        if (!parent) continue
+        if (parent.statusId !== "BcReleased") {
+            reopened.add(parent.budgetCommitmentId)
+            continue
+        }
+        // the order line was revised since: its current revision holds the amount again
+        const current = rows(COMMITMENT, {
+            sourceEntityName: parent.sourceEntityName,
+            sourceId: parent.sourceId,
+            stageEnumId: parent.stageEnumId
         })
-    settleParents([
-        ...new Set(
-            actual
-                .concat(shares)
-                .map(row => row.convertedFromId)
-                .filter(Boolean)
-        )
-    ])
+            .filter(
+                other =>
+                    (other.sourceItemId || null) === (parent.sourceItemId || null) &&
+                    ["BcReserved", "BcConverted"].includes(other.statusId)
+            )
+            .sort((a, b) => ms(b.createdDate) - ms(a.createdDate))[0]
+        if (!current) continue
+        call("update#" + COMMITMENT, {
+            budgetCommitmentId: current.budgetCommitmentId,
+            amount: dec(current.amount).add(dec(row.amount)),
+            amount_changeReason: "Bill " + p.invoiceId + " reversed"
+        })
+        reopened.add(current.budgetCommitmentId)
+    }
+    settleParents([...reopened])
     return {reversedCount: actual.length}
 }
 
