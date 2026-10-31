@@ -595,6 +595,9 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="paymentApplicationId"/>
         </out-parameters>
         <actions>
+            <!-- the hold guard: no payment is made for a bill on hold -->
+            <script>ec.resource.script('component://mr-mantle/service/mantle/account/InvoiceWorkflowLib.js')
+                .requireNotHeld(invoiceId)</script>
             <service-call name="mantle.account.PaymentServices.check#InvoiceStatusForPayment" in-map="{invoiceId:invoiceId}"/>
 
             <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
@@ -953,9 +956,23 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
     <service verb="apply" noun="PaymentForInvoice">
+        <description>Apply a delivered payment to the invoice it is for (forInvoiceId). A payment for a bill on hold stays
+            unapplied, with a warning naming the bill (PAYMENT_HELD).</description>
         <in-parameters><parameter name="paymentId" required="true"/></in-parameters>
         <actions>
             <entity-find-one entity-name="mantle.account.payment.Payment" value-field="payment"/>
+            <if condition="payment.forInvoiceId">
+                <entity-find-count entity-name="mantle.account.invoice.InvoiceHold" count-field="openHoldCount">
+                    <econdition field-name="invoiceId" from="payment.forInvoiceId"/>
+                    <econdition field-name="releasedDate" from="null"/>
+                </entity-find-count>
+                <if condition="openHoldCount">
+                    <log level="warn"
+                            message="PAYMENT_HELD: payment ${paymentId} left unapplied, bill ${payment.forInvoiceId} is on hold"/>
+                    <message type="warning">PAYMENT_HELD: Payment ${paymentId} waits: bill ${payment.forInvoiceId} is held</message>
+                    <return/>
+                </if>
+            </if>
             <if condition="payment.forInvoiceId &amp;&amp; ['PmntDelivered', 'PmntConfirmed'].includes(payment.statusId) &amp;&amp;
                     (payment.unappliedTotal == null || toDecimal(payment.unappliedTotal).compare(0) &gt; 0)">
                 <service-call name="mantle.account.PaymentServices.apply#InvoicePayment" out-map="context"
@@ -964,10 +981,19 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
     <service verb="apply" noun="InvoiceForPayments">
+        <description>Apply the delivered payments for an invoice (forInvoiceId) to it. For a bill on hold they stay
+            unapplied, with a warning naming the bill (PAYMENT_HELD).</description>
         <in-parameters><parameter name="invoiceId" required="true"/></in-parameters>
         <actions>
             <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
             <if condition="invoice == null"><return message="Invoice ${invoiceId} not found, not applying payments"/></if>
+            <entity-find-count entity-name="mantle.account.invoice.InvoiceHold" count-field="openHoldCount">
+                <econdition field-name="invoiceId"/><econdition field-name="releasedDate" from="null"/></entity-find-count>
+            <if condition="openHoldCount">
+                <log level="warn" message="PAYMENT_HELD: payments for bill ${invoiceId} left unapplied, it is on hold"/>
+                <message type="warning">PAYMENT_HELD: Payments for bill ${invoiceId} are not applied while it is on hold</message>
+                <return/>
+            </if>
             <entity-find entity-name="mantle.account.payment.Payment" list="paymentList">
                 <econdition field-name="forInvoiceId" from="invoiceId"/></entity-find>
             <iterate list="paymentList" entry="payment">

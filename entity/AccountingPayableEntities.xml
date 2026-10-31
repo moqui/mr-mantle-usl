@@ -1,0 +1,121 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<!-- Payables: the supplier profile's finance fields, bill holds, the receipt billing rule and the cost center of order and
+    invoice lines (mantle.party.SupplierServices, the payable services of mantle.account.InvoiceServices). -->
+<entities xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/entity-definition-3.xsd">
+    <entity entity-name="SupplierProfile" package="mantle.party.supplier" cache="never">
+        <description>What an organization keeps about one of its suppliers, as effective-dated rows: a change ends the row in
+            effect and starts the next (store#SupplierProfile). The finance fields are the default payment term of the
+            supplier's bills and whether the organization bills itself for the supplier's receipts (self-billing); the
+            buying fields are Purchasing's.</description>
+        <field name="supplierProfileId" type="id" is-pk="true"/>
+        <field name="organizationPartyId" type="id" enable-audit-log="true"/>
+        <field name="supplierPartyId" type="id" enable-audit-log="true"/>
+        <field name="fromDate" type="date-time" enable-audit-log="true"/>
+        <field name="thruDate" type="date-time" enable-audit-log="true"/>
+        <field name="settlementTermId" type="id" enable-audit-log="true"/>
+        <field name="selfBillingIndicator" type="text-indicator" enable-audit-log="true"/>
+        <field name="changeReason" type="text-medium" enable-audit-log="true"/>
+        <field name="changedByUserId" type="id"/>
+        <relationship type="one" title="Organization" related="mantle.party.Party">
+            <key-map field-name="organizationPartyId" related="partyId"/>
+        </relationship>
+        <relationship type="one" title="Supplier" related="mantle.party.Party">
+            <key-map field-name="supplierPartyId" related="partyId"/>
+        </relationship>
+        <relationship type="one" related="mantle.account.invoice.SettlementTerm"/>
+        <index name="SUPPLIER_PROFILE_ORG"><index-field name="organizationPartyId"/><index-field name="supplierPartyId"/></index>
+    </entity>
+    <entity entity-name="InvoiceHold" package="mantle.account.invoice" cache="never">
+        <description>A hold on a bill: while it is open (no releasedDate) the bill is not approved and no payment is applied
+            to it. Placed by hold#Invoice, a release asked for by request#HoldRelease and released by another user through
+            release#InvoiceHold.</description>
+        <field name="invoiceHoldId" type="id" is-pk="true"/>
+        <field name="invoiceId" type="id" enable-audit-log="true"/>
+        <field name="holdReasonEnumId" type="id" enable-audit-log="true"/>
+        <field name="holdComment" type="text-medium" enable-audit-log="true"/>
+        <field name="reviewDate" type="date-time" enable-audit-log="true">
+            <description>When the hold is to be reviewed or released; it is not released by itself.</description></field>
+        <field name="placedByUserId" type="id" enable-audit-log="true"/>
+        <field name="placedDate" type="date-time" enable-audit-log="true"/>
+        <field name="releaseRequestedByUserId" type="id" enable-audit-log="true"/>
+        <field name="releaseRequestedDate" type="date-time" enable-audit-log="true"/>
+        <field name="releaseRequestNote" type="text-medium" enable-audit-log="true"/>
+        <field name="releasedByUserId" type="id" enable-audit-log="true"/>
+        <field name="releasedDate" type="date-time" enable-audit-log="true"/>
+        <field name="releaseComment" type="text-medium" enable-audit-log="true"/>
+        <relationship type="one" related="mantle.account.invoice.Invoice"/>
+        <relationship type="one" title="InvoiceHoldReason" related="moqui.basic.Enumeration">
+            <key-map field-name="holdReasonEnumId" related="enumId"/>
+        </relationship>
+        <seed-data>
+            <moqui.basic.EnumerationType description="Invoice Hold Reason" enumTypeId="InvoiceHoldReason"/>
+            <moqui.basic.Enumeration description="Match exception" enumId="IhrMatchException" enumTypeId="InvoiceHoldReason"
+                    sequenceNum="1"/>
+            <moqui.basic.Enumeration description="AP review" enumId="IhrApReview" enumTypeId="InvoiceHoldReason" sequenceNum="2"/>
+            <moqui.basic.Enumeration description="Supplier dispute" enumId="IhrSupplierDispute" enumTypeId="InvoiceHoldReason"
+                    sequenceNum="3"/>
+            <moqui.basic.Enumeration description="Bank detail change" enumId="IhrBankChange" enumTypeId="InvoiceHoldReason"
+                    sequenceNum="4"/>
+        </seed-data>
+        <index name="INVOICE_HOLD_INVOICE"><index-field name="invoiceId"/><index-field name="releasedDate"/></index>
+    </entity>
+    <view-entity entity-name="InvoiceOpenHoldSummary" package="mantle.account.invoice" cache="never">
+        <description>The number of open holds of each invoice, a sub-select of InvoiceFinance (find#Payables' held
+            queue).</description>
+        <member-entity entity-alias="HLD" entity-name="mantle.account.invoice.InvoiceHold"/>
+        <alias entity-alias="HLD" name="invoiceId"/>
+        <alias entity-alias="HLD" name="openHoldCount" field="invoiceHoldId" function="count"/>
+        <entity-condition>
+            <econdition entity-alias="HLD" field-name="releasedDate" operator="is-null"/>
+        </entity-condition>
+    </view-entity>
+    <view-entity entity-name="InvoiceHoldDetail" package="mantle.account.invoice" cache="never">
+        <description>An invoice hold with its bill's parties, status and totals, for the lists of held bills.</description>
+        <member-entity entity-alias="HLD" entity-name="mantle.account.invoice.InvoiceHold"/>
+        <member-entity entity-alias="INV" entity-name="mantle.account.invoice.Invoice" join-from-alias="HLD">
+            <key-map field-name="invoiceId"/>
+        </member-entity>
+        <member-entity entity-alias="FROMP" entity-name="mantle.party.Party" join-from-alias="INV">
+            <key-map field-name="fromPartyId" related="partyId"/>
+        </member-entity>
+        <alias-all entity-alias="HLD"/>
+        <alias entity-alias="FROMP" name="fromPrivateOwnerUserId" field="privateOwnerUserId"/>
+        <alias entity-alias="INV" name="fromPartyId"/>
+        <alias entity-alias="INV" name="toPartyId"/>
+        <alias entity-alias="INV" name="statusId"/>
+        <alias entity-alias="INV" name="invoiceTypeEnumId"/>
+        <alias entity-alias="INV" name="referenceNumber"/>
+        <alias entity-alias="INV" name="currencyUomId"/>
+        <alias entity-alias="INV" name="invoiceTotal"/>
+        <alias entity-alias="INV" name="unpaidTotal"/>
+        <alias entity-alias="INV" name="dueDate"/>
+    </view-entity>
+    <extend-entity entity-name="PartyAcctgPreference" package="mantle.ledger.config">
+        <field name="receiptInvoiceSelfBilledOnly" type="text-indicator" default="'N'" enable-audit-log="update">
+            <description>Y: a delivered incoming shipment bills itself only for a self-billing supplier (SupplierProfile), and
+                then for the accepted quantity only, with no leftover or charge lines; other bills come from the supplier
+                (import#Bill) or from the order (create#InvoiceFromSource). N, the default: every delivered incoming
+                shipment is billed as before.</description></field>
+    </extend-entity>
+    <extend-entity entity-name="OrderItem" package="mantle.order">
+        <field name="costCenterId" type="id" enable-audit-log="update"/>
+    </extend-entity>
+    <extend-entity entity-name="InvoiceItem" package="mantle.account.invoice">
+        <field name="costCenterId" type="id" enable-audit-log="update">
+            <description>The cost center the line posts to, else its order line's.</description></field>
+    </extend-entity>
+</entities>

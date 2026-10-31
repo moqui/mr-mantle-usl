@@ -749,6 +749,8 @@ function checkApplication(p) {
         denied("APPLICATION_AMOUNT_PRECISION", "Application amount must use its currency's precision")
     if (payments.some(row => row.paymentTypeEnumId === "PtInternalTransfer"))
         denied("TRANSFER_APPLICATION_REFUSED", "Internal transfers cannot fund trade applications or refunds")
+    // the hold guard: nothing is applied to a bill on hold
+    for (const invoice of invoices) lib.requireNotHeld(invoice.invoiceId)
     // The book day: as reviewed, else the day the posting would take from its source, else the applied date's day.
     const bookDay = p.accountingDate
         ? policy.calendarDateText(p.accountingDate)
