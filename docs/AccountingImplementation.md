@@ -873,9 +873,11 @@ An organization's accounting is activated once, from a setup run (AC-01). `mantl
   the opening day, the migration clearing account, `runVersion`, the activation's transaction, user and date, and the
   last open item import (`lastImportJson`). `AccountingSetupBalance` holds its opening trial balance lines (an account's
   debit or credit, in the base currency).
-- **`store#SetupRun`.** An organization without its own preference is set up from the template
+- **`store#SetupRun`.** An organization with no preference, its own or inherited through its rollup, is set up from the
+  template
   (`init#PartyAccountingConfiguration` with the base currency, fiscal year start and costing basis, the posting guard and
-  single-currency documents on); for one with its own, a changed basis goes through `store#Preferences`. It makes the
+  single-currency documents on); for one with its own, a changed basis goes through `store#Preferences`; one that
+  inherits keeps its parent's basis (`BASIS_INHERITED`). It makes the
   fiscal periods of the opening day (`get#OrganizationFiscalTimePeriods`), and replaces the lines (`balances`, or
   `balancesCsvText` with account, debit and credit) or saves one (`balanceLine`; empty amounts remove it). Every save
   raises `runVersion` and needs the version reviewed; an activated run, and a new opening day or migration account once
@@ -889,19 +891,23 @@ An organization's accounting is activated once, from a setup run (AC-01). `mantl
   guard, on the opening day) and `InvoiceIssuedDueSchedule` writes its schedule, and a posting that does not complete
   refuses the row. A refused row is named with its reason code and the rest are kept; the same organization, side, party
   and number answers the invoice made before (or `OPEN_ITEM_CONFLICT` for another amount or due day); `verifyOnly`
-  checks only. An open bill is imported approved, so it needs `INVOICE_APPROVE` (the status flow's transition); an
+  checks only, without a lock, and keeps its results apart (`lastCheckJson`). The posting guard must be on
+  (`POSTING_GUARD_REQUIRED`); a cancelled invoice is not a repeat. An open bill is imported approved, stamped with the
+  importer's approval, so it needs `INVOICE_APPROVE` (the status flow's transition); an
   internal counterparty, a document after the opening day and a currency other than the base currency (single currency
   until P20) are refused. No tax, approval workflow, budget or email runs for an opening item. The rows run in their
-  own transactions, so a caller that changed the run in its own open transaction must commit first.
+  own transactions, so a caller that changed the run in its own open transaction must commit first. A credit memo
+  allocated over an open item's lines takes the account mapped to `ItemOpeningBalance` for the side, never migration
+  clearing (`CREDIT_ACCOUNT_MISSING` without one).
 - **`preview#OpeningBalances`** answers the run, the templates, the lines with their totals, the tie-out of each
   receivable and payable control account (the AR and AP defaults and what the opening items posted to) against what the
   open items posted there, a page of the open items with each side's count and total, and the last import.
 - **`check#Readiness`** answers a row per check, each `ok`, `warning` or `blocker` with its message and items, one check
   that fails named and the others going on: preferences, chart, the open periods of the opening day, the posting guard,
-  the migration account, the AR and AP accounts, mappings naming a summary account (impl-accounting F71, F251) and
+  the migration account, the AR and AP accounts, mappings, read over the rollup chain, naming a summary account (impl-accounting F71, F251) and
   mapped accounts not in the chart (F190, F250, F271), the inventory WIP and transfer accounts and costing basis, single
   currency (open documents, pending payments and active prices in another currency, D18), the sales tax gateway, a bank
-  account, the paused `send_SalesInvoicePastDueEmails` job, entries already posted (which the opening balances add to),
+  account, the paused `send_SalesInvoicePastDueEmails` job, the production cost accounts (a warning), entries already posted (which the opening balances add to),
   balanced lines and the open items' tie-out.
   `get#Readiness` also answers `setupStatus` (unconfigured, inSetup, active or configured) for Home.
 - **`activate#Accounting`** locks the organization and the run, answers a retried operation key, answers an activated run
