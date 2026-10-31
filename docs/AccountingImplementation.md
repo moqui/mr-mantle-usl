@@ -156,8 +156,9 @@ self-billing (`selfBillingIndicator`). `mantle.party.SupplierServices.store#Supp
 starts the next (`SUPPLIER_TERMS_EDIT` for these finance fields; Purchasing adds the buyer fields under
 `SUPPLIER_PROFILE_EDIT`); `get#SupplierFinance` reads a supplier's bills, payments, open, in-review, held and overdue
 amounts, agreements, profile rows and, by permission, its masked bank accounts, identifications and tax
-registrations. The `CustomerFinanceServices` writers take `side` supplier for a supplier's (its identifications need
-`PAYABLE_EDIT`), and `check#CustomerScope` accepts a purchase order or a supplier profile as the relationship.
+registrations. The `CustomerFinanceServices` writers take `side`: `check#CustomerScope` counts only that side's
+relationship (a customer's sales or current relationship; a supplier's bills, purchase orders or profile), and a
+supplier's identifications need `PAYABLE_EDIT`.
 
 **Due date.** `checkSet#InvoiceDueDate` (the `InvoiceSetDueDate` EECA): the invoice's term, else the newest agreement
 term, else for a bill the supplier's term in effect on the invoice date, else for a receivable the organization's.
@@ -167,34 +168,41 @@ term, else for a bill the supplier's term in effect on the invoice date, else fo
   person's expenses, all), each with its open holds (`PAYABLE_VIEW` or `ACCOUNTING_VIEW`).
 - `import#Bill` (`PAYABLE_IMPORT`): a draft bill keyed by organization, supplier and the supplier's reference, one line
   for an amount given and the file as its content; a repeat is refused (`BILL_DUPLICATE`) naming the first. For a
-  receipt (`shipmentId`) with a self-billed draft, the file is attached to that draft instead.
+  receipt (`shipmentId`) billed as a draft without a reference (self-billed), the file is attached to that draft, which
+  takes the reference; a later upload for the receipt, or one whose bill is no longer a draft, is refused naming it.
 - `create#InvoiceFromSource` (`PAYABLE_EDIT` for a purchase, `RECEIVABLE_EDIT` for a sale): the ordered basis
   (`create#EntireOrderPartInvoice`) or, for a purchase, the received basis (`create#PurchaseShipmentInvoices` with
-  `acceptedOnly`); the order's payments are marked for the invoice and apply when it is approved; a source already
-  invoiced is refused (`SOURCE_ALREADY_INVOICED`, keyed on `Invoice.workflowSourceKey`).
-- `request#PayableApproval` (`PAYABLE_EDIT`): an incoming bill is received and the `BillApproval` notification sent.
-- `approve#Payable` (`INVOICE_APPROVE`): a bill's posting day when given, then `change#InvoiceState`'s approval.
+  `acceptedOnly`), each delivered receipt once; the order's payments are marked for the invoice and apply when it is
+  approved; a source already invoiced is refused (`SOURCE_ALREADY_INVOICED`); a retried operation key answers first.
+- `request#PayableApproval` (`PAYABLE_EDIT`): an incoming bill is received and `BillApproval` sent to the
+  organization's users who hold `INVOICE_APPROVE`.
+- `approve#Payable` (`INVOICE_APPROVE`): a bill's posting day when given, then `change#InvoiceState`'s approval; the
+  bill's `BillApproval` notifications are marked read.
 
 **Holds.** `mantle.account.invoice.InvoiceHold`, reasons of enumeration type `InvoiceHoldReason` (match exception, AP
 review, supplier dispute, bank detail change). `hold#Invoice` (`INVOICE_HOLD`; a payable only, one open hold per
-reason), `request#HoldRelease` (`PAYABLE_EDIT`; records the request and sends `BillHoldRelease`), `release#InvoiceHold`
-(`INVOICE_HOLD_RELEASE`; never by the placer, `HOLD_RELEASE_SELF`, with a reason) and `get#InvoiceHolds`. The hold
+reason), `request#HoldRelease` (`PAYABLE_EDIT`; records the request and sends `BillHoldRelease` to the organization's users who
+hold `INVOICE_HOLD_RELEASE`), `release#InvoiceHold` (`INVOICE_HOLD_RELEASE`; never by the placer, `HOLD_RELEASE_SELF`,
+with a reason; marks the hold's notifications read and, for the last hold of an approved bill, applies its waiting
+payments) and `get#InvoiceHolds`. The hold
 guard, `InvoiceWorkflowLib.requireNotHeld` (`INVOICE_HELD`), runs in `change#InvoiceState`'s approval of a bill, in the
 rules every application checks (`PaymentSettlement.checkApplication`, so `apply#InvoicePayment`,
 `apply#InvoiceToInvoice` and `apply#Settlement`), in `create#InvoicePayment`, and in the open items
-(`find#OpenItems` gives a held bill the reason `INVOICE_HELD`). `apply#PaymentForInvoice` and `apply#InvoiceForPayments`,
+(`find#OpenItems` gives a held bill the reason `INVOICE_HELD`; `InvoiceFinance.heldInvoiceId` is a sub-select of the
+open holds). `apply#PaymentForInvoice` and `apply#InvoiceForPayments`,
 which the `PaymentApplyForInvoice` and `InvoiceApplyForPayments` SECAs call, leave a held bill's payments unapplied
 with a `PAYMENT_HELD` warning. There is no flag: no flow spec holds a bill.
 
 **Receipt billing (D2).** `create#PurchaseShipmentInvoices` and `create#SalesShipmentInvoices` take `acceptedOnly`: a
 receipt's accepted quantity only, no leftover line and no charge or service line. With
-`PartyAcctgPreference.receiptInvoiceSelfBilledOnly` Y (off by default), `ShipmentIncomingDeliveredCreateInvoices`
+`PartyAcctgPreference.receiptInvoiceSelfBilledOnly` Y (off by default; a preference `store#Preferences` sets),
+`ShipmentIncomingDeliveredCreateInvoices`
 bills a delivered receipt only for a supplier whose profile in effect is self-billing, and then with `acceptedOnly`;
-otherwise the bill comes from the supplier or the order. OrderProcureToPayBasicFlow asserts the SECA's bill with its
+otherwise the bill comes from the supplier or the order. A receipt with nothing accepted leaves no empty bill. OrderProcureToPayBasicFlow asserts the SECA's bill with its
 freight line, so the rule is a flag; BOSS's demo organization turns it on.
 
-**Cost centers (AC-22).** `OrderItem.costCenterId` and `InvoiceItem.costCenterId`; the invoice postings
-(`post#Invoice`, `post#InvoiceAdjustment`) carry an invoice line's cost center, else its order line's.
+**Cost centers (AC-22).** `OrderItem.costCenterId` and `InvoiceItem.costCenterId`: a bill or invoice line made from an
+order line takes its cost center, and the invoice postings (`post#Invoice`, `post#InvoiceAdjustment`) carry the line's.
 
 ## Libraries
 

@@ -47,7 +47,7 @@ function user(kind, permissions) {
 }
 // A purchase order of DEMO_1_1 with a freight line, approved; with receive it is shipped, received with two units rejected
 // and delivered, which runs the receipt billing SECA.
-function purchase(vendorPartyId, receive) {
+function purchase(vendorPartyId, receive, accepted = 8, rejected = 2) {
     const order = svc("mantle.order.OrderServices.create#Order", {
         customerPartyId: org,
         vendorPartyId,
@@ -72,21 +72,34 @@ function purchase(vendorPartyId, receive) {
     svc("mantle.order.OrderServices.place#Order", {orderId: order.orderId})
     svc("mantle.order.OrderServices.approve#Order", {orderId: order.orderId})
     if (!receive) return {orderId: order.orderId}
+    return {orderId: order.orderId, shipmentId: deliver(order.orderId, accepted, rejected)}
+}
+// A delivery of the order's DEMO_1_1: a shipment of the quantity received (accepted and rejected), shipped, received and
+// delivered, which runs the receipt billing SECA.
+function deliver(orderId, accepted, rejected) {
     const shipment = svc("mantle.shipment.ShipmentServices.create#OrderPartShipment", {
-        orderId: order.orderId,
-        orderPartSeqId: order.orderPartSeqId,
+        orderId,
+        orderPartSeqId: "01",
         destinationFacilityId: facility
     })
+    const quantity = accepted + rejected
+    for (const source of rows("mantle.shipment.ShipmentItemSource", {shipmentId: shipment.shipmentId}))
+        svc("update#mantle.shipment.ShipmentItemSource", {
+            shipmentItemSourceId: source.shipmentItemSourceId,
+            quantity,
+            quantityNotHandled: quantity
+        })
+    svc("update#mantle.shipment.ShipmentItem", {shipmentId: shipment.shipmentId, productId: "DEMO_1_1", quantity})
     svc("mantle.shipment.ShipmentServices.ship#Shipment", {shipmentId: shipment.shipmentId})
     svc("mantle.shipment.ShipmentServices.receive#ShipmentProduct", {
         shipmentId: shipment.shipmentId,
         productId: "DEMO_1_1",
-        quantityAccepted: 8,
-        quantityRejected: 2,
+        quantityAccepted: accepted,
+        quantityRejected: rejected,
         facilityId: facility
     })
     svc("mantle.shipment.ShipmentServices.deliver#Shipment", {shipmentId: shipment.shipmentId})
-    return {orderId: order.orderId, shipmentId: shipment.shipmentId}
+    return shipment.shipmentId
 }
 function shipmentBills(shipmentId) {
     return [
@@ -96,6 +109,10 @@ function shipmentBills(shipmentId) {
                 .filter(Boolean)
         )
     ]
+}
+function selfBilledUpload(shipmentId) {
+    login(users.ap)
+    return native("import#Bill", {organizationPartyId: org, supplierPartyId: selfBilled, shipmentId, referenceNumber: "SELF-1"})
 }
 function bill(reference, amount = "100") {
     login(users.ap)
@@ -317,9 +334,16 @@ feature("the placer cannot release a hold; a release asked for notifies, and an 
         const holds = native("get#InvoiceHolds", {invoiceId: billId})
         const hold = one("mantle.account.invoice.InvoiceHold", {invoiceHoldId: own.invoiceHoldId})
         const notice = one("moqui.security.user.NotificationMessage", {notificationMessageId: asked.notificationMessageId})
-        return {selfRelease, noRelease, noReason, released, holds, hold, notice}
+        const recipients = rows("moqui.security.user.NotificationMessageUser", {
+            notificationMessageId: asked.notificationMessageId
+        })
+        return {selfRelease, noRelease, noReason, released, holds, hold, notice, recipients}
     },
-    then({selfRelease, noRelease, noReason, released, holds, hold, notice}) {
+    then({selfRelease, noRelease, noReason, released, holds, hold, notice, recipients}) {
+        // the organization's users who may release it hear of it, the asker and the users without the permission do not;
+        // the release marks it read
+        recipients.map(row => row.userId).sort() == [users.approver, users.holder].sort()
+        recipients.every(row => row.viewedDate != null)
         selfRelease.includes("HOLD_RELEASE_SELF")
         noRelease.includes("PERMISSION_DENIED")
         noReason.includes("REASON_REQUIRED")
@@ -345,10 +369,17 @@ feature("an AP user sends a bill for approval and an approver approves it once r
             lastUpdatedStamp: received.lastUpdatedStamp
         })
         login(users.approver)
+        const unread = () =>
+            rows("moqui.security.user.NotificationMessageUser", {notificationMessageId: sent.notificationMessageId}).filter(
+                row => !row.viewedDate
+            ).length
+        const waiting = unread()
         const approved = native("approve#Payable", {invoiceId: billId, lastUpdatedStamp: received.lastUpdatedStamp})
-        return {sent, arDenied, approved}
+        return {sent, arDenied, approved, waiting, left: unread()}
     },
-    then({sent, arDenied, approved}) {
+    then({sent, arDenied, approved, waiting, left}) {
+        waiting == 2
+        left == 0
         sent.statusId == "InvoiceReceived"
         sent.notificationMessageId != null
         arDenied.includes("PERMISSION_DENIED")
@@ -365,22 +396,34 @@ feature("with the receipt billing rule a receipt bills only a self-billing suppl
         const self = purchase(selfBilled, true)
         const selfBills = shipmentBills(self.shipmentId)
         const lines = selfBills.length ? rows("mantle.account.invoice.InvoiceItem", {invoiceId: selfBills[0]}) : []
-        // the supplier's file for that receipt is attached to the self-billed draft, not a second bill
+        // a receipt with nothing accepted leaves no empty bill
+        const rejectedAll = purchase(selfBilled, true, 0, 10)
+        const rejectedBills = shipmentBills(rejectedAll.shipmentId)
+        const upload = selfBilledUpload(self.shipmentId)
+        // a second self-billed receipt whose supplier reference is another bill's: refused, the draft keeps no reference
+        login("john.doe")
+        const other = purchase(selfBilled, true)
+        const otherDraft = shipmentBills(other.shipmentId)[0]
         login(users.ap)
-        const upload = native("import#Bill", {
+        native("import#Bill", {organizationPartyId: org, supplierPartyId: selfBilled, referenceNumber: "SELF-2", amount: "5"})
+        const conflicting = refused("mantle.account.InvoiceServices.import#Bill", {
             organizationPartyId: org,
             supplierPartyId: selfBilled,
-            shipmentId: self.shipmentId,
-            referenceNumber: "SELF-1"
+            shipmentId: other.shipmentId,
+            referenceNumber: "SELF-2"
         })
+        const keptReference = one("mantle.account.invoice.Invoice", {invoiceId: otherDraft}).referenceNumber
         login(users.ap)
         const fromReceipt = native("create#InvoiceFromSource", {orderId: plain.orderId, basis: "received"})
         const receiptLines = rows("mantle.account.invoice.InvoiceItem", {invoiceId: fromReceipt.invoiceId})
         login("john.doe")
         svc("update#mantle.ledger.config.PartyAcctgPreference", {organizationPartyId: org, receiptInvoiceSelfBilledOnly: "N"})
-        return {plainBills, selfBills, lines, upload, receiptLines}
+        return {plainBills, selfBills, lines, rejectedBills, upload, conflicting, keptReference, receiptLines}
     },
-    then({plainBills, selfBills, lines, upload, receiptLines}) {
+    then({plainBills, selfBills, lines, rejectedBills, upload, conflicting, keptReference, receiptLines}) {
+        rejectedBills.length == 0
+        conflicting.includes("BILL_DUPLICATE")
+        keptReference == null
         plainBills.length == 0
         selfBills.length == 1
         lines.length == 1
@@ -390,5 +433,96 @@ feature("with the receipt billing rule a receipt bills only a self-billing suppl
         upload.invoiceId == selfBills[0]
         receiptLines.length == 1
         receiptLines[0].quantity.toNumber() == 8
+    }
+})
+
+feature("a repeat upload for a receipt is refused, naming its bill, also once the bill is approved", {
+    when() {
+        login("john.doe")
+        const draftId = Array.from(
+            helper().lib.find("mantle.account.invoice.Invoice", {fromPartyId: selfBilled, referenceNumber: "SELF-1"}).list()
+        )[0].invoiceId
+        const shipmentId = rows("mantle.shipment.ShipmentItemSource", {invoiceId: draftId})[0].shipmentId
+        login(users.ap)
+        const repeat = refused("mantle.account.InvoiceServices.import#Bill", {
+            organizationPartyId: org,
+            supplierPartyId: selfBilled,
+            shipmentId,
+            referenceNumber: "SELF-1B"
+        })
+        login(users.approver)
+        native("approve#Payable", {
+            invoiceId: draftId,
+            lastUpdatedStamp: one("mantle.account.invoice.Invoice", {invoiceId: draftId}).lastUpdatedStamp
+        })
+        login(users.ap)
+        const afterApproval = refused("mantle.account.InvoiceServices.import#Bill", {
+            organizationPartyId: org,
+            supplierPartyId: selfBilled,
+            shipmentId,
+            referenceNumber: "SELF-1C"
+        })
+        return {draftId, repeat, afterApproval}
+    },
+    then({draftId, repeat, afterApproval}) {
+        repeat.includes("BILL_DUPLICATE")
+        repeat.includes(draftId)
+        afterApproval.includes("BILL_DUPLICATE")
+        afterApproval.includes(draftId)
+    }
+})
+
+feature("each delivery of an order is billed on its receipt, and a retry with the same key answers the first bill", {
+    when() {
+        login("john.doe")
+        svc("update#mantle.ledger.config.PartyAcctgPreference", {organizationPartyId: org, receiptInvoiceSelfBilledOnly: "Y"})
+        const po = purchase(supplier, false)
+        deliver(po.orderId, 4, 0)
+        login(users.ap)
+        const first = native("create#InvoiceFromSource", {orderId: po.orderId, basis: "received", operationKey: "AP-SRC-1"})
+        const retry = native("create#InvoiceFromSource", {orderId: po.orderId, basis: "received", operationKey: "AP-SRC-1"})
+        login("john.doe")
+        deliver(po.orderId, 6, 0)
+        login(users.ap)
+        const second = native("create#InvoiceFromSource", {orderId: po.orderId, basis: "received"})
+        const third = refused("mantle.account.InvoiceServices.create#InvoiceFromSource", {orderId: po.orderId, basis: "received"})
+        const quantity = invoiceId => rows("mantle.account.invoice.InvoiceItem", {invoiceId})[0]?.quantity?.toNumber()
+        login("john.doe")
+        svc("update#mantle.ledger.config.PartyAcctgPreference", {organizationPartyId: org, receiptInvoiceSelfBilledOnly: "N"})
+        return {first, retry, second, third, firstQuantity: quantity(first.invoiceId), secondQuantity: quantity(second.invoiceId)}
+    },
+    then({first, retry, second, third, firstQuantity, secondQuantity}) {
+        retry.invoiceId == first.invoiceId
+        second.invoiceId != first.invoiceId
+        firstQuantity == 4
+        secondQuantity == 6
+        third.includes("SOURCE_ALREADY_INVOICED")
+    }
+})
+
+feature("a user who only edits receivables cannot change a supplier's identifications, by either side", {
+    when() {
+        login("john.doe")
+        const poOnly = prefix + "_PO_ONLY"
+        party(poOnly, "Purchase order supplier", "Supplier")
+        purchase(poOnly, false)
+        const request = side => ({
+            organizationPartyId: org,
+            customerPartyId: poOnly,
+            side,
+            partyIdTypeEnumId: "PtidFein",
+            idValue: "12-3456789"
+        })
+        login(users.ar)
+        const asCustomer = refused("mantle.account.CustomerFinanceServices.store#CustomerIdentification", request("customer"))
+        const asSupplier = refused("mantle.account.CustomerFinanceServices.store#CustomerIdentification", request("supplier"))
+        login(users.ap)
+        const ap = refused("mantle.account.CustomerFinanceServices.store#CustomerIdentification", request("supplier"))
+        return {asCustomer, asSupplier, ap}
+    },
+    then({asCustomer, asSupplier, ap}) {
+        asCustomer.includes("CUSTOMER_SCOPE_INVALID")
+        asSupplier.includes("PERMISSION_DENIED")
+        ap == ""
     }
 })

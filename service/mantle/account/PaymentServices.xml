@@ -595,10 +595,10 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="paymentApplicationId"/>
         </out-parameters>
         <actions>
-            <service-call name="mantle.account.PaymentServices.check#InvoiceStatusForPayment" in-map="{invoiceId:invoiceId}"/>
             <!-- the hold guard: no payment is made for a bill on hold -->
             <script>ec.resource.script('component://mr-mantle/service/mantle/account/InvoiceWorkflowLib.js')
                 .requireNotHeld(invoiceId)</script>
+            <service-call name="mantle.account.PaymentServices.check#InvoiceStatusForPayment" in-map="{invoiceId:invoiceId}"/>
 
             <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
 

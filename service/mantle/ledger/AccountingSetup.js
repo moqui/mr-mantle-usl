@@ -27,6 +27,7 @@ const preferenceFields = [
     "singleCurrencyDocumentsOnly",
     "invoiceApprovalRequired",
     "inventoryRevaluationEnabled",
+    "receiptInvoiceSelfBilledOnly",
     "invoiceDocumentTemplate",
     "paymentDocumentTemplate",
     "documentLocale",

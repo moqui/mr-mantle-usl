@@ -73,6 +73,16 @@ along with this software (see the LICENSE.md file). If not, see
         </seed-data>
         <index name="INVOICE_HOLD_INVOICE"><index-field name="invoiceId"/><index-field name="releasedDate"/></index>
     </entity>
+    <view-entity entity-name="InvoiceOpenHoldSummary" package="mantle.account.invoice" cache="never">
+        <description>The number of open holds of each invoice, a sub-select of InvoiceFinance (find#Payables' held
+            queue).</description>
+        <member-entity entity-alias="HLD" entity-name="mantle.account.invoice.InvoiceHold"/>
+        <alias entity-alias="HLD" name="invoiceId"/>
+        <alias entity-alias="HLD" name="openHoldCount" field="invoiceHoldId" function="count"/>
+        <entity-condition>
+            <econdition entity-alias="HLD" field-name="releasedDate" operator="is-null"/>
+        </entity-condition>
+    </view-entity>
     <view-entity entity-name="InvoiceHoldDetail" package="mantle.account.invoice" cache="never">
         <description>An invoice hold with its bill's parties, status and totals, for the lists of held bills.</description>
         <member-entity entity-alias="HLD" entity-name="mantle.account.invoice.InvoiceHold"/>

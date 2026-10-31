@@ -5,100 +5,82 @@ const lib = ec.resource.script("component://mr-mantle/service/mantle/account/Inv
 const {find, one, rows, call, denied, has} = lib
 const I = lib.invoiceEntity
 const dayMs = 86400000
-const queues = ["incoming", "review", "held", "approved", "due", "credits", "expenses", "all"]
+const queues = ["incoming", "review", "held", "approved", "due", "overdue", "credits", "expenses", "all"]
 
 // The bills of an organization the user may read: its supplier bills, the linked credits of its bills and supplier
-// credits, private counterparties of other users left out, filtered in the query.
+// credits, private counterparties of other users left out, filtered in the query. The condition is built once; a find
+// runs once, so the page and the count each make one from it.
 function payableQuery(p) {
     if (!has("ACCOUNTING_VIEW") && !has("ACCOUNTING_ADMIN")) lib.requirePermission("PAYABLE_VIEW")
     const organizationPartyId = lib.organization(p.organizationPartyId || lib.policy.access().activeOrganizationPartyId)
     const cf = ec.entity.conditionFactory
     const all = conditions => cf.makeCondition(conditions, "and")
-    let query = find("mantle.account.invoice.InvoiceFinance").condition(
-        cf.makeCondition(
-            [
-                all([
-                    cf.makeCondition("toPartyId", "equals", organizationPartyId),
-                    cf.makeCondition("creditForInvoiceId", "is-null", null),
-                    cf.makeCondition("financeDirection", "is-null", null)
-                ]),
-                all([
-                    cf.makeCondition("sourceToPartyId", "equals", organizationPartyId),
-                    cf.makeCondition("financeDirection", "is-null", null)
-                ]),
-                all([
-                    cf.makeCondition("financeOrganizationPartyId", "equals", organizationPartyId),
-                    cf.makeCondition("financeDirection", "equals", "payable")
-                ])
-            ],
-            "or"
-        )
-    )
+    const any = conditions => cf.makeCondition(conditions, "or")
+    const conditions = [
+        any([
+            all([
+                cf.makeCondition("toPartyId", "equals", organizationPartyId),
+                cf.makeCondition("creditForInvoiceId", "is-null", null),
+                cf.makeCondition("financeDirection", "is-null", null)
+            ]),
+            all([
+                cf.makeCondition("sourceToPartyId", "equals", organizationPartyId),
+                cf.makeCondition("financeDirection", "is-null", null)
+            ]),
+            all([
+                cf.makeCondition("financeOrganizationPartyId", "equals", organizationPartyId),
+                cf.makeCondition("financeDirection", "equals", "payable")
+            ])
+        ])
+    ]
+    const add = (field, op, value) => conditions.push(cf.makeCondition(field, op, value))
     if (!lib.access.systemAdmin())
         for (const field of ["fromPrivateOwnerUserId", "toPrivateOwnerUserId"])
-            query = query.condition(
-                cf.makeCondition(
-                    [cf.makeCondition(field, "is-null", null), cf.makeCondition(field, "equals", ec.user.userId)],
-                    "or"
-                )
-            )
+            conditions.push(any([cf.makeCondition(field, "is-null", null), cf.makeCondition(field, "equals", ec.user.userId)]))
     if (p.supplierPartyId)
-        query = query.condition(
-            cf.makeCondition(
-                [
-                    cf.makeCondition("fromPartyId", "equals", p.supplierPartyId),
-                    cf.makeCondition("toPartyId", "equals", p.supplierPartyId)
-                ],
-                "or"
-            )
+        conditions.push(
+            any([
+                cf.makeCondition("fromPartyId", "equals", p.supplierPartyId),
+                cf.makeCondition("toPartyId", "equals", p.supplierPartyId)
+            ])
         )
-    if (p.recordId || p.invoiceId) query = query.condition("invoiceId", p.recordId || p.invoiceId)
+    if (p.recordId || p.invoiceId) add("invoiceId", "equals", p.recordId || p.invoiceId)
     if (p.text)
-        query = query.condition(
-            cf.makeCondition(
+        conditions.push(
+            any(
                 ["invoiceId", "description", "referenceNumber"].map(field =>
                     cf.makeCondition(field, "like", "%" + p.text + "%").ignoreCase()
-                ),
-                "or"
+                )
             )
         )
-    if (p.statusId) query = query.condition("statusId", p.statusId)
-    if (p.invoiceTypeEnumId) query = query.condition("invoiceTypeEnumId", p.invoiceTypeEnumId)
-    if (p.currencyUomId) query = query.condition("currencyUomId", p.currencyUomId)
+    if (p.statusId) add("statusId", "equals", p.statusId)
+    if (p.invoiceTypeEnumId) add("invoiceTypeEnumId", "equals", p.invoiceTypeEnumId)
+    if (p.currencyUomId) add("currencyUomId", "equals", p.currencyUomId)
     for (const [input, field, op] of [
         ["fromDate", "invoiceDate", "greater-equals"],
         ["thruDate", "invoiceDate", "less"],
         ["dueFromDate", "dueDate", "greater-equals"],
         ["dueThruDate", "dueDate", "less"]
     ])
-        if (p[input]) query = query.condition(field, op, p[input])
+        if (p[input]) add(field, op, p[input])
     const queue = p.queue || "all"
     if (!queues.includes(queue)) denied("QUEUE_INVALID", "Unknown bills queue")
-    if (queue === "incoming") query = query.condition("statusId", "InvoiceIncoming")
-    else if (queue === "review") query = query.condition("statusId", "InvoiceReceived")
-    else if (queue === "held") query = query.condition("invoiceId", "in", heldInvoiceIds(organizationPartyId))
-    else if (queue === "credits") query = query.condition("invoiceTypeEnumId", "InvoiceCreditMemo")
+    const now = Number(ec.user.nowTimestamp)
+    if (queue === "incoming") add("statusId", "equals", "InvoiceIncoming")
+    else if (queue === "review") add("statusId", "equals", "InvoiceReceived")
+    else if (queue === "held") add("heldInvoiceId", "is-not-null", null)
+    else if (queue === "credits") add("invoiceTypeEnumId", "equals", "InvoiceCreditMemo")
     else if (queue === "expenses") {
-        query = query.condition("fromPartyTypeEnumId", "PtyPerson")
-        if (!p.statusId) query = query.condition("statusId", "in", ["InvoiceIncoming", "InvoiceReceived"])
+        add("fromPartyTypeEnumId", "equals", "PtyPerson")
+        if (!p.statusId) add("statusId", "in", ["InvoiceIncoming", "InvoiceReceived"])
+    } else if (["approved", "due", "overdue"].includes(queue)) {
+        add("statusId", "equals", "InvoiceApproved")
+        add("unpaidTotal", "greater", 0)
+        if (queue === "due") add("dueDate", "less", new Date(now + 7 * dayMs))
+        if (queue === "overdue") add("dueDate", "less", new Date(now))
     }
-    else if (["approved", "due"].includes(queue)) {
-        query = query.condition("statusId", "InvoiceApproved").condition("unpaidTotal", "greater", 0)
-        if (queue === "due") query = query.condition("dueDate", "less", new Date(Number(ec.user.nowTimestamp) + 7 * dayMs))
-    }
-    return {query, organizationPartyId}
-}
-// The bills of the organization with an open hold, at most 1000.
-function heldInvoiceIds(organizationPartyId) {
-    const ids = Array.from(
-        find("mantle.account.invoice.InvoiceHoldDetail", {toPartyId: organizationPartyId})
-            .condition("releasedDate", "is-null", null)
-            .selectField("invoiceId")
-            .distinct(true)
-            .limit(1000)
-            .list()
-    ).map(row => row.invoiceId)
-    return ids.length ? ids : ["_NONE_"]
+    const condition = all(conditions)
+    return {find: () => find("mantle.account.invoice.InvoiceFinance").condition(condition), organizationPartyId}
 }
 function statusNames(ids) {
     const wanted = [...new Set(ids.filter(Boolean))]
@@ -135,8 +117,8 @@ function payableRows(records) {
     )
 }
 function payables(p) {
-    const {query} = payableQuery(p)
-    const result = lib.page(query.orderBy("-invoiceDate,invoiceId"), p, "records", payableQuery(p).query.count())
+    const query = payableQuery(p)
+    const result = lib.page(query.find().orderBy("-invoiceDate,invoiceId"), p, "records", query.find().count())
     result.rows = payableRows(result.rows)
     result.records = result.rows
     return result
@@ -149,27 +131,35 @@ function supplier(partyId) {
         denied("SUPPLIER_UNAVAILABLE", "Choose an available supplier")
     return party
 }
-// The self-billed draft of a receipt: the open bill its shipment's receipts were billed on.
-function selfBilledDraft(organizationPartyId, supplierPartyId, shipmentId) {
+// The bill of a receipt (a self-billed draft, or a bill made from it later): the first bill, not cancelled, that its
+// receipts or shipment lines were billed on.
+function receiptBill(organizationPartyId, supplierPartyId, shipmentId) {
     const shipment = one("mantle.shipment.Shipment", {shipmentId})
     if (!shipment || shipment.toPartyId !== organizationPartyId || shipment.fromPartyId !== supplierPartyId)
         denied("SHIPMENT_INVALID", "Choose a receipt from this supplier to this organization")
-    const ids = [
-        ...new Set(
-            Array.from(
-                find("mantle.shipment.ShipmentItemSource", {shipmentId}).condition("invoiceId", "is-not-null", null).list()
-            ).map(row => row.invoiceId)
-        )
-    ]
+    const billed = source =>
+        Array.from(find(source, {shipmentId}).condition("invoiceId", "is-not-null", null).list()).map(row => row.invoiceId)
+    const ids = [...new Set([...billed("mantle.shipment.ShipmentItemSource"), ...billed("mantle.product.receipt.AssetReceipt")])]
     if (!ids.length) return null
     return Array.from(
         find(I)
             .condition("invoiceId", "in", ids)
             .condition("toPartyId", organizationPartyId)
-            .condition("statusId", "in", ["InvoiceIncoming", "InvoiceReceived"])
+            .condition("statusId", "not-equals", "InvoiceCancelled")
             .orderBy("invoiceId")
             .list()
     )[0]
+}
+// A supplier's reference already on another bill of the organization refuses, naming that bill.
+function requireNewReference(organizationPartyId, supplierPartyId, reference, exceptInvoiceId = null) {
+    let query = find(I, {toPartyId: organizationPartyId, fromPartyId: supplierPartyId, referenceNumber: reference}).condition(
+        "statusId",
+        "not-equals",
+        "InvoiceCancelled"
+    )
+    if (exceptInvoiceId) query = query.condition("invoiceId", "not-equals", exceptInvoiceId)
+    const earlier = Array.from(query.orderBy("invoiceId").list())[0]
+    if (earlier) denied("BILL_DUPLICATE", "Bill " + reference + " from this supplier is already recorded as " + earlier.invoiceId)
 }
 function attach(invoiceId, p) {
     if (!p.contentFile) return null
@@ -181,8 +171,10 @@ function attach(invoiceId, p) {
         userId: ec.user.userId
     }).invoiceContentId
 }
-// import#Bill: a supplier's bill, keyed by organization, supplier and the supplier's reference; a repeat is refused and the
-// earlier bill named. For a receipt with a self-billed draft the file is attached to that draft instead.
+// import#Bill: a supplier's bill, keyed by organization, supplier and the supplier's reference, or for a receipt
+// (shipmentId) by the receipt's bill; a repeat is refused and the earlier bill named. The supplier's bill for a receipt
+// already billed as a draft (self-billed) is attached to that draft, which takes the supplier's reference; once the draft
+// has a reference, or is no longer a draft, another upload for the receipt is refused.
 function importBill(p) {
     lib.requirePermission("PAYABLE_IMPORT")
     const organizationPartyId = lib.organization(p.organizationPartyId, null, true)
@@ -197,24 +189,20 @@ function importBill(p) {
     }
     const operation = p.operationKey ? lib.operation(p, "BillImport", organizationPartyId, request, false) : null
     if (operation?.old) return lib.previous(operation)
+    if (!reference) denied("REFERENCE_REQUIRED", "Enter the supplier's bill reference")
     let result = null
     if (p.shipmentId) {
-        const draft = selfBilledDraft(organizationPartyId, p.supplierPartyId, p.shipmentId)
-        if (draft) {
-            if (reference && !draft.referenceNumber) call("update#" + I, {invoiceId: draft.invoiceId, referenceNumber: reference})
-            result = {invoiceId: draft.invoiceId, attached: true, invoiceContentId: attach(draft.invoiceId, p)}
+        const bill = receiptBill(organizationPartyId, p.supplierPartyId, p.shipmentId)
+        if (bill) {
+            if (!["InvoiceIncoming", "InvoiceReceived"].includes(bill.statusId) || bill.referenceNumber)
+                denied("BILL_DUPLICATE", "The bill of this receipt is already recorded as " + bill.invoiceId)
+            requireNewReference(organizationPartyId, p.supplierPartyId, reference, bill.invoiceId)
+            call("update#" + I, {invoiceId: bill.invoiceId, referenceNumber: reference})
+            result = {invoiceId: bill.invoiceId, attached: true, invoiceContentId: attach(bill.invoiceId, p)}
         }
     }
     if (!result) {
-        if (!reference) denied("REFERENCE_REQUIRED", "Enter the supplier's bill reference")
-        const earlier = Array.from(
-            find(I, {toPartyId: organizationPartyId, fromPartyId: p.supplierPartyId, referenceNumber: reference})
-                .condition("statusId", "not-equals", "InvoiceCancelled")
-                .orderBy("invoiceId")
-                .list()
-        )[0]
-        if (earlier)
-            denied("BILL_DUPLICATE", "Bill " + reference + " from this supplier is already recorded as " + earlier.invoiceId)
+        requireNewReference(organizationPartyId, p.supplierPartyId, reference)
         if (p.orderId) {
             const part = one("mantle.order.OrderPart", {orderId: p.orderId, orderPartSeqId: p.orderPartSeqId || "01"})
             if (!part || part.customerPartyId !== organizationPartyId || part.vendorPartyId !== p.supplierPartyId)
@@ -245,8 +233,9 @@ function importBill(p) {
 
 // create#InvoiceFromSource: the bill of a purchase order part (or the invoice of a sales order part) on the ordered basis
 // (create#EntireOrderPartInvoice) or, for a purchase, the received basis (create#PurchaseShipmentInvoices with
-// acceptedOnly). The order's payments are marked for the invoice, so they apply when it is approved. A second invoice of
-// the same source is refused and the first named.
+// acceptedOnly), each delivered receipt once. The order's payments are marked for the invoice, so they apply when it is
+// approved. A second invoice of the same source is refused and the first named; a retry with the same operationKey
+// answers the first result.
 function invoiceFromSource(p) {
     const part = one("mantle.order.OrderPart", {orderId: p.orderId, orderPartSeqId: p.orderPartSeqId || "01"})
     const header = part && one("mantle.order.OrderHeader", {orderId: p.orderId})
@@ -263,42 +252,69 @@ function invoiceFromSource(p) {
     const basis = p.basis || "ordered"
     if (!["ordered", "received"].includes(basis)) denied("SOURCE_BASIS_INVALID", "Choose the ordered or the received basis")
     if (basis === "received" && !payable) denied("SOURCE_BASIS_INVALID", "Only a purchase is billed on its receipts")
-    const sourceKey = ["source", p.orderId, part.orderPartSeqId, basis, p.shipmentId || ""].join(":")
-    const earlier = Array.from(
-        find(I, {workflowSourceKey: sourceKey}).condition("statusId", "not-equals", "InvoiceCancelled").list()
-    )[0]
-    if (earlier) denied("SOURCE_ALREADY_INVOICED", "This source is already invoiced as " + earlier.invoiceId)
-    const operation = p.operationKey ? lib.operation(p, "InvoiceFromSource", organizationPartyId, {sourceKey}, false) : null
+    const operation = p.operationKey
+        ? lib.operation(
+              p,
+              "InvoiceFromSource",
+              organizationPartyId,
+              {
+                  orderId: p.orderId,
+                  orderPartSeqId: part.orderPartSeqId,
+                  basis,
+                  shipmentId: p.shipmentId || null
+              },
+              false
+          )
+        : null
     if (operation?.old) return lib.previous(operation)
     const invoiceDate = p.invoiceDate || ec.user.nowTimestamp
+    const sourceKey = shipmentId => ["source", p.orderId, part.orderPartSeqId, basis, shipmentId || ""].join(":")
     let invoiceIdList = []
     if (basis === "ordered") {
+        const earlier = Array.from(
+            find(I, {workflowSourceKey: sourceKey(null)})
+                .condition("statusId", "not-equals", "InvoiceCancelled")
+                .list()
+        )[0]
+        if (earlier) denied("SOURCE_ALREADY_INVOICED", "This source is already invoiced as " + earlier.invoiceId)
         if (!unbilledItems(p.orderId, part.orderPartSeqId))
             denied("NOTHING_TO_BILL", "Every line of this order is already invoiced")
-        invoiceIdList = [
-            call("mantle.account.InvoiceServices.create#EntireOrderPartInvoice", {
-                orderId: p.orderId,
-                orderPartSeqId: part.orderPartSeqId,
-                invoiceDate
-            }).invoiceId
-        ]
+        const invoiceId = call("mantle.account.InvoiceServices.create#EntireOrderPartInvoice", {
+            orderId: p.orderId,
+            orderPartSeqId: part.orderPartSeqId,
+            invoiceDate
+        }).invoiceId
+        call("update#" + I, {invoiceId, workflowSourceKey: sourceKey(null)})
+        invoiceIdList = [invoiceId]
     } else {
+        // each delivered receipt of the order is billed once, on its accepted quantity: a receipt already billed is
+        // skipped (named when it is the one given), so each new delivery can be billed
         const shipmentIds = p.shipmentId ? [p.shipmentId] : deliveredShipments(p.orderId)
+        let billedAs = null
         for (const shipmentId of shipmentIds) {
             const shipment = one("mantle.shipment.Shipment", {shipmentId})
             if (!shipment || shipment.toPartyId !== organizationPartyId || shipment.statusId !== "ShipDelivered")
                 denied("SHIPMENT_INVALID", "Choose a delivered receipt of this order")
+            const receipts = rows("mantle.product.receipt.AssetReceipt", {shipmentId, orderId: p.orderId})
+            const unbilled = receipts.filter(row => !row.invoiceId && toDecimal(row.quantityAccepted ?? 0).compare(0) > 0)
+            if (!unbilled.length) {
+                billedAs = billedAs || receipts.find(row => row.invoiceId)?.invoiceId || null
+                continue
+            }
             const made = call("mantle.account.InvoiceServices.create#PurchaseShipmentInvoices", {
                 shipmentId,
                 invoiceDate,
                 acceptedOnly: true
             })
-            invoiceIdList.push(...Array.from(made.invoiceIdList || []))
+            for (const invoiceId of Array.from(made.invoiceIdList || [])) {
+                call("update#" + I, {invoiceId, workflowSourceKey: sourceKey(shipmentId)})
+                invoiceIdList.push(invoiceId)
+            }
         }
-        invoiceIdList = invoiceIdList.filter(invoiceId => find("mantle.account.invoice.InvoiceItem", {invoiceId}).count() > 0)
+        if (!invoiceIdList.length && billedAs)
+            denied("SOURCE_ALREADY_INVOICED", "The accepted receipts of this order are already billed, as " + billedAs)
         if (!invoiceIdList.length) denied("NOTHING_TO_BILL", "No accepted receipt of this order is left to bill")
     }
-    for (const invoiceId of invoiceIdList) call("update#" + I, {invoiceId, workflowSourceKey: sourceKey})
     const result = {invoiceId: invoiceIdList[0], invoiceIdList}
     if (operation) lib.complete(operation, I, result.invoiceId, result)
     return result
@@ -414,7 +430,85 @@ function supplierSummary(p) {
     return {summaryRows: Object.values(byCurrency), incomplete: bills.length > 500}
 }
 
-const operations = {payables, importBill, invoiceFromSource, holds, supplierSummary}
+// The users of an organization who hold a permission: members of a group that is granted it, in effect, whose party is
+// an agent, employee or member of the organization. The approval notifications go to them, not to every subscriber.
+function organizationUsers(permission, organizationPartyId) {
+    const groupIds = rows("moqui.security.UserGroupPermission", {userPermissionId: permission})
+        .filter(row => lib.policy.lib.active(row))
+        .map(row => row.userGroupId)
+    if (!groupIds.length) return []
+    const userIds = [
+        ...new Set(
+            Array.from(find("moqui.security.UserGroupMember").condition("userGroupId", "in", groupIds).list())
+                .filter(row => lib.policy.lib.active(row))
+                .map(row => row.userId)
+        )
+    ]
+    if (!userIds.length) return []
+    const accounts = Array.from(find("moqui.security.UserAccount").condition("userId", "in", userIds).list()).filter(
+        row => row.partyId && row.userId !== ec.user.userId
+    )
+    if (!accounts.length) return []
+    const members = new Set(
+        Array.from(
+            find("mantle.party.PartyRelationship", {toPartyId: organizationPartyId})
+                .condition("relationshipTypeEnumId", "in", ["PrtAgent", "PrtEmployee", "PrtMember"])
+                .condition(
+                    "fromPartyId",
+                    "in",
+                    accounts.map(row => row.partyId)
+                )
+                .list()
+        )
+            .filter(row => lib.policy.lib.active(row))
+            .map(row => row.fromPartyId)
+    )
+    return accounts.filter(row => members.has(row.partyId)).map(row => row.userId)
+}
+// Send an approval notification about a bill to the organization's users who may decide it.
+function notify(p) {
+    const notification = ec
+        .makeNotificationMessage()
+        .topic(p.topic)
+        .message(p.message)
+        .record(I, p.invoiceId)
+        .actorUserId(ec.user.userId)
+        .userIds(organizationUsers(p.permission, p.organizationPartyId))
+    notification.send()
+    return {notificationMessageId: notification.getNotificationMessageId()}
+}
+// A decision clears its notifications: each recipient's copy of the topic's messages about the bill (about the hold, when
+// one is named) is marked read, so the Approvals lists empty.
+function clearNotices(p) {
+    const messages = rows("moqui.security.user.NotificationMessage", {
+        topic: p.topic,
+        recordEntityName: I,
+        recordId: p.invoiceId
+    }).filter(row => {
+        if (!p.invoiceHoldId) return true
+        try {
+            return JSON.parse(row.messageJson || "{}").invoiceHoldId === p.invoiceHoldId
+        } catch (error) {
+            ec.logger.warn("Notification " + row.notificationMessageId + " message is not JSON: " + error.message)
+            return false
+        }
+    })
+    let cleared = 0
+    for (const message of messages)
+        for (const user of rows("moqui.security.user.NotificationMessageUser", {
+            notificationMessageId: message.notificationMessageId
+        }).filter(row => !row.viewedDate)) {
+            call("update#moqui.security.user.NotificationMessageUser", {
+                notificationMessageId: user.notificationMessageId,
+                userId: user.userId,
+                viewedDate: ec.user.nowTimestamp
+            })
+            cleared++
+        }
+    return {cleared}
+}
+
+const operations = {payables, importBill, invoiceFromSource, holds, supplierSummary, notify, clearNotices}
 ;({
     execute: (op, parameters) => {
         if (!operations[op]) denied("OPERATION_UNKNOWN", "Unknown payables operation " + op)

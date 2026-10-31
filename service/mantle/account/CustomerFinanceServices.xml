@@ -25,9 +25,10 @@ along with this software (see the LICENSE.md file). If not, see
         </in-parameters>
     </service>
     <service verb="check" noun="CustomerScope" allow-remote="false">
-        <description>The customer of an organization the user works in: the permission given, a customer no other user keeps
-            private, and an invoice, order or current relationship between the two, or for a supplier its profile. Refuses
-            otherwise.</description>
+        <description>The customer of an organization the user works in, or with side supplier its supplier: the permission
+            given, a party no other user keeps private, and a relationship of that side (for a customer an invoice to it, a
+            credit from it, a sales order or a current relationship; for a supplier a bill from it, a purchase order or its
+            supplier profile). Refuses otherwise.</description>
         <implements service="mantle.account.CustomerFinanceServices.define#CustomerScope"/>
         <in-parameters><parameter name="permission"/></in-parameters>
         <out-parameters><parameter name="customer" type="Map"/></out-parameters>
@@ -39,42 +40,53 @@ along with this software (see the LICENSE.md file). If not, see
                 <field-map field-name="partyId" from="customerPartyId"/></entity-find-one>
             <if condition="party == null || (party.privateOwnerUserId &amp;&amp; party.privateOwnerUserId != ec.user.userId)">
                 <return error="true" message="CUSTOMER_UNAVAILABLE: Customer is not available"/></if>
+            <!-- the relationship of the side asked for: for a customer its sales (an invoice to it, a credit from it, a
+                sales order) or a current relationship; for a supplier its purchases (a bill from it, a purchase order) or
+                its supplier profile. The side's permission is checked by the caller with the side, so a side without its
+                relationship opens nothing. -->
+            <set field="supplierSide" from="side == 'supplier'"/>
+            <if condition="!['customer', 'supplier'].includes(side)">
+                <return error="true" message="SIDE_INVALID: Choose the customer or the supplier side"/></if>
             <entity-find-count entity-name="mantle.account.invoice.Invoice" count-field="invoiceCount" disable-authz="true">
                 <econditions combine="or">
-                    <econditions><econdition field-name="fromPartyId" from="organizationPartyId"/>
-                        <econdition field-name="toPartyId" from="customerPartyId"/></econditions>
-                    <econditions><econdition field-name="fromPartyId" from="customerPartyId"/>
-                        <econdition field-name="toPartyId" from="organizationPartyId"/></econditions>
+                    <econditions>
+                        <econdition field-name="fromPartyId" from="supplierSide ? customerPartyId : organizationPartyId"/>
+                        <econdition field-name="toPartyId" from="supplierSide ? organizationPartyId : customerPartyId"/>
+                    </econditions>
+                    <econditions>
+                        <econdition field-name="fromPartyId" from="supplierSide ? organizationPartyId : customerPartyId"/>
+                        <econdition field-name="toPartyId" from="supplierSide ? customerPartyId : organizationPartyId"/>
+                        <econdition field-name="invoiceTypeEnumId" value="InvoiceCreditMemo"/>
+                    </econditions>
                 </econditions>
             </entity-find-count>
             <entity-find-count entity-name="mantle.order.OrderPart" count-field="orderCount" disable-authz="true">
-                <econditions combine="or">
-                    <econditions><econdition field-name="vendorPartyId" from="organizationPartyId"/>
-                        <econdition field-name="customerPartyId"/></econditions>
-                    <econditions><econdition field-name="vendorPartyId" from="customerPartyId"/>
-                        <econdition field-name="customerPartyId" from="organizationPartyId"/></econditions>
-                </econditions>
+                <econdition field-name="vendorPartyId" from="supplierSide ? customerPartyId : organizationPartyId"/>
+                <econdition field-name="customerPartyId" from="supplierSide ? organizationPartyId : customerPartyId"/>
             </entity-find-count>
-            <entity-find-count entity-name="mantle.party.PartyRelationship" count-field="relationshipCount" disable-authz="true">
-                <date-filter/>
-                <econditions combine="or">
-                    <econditions><econdition field-name="fromPartyId" from="organizationPartyId"/>
-                        <econdition field-name="toPartyId" from="customerPartyId"/></econditions>
-                    <econditions><econdition field-name="fromPartyId" from="customerPartyId"/>
-                        <econdition field-name="toPartyId" from="organizationPartyId"/></econditions>
-                </econditions>
-            </entity-find-count>
+            <set field="relationshipCount" from="0"/>
             <set field="profileCount" from="0"/>
-            <if condition="side == 'supplier'">
+            <if condition="supplierSide"><then>
                 <entity-find-count entity-name="mantle.party.supplier.SupplierProfile" count-field="profileCount"
                         disable-authz="true">
                     <econdition field-name="organizationPartyId"/>
                     <econdition field-name="supplierPartyId" from="customerPartyId"/>
                 </entity-find-count>
-            </if>
+            </then><else>
+                <entity-find-count entity-name="mantle.party.PartyRelationship" count-field="relationshipCount"
+                        disable-authz="true">
+                    <date-filter/>
+                    <econditions combine="or">
+                        <econditions><econdition field-name="fromPartyId" from="organizationPartyId"/>
+                            <econdition field-name="toPartyId" from="customerPartyId"/></econditions>
+                        <econditions><econdition field-name="fromPartyId" from="customerPartyId"/>
+                            <econdition field-name="toPartyId" from="organizationPartyId"/></econditions>
+                    </econditions>
+                </entity-find-count>
+            </else></if>
             <if condition="!invoiceCount &amp;&amp; !orderCount &amp;&amp; !relationshipCount &amp;&amp; !profileCount">
-                <return error="true"
-                        message="CUSTOMER_SCOPE_INVALID: Customer has no business relationship with this organization"/></if>
+                <return error="true" message="${supplierSide ? 'SUPPLIER' : 'CUSTOMER'}_SCOPE_INVALID: The ${side} has no business
+                    relationship of that side with this organization"/></if>
             <set field="customer" from="{partyId:party.partyId, partyTypeEnumId:party.partyTypeEnumId,
                 organizationName:party.organizationName, firstName:party.firstName, middleName:party.middleName,
                 lastName:party.lastName}"/>

@@ -1073,7 +1073,7 @@ along with this software (see the LICENSE.md file). If not, see
                     <!-- create InvoiceItem -->
                     <!-- is prorate by quantity needed? -->
                     <service-call name="create#mantle.account.invoice.InvoiceItem"
-                            in-map="{invoiceId:invoiceId, invoiceItemSeqId:orderItem.orderItemSeqId,
+                            in-map="{invoiceId:invoiceId, costCenterId:orderItem.costCenterId, invoiceItemSeqId:orderItem.orderItemSeqId,
                                 parentItemSeqId:orderItem.parentItemSeqId, itemTypeEnumId:orderItem.itemTypeEnumId || 'ItemSales',
                                 amount:orderItem.unitAmount, description:orderItem.itemDescription, quantity:quantityNotBilled,
                                 quantityUomId:orderItem.quantityUomId, otherPartyProductId:orderItem.otherPartyProductId,
@@ -1241,7 +1241,7 @@ along with this software (see the LICENSE.md file). If not, see
                             <!-- should we make sure the total quantity on all AssetIssuance records matches the
                                 quantity on the ShipmentItemSource record? that should be handled when they are created... -->
                             <service-call name="create#mantle.account.invoice.InvoiceItem" out-map="iiOut"
-                                    in-map="{invoiceId:invoiceId, itemTypeEnumId:orderItem.itemTypeEnumId || 'ItemProduct',
+                                    in-map="{invoiceId:invoiceId, costCenterId:orderItem.costCenterId, itemTypeEnumId:orderItem.itemTypeEnumId || 'ItemProduct',
                                         amount:orderItem.unitAmount, description:orderItem.itemDescription,
                                         quantity:issuanceQuantityToBill, assetId:assetIssuance.assetId,
                                         quantityUomId:orderItem.quantityUomId, productId:orderItem.productId,
@@ -1304,7 +1304,7 @@ along with this software (see the LICENSE.md file). If not, see
                             <!-- should we make sure the total quantity on all AssetReceipt records matches the
                                 quantity on the ShipmentItemSource record? that should be handled when they are created... -->
                             <service-call name="create#mantle.account.invoice.InvoiceItem" out-map="iiOut"
-                                    in-map="{invoiceId:invoiceId, itemTypeEnumId:orderItem.itemTypeEnumId || 'ItemInventory',
+                                    in-map="{invoiceId:invoiceId, costCenterId:orderItem.costCenterId, itemTypeEnumId:orderItem.itemTypeEnumId || 'ItemInventory',
                                         amount:orderItem.unitAmount, description:orderItem.itemDescription,
                                         quantity:receiptQuantityToBill, assetId:assetReceipt.assetId,
                                         quantityUomId:orderItem.quantityUomId, productId:orderItem.productId,
@@ -1350,7 +1350,7 @@ along with this software (see the LICENSE.md file). If not, see
                     <if condition="quantityNotBilled.compare(0) &gt; 0">
                         <!-- NOTE: in this case we don't have an assetId -->
                         <service-call name="create#mantle.account.invoice.InvoiceItem" out-map="mainIiOut" out-map-add-to-existing="false"
-                                in-map="{invoiceId:invoiceId, itemTypeEnumId:orderItem.itemTypeEnumId || 'ItemProduct',
+                                in-map="{invoiceId:invoiceId, costCenterId:orderItem.costCenterId, itemTypeEnumId:orderItem.itemTypeEnumId || 'ItemProduct',
                                     amount:orderItem.unitAmount, description:orderItem.itemDescription,
                                     quantity:quantityNotBilled, quantityUomId:orderItem.quantityUomId,
                                     productId:orderItem.productId, otherPartyProductId:orderItem.otherPartyProductId,
@@ -1423,7 +1423,7 @@ along with this software (see the LICENSE.md file). If not, see
                             </else></if>
 
                             <service-call name="create#mantle.account.invoice.InvoiceItem" out-map="childIiOut"
-                                    in-map="{invoiceId:invoiceId, itemTypeEnumId:(childOrderItem.itemTypeEnumId || 'ItemSales'),
+                                    in-map="{invoiceId:invoiceId, costCenterId:childOrderItem.costCenterId, itemTypeEnumId:(childOrderItem.itemTypeEnumId || 'ItemSales'),
                                         parentItemSeqId:parentInvoiceItemSeqId, amount:childAmountToBill,
                                         productId:(childOrderItem.productId || orderItem.productId),
                                         description:childOrderItem.itemDescription, quantity:childQtyToBill,
@@ -1472,7 +1472,7 @@ along with this software (see the LICENSE.md file). If not, see
                         <set field="otherItemQty" from="toDecimal(otherOrderItem.quantity != null ? otherOrderItem.quantity : 1).multiply(toDecimal(otherOrderItem.selectedAmount ?? 0).isZero() ? 1 : otherOrderItem.selectedAmount)"/>
                         <!-- TODO is prorate by quantity needed? for example pro-rate order level shipping for partial shipment -->
                         <service-call name="create#mantle.account.invoice.InvoiceItem" out-map="iiOut"
-                                in-map="{invoiceId:invoiceId, itemTypeEnumId:otherOrderItem.itemTypeEnumId || 'ItemSales',
+                                in-map="{invoiceId:invoiceId, costCenterId:otherOrderItem.costCenterId, itemTypeEnumId:otherOrderItem.itemTypeEnumId || 'ItemSales',
                                     productId:otherOrderItem.productId,
                                     amount:otherOrderItem.unitAmount, description:otherOrderItem.itemDescription,
                                     quantity:otherItemQty, quantityUomId:otherOrderItem.quantityUomId}"/>
@@ -1532,7 +1532,7 @@ along with this software (see the LICENSE.md file). If not, see
                             </else></if>
 
                             <service-call name="create#mantle.account.invoice.InvoiceItem" out-map="childIiOut"
-                                    in-map="{invoiceId:invoiceId, itemTypeEnumId:(childOrderItem.itemTypeEnumId || 'ItemSales'),
+                                    in-map="{invoiceId:invoiceId, costCenterId:childOrderItem.costCenterId, itemTypeEnumId:(childOrderItem.itemTypeEnumId || 'ItemSales'),
                                         parentItemSeqId:parentInvoiceItemSeqId, amount:childAmountToBill,
                                         productId:(childOrderItem.productId || otherOrderItem.productId),
                                         description:childOrderItem.itemDescription, quantity:childQtyToBill,
@@ -1590,6 +1590,23 @@ along with this software (see the LICENSE.md file). If not, see
                 <set field="handleReceipts" from="true"/>
                 <service-call name="mantle.account.InvoiceServices.create#SalesShipmentInvoices" in-map="context" out-map="context"/>
                 <set field="invoiceIdList" from="Object.values(invoiceIdByOrderPartIdMap ?? {})"/>
+                <!-- accepted quantity only: a receipt with nothing accepted leaves no empty draft bill -->
+                <if condition="acceptedOnly">
+                    <iterate list="invoiceIdList" entry="madeInvoiceId">
+                        <entity-find-count entity-name="mantle.account.invoice.InvoiceItem" count-field="madeItemCount">
+                            <econdition field-name="invoiceId" from="madeInvoiceId"/></entity-find-count>
+                        <if condition="!madeItemCount">
+                            <entity-find entity-name="mantle.account.payment.Payment" list="markedPaymentList">
+                                <econdition field-name="forInvoiceId" from="madeInvoiceId"/></entity-find>
+                            <iterate list="markedPaymentList" entry="markedPayment">
+                                <service-call name="update#mantle.account.payment.Payment"
+                                        in-map="{paymentId:markedPayment.paymentId, forInvoiceId:null}"/></iterate>
+                            <service-call name="delete#mantle.account.invoice.Invoice" in-map="{invoiceId:madeInvoiceId}"/>
+                        </if>
+                    </iterate>
+                    <set field="invoiceIdList" from="invoiceIdList.filter((id) =&gt; ec.entity.find('mantle.account.invoice.Invoice')
+                        .condition('invoiceId', id).one() != null)"/>
+                </if>
             </if>
         </actions>
     </service>
@@ -4258,8 +4275,9 @@ along with this software (see the LICENSE.md file). If not, see
         <description>Take a supplier's bill into an organization: a draft bill (InvoiceIncoming, create#Invoice) with the
             supplier's reference, one line for the amount when given, and the file as its content. Keyed by organization,
             supplier and the supplier's reference: a second bill with the same reference is refused (BILL_DUPLICATE),
-            naming the first. For a receipt (shipmentId) of a self-billing supplier whose draft exists, the file is
-            attached to that draft instead (attached true). Needs PAYABLE_IMPORT in the organization, as AP intake and a
+            naming the first. For a receipt (shipmentId) billed as a draft with no supplier reference (a self-billed draft),
+            the file is attached to that draft, which takes the reference (attached true); a receipt whose bill has a
+            reference or is no longer a draft is refused (BILL_DUPLICATE, naming it). Needs PAYABLE_IMPORT in the organization, as AP intake and a
             buyer hold it; an order given must be the organization's from this supplier. The same operationKey and
             request answers the first result.</description>
         <in-parameters>
@@ -4325,7 +4343,7 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
     <service verb="request" noun="PayableApproval" allow-remote="false">
         <description>Send a reviewed bill for approval: an incoming bill with lines is received (change#InvoiceState) and
-            the BillApproval notification goes to the topic's subscribers. Refuses a receivable, a bill that is not
+            the BillApproval notification goes to the organization's users who may approve it (INVOICE_APPROVE). Refuses a receivable, a bill that is not
             incoming and a stale lastUpdatedStamp. Needs PAYABLE_EDIT in the organization.</description>
         <in-parameters>
             <parameter name="invoiceId" required="true"/>
@@ -4351,21 +4369,19 @@ along with this software (see the LICENSE.md file). If not, see
                     in-map="{invoiceId:invoiceId, organizationPartyId:scope.organizationPartyId, action:'receive',
                         lastUpdatedStamp:lastUpdatedStamp, changeReason:'Sent for approval'}"/>
             <set field="statusId" from="changed.statusId"/>
-            <set field="message" from="{invoiceId:invoiceId, organizationPartyId:scope.organizationPartyId,
-                amount:String(scope.record.invoiceTotal ?? 0), currencyUomId:scope.record.currencyUomId}"/>
-            <script><![CDATA[
-                const notification = ec.makeNotificationMessage().topic('BillApproval').message(message)
-                    .record('mantle.account.invoice.Invoice', invoiceId).actorUserId(ec.user.userId)
-                notification.send()
-                notificationMessageId = notification.getNotificationMessageId()
-            ]]></script>
+            <set field="payables" value="component://mr-mantle/service/mantle/account/Payables.js"/>
+            <set field="notified" from="ec.resource.script(payables).execute('notify', {topic:'BillApproval',
+                permission:'INVOICE_APPROVE', organizationPartyId:scope.organizationPartyId, invoiceId:invoiceId,
+                message:{invoiceId:invoiceId, organizationPartyId:scope.organizationPartyId,
+                    amount:String(scope.record.invoiceTotal ?? 0), currencyUomId:scope.record.currencyUomId}})"/>
+            <set field="notificationMessageId" from="notified.notificationMessageId"/>
         </actions>
     </service>
     <service verb="approve" noun="Payable" allow-remote="false">
         <description>Approve a bill: its posting day when given (accountingDate, a draft's book day in an open period),
             then change#InvoiceState's approval, which posts it and stamps the approver (self-approved when the approver
-            drafted it). Refuses a receivable, a bill on hold (INVOICE_HELD) and a stale lastUpdatedStamp. Needs
-            INVOICE_APPROVE in the organization.</description>
+            drafted it), and its BillApproval notifications marked read. Refuses a receivable, a bill on hold (INVOICE_HELD)
+            and a stale lastUpdatedStamp. Needs INVOICE_APPROVE in the organization.</description>
         <in-parameters>
             <parameter name="invoiceId" required="true"/>
             <parameter name="organizationPartyId"/>
@@ -4398,6 +4414,8 @@ along with this software (see the LICENSE.md file). If not, see
                         lastUpdatedStamp:lastUpdatedStamp, operationKey:operationKey, changeReason:changeReason}"/>
             <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="approved" disable-authz="true"/>
             <set field="statusId" from="approved.statusId"/>
+            <set field="payables" value="component://mr-mantle/service/mantle/account/Payables.js"/>
+            <script>ec.resource.script(payables).execute('clearNotices', {topic:'BillApproval', invoiceId:invoiceId})</script>
             <set field="isSelfApproved" from="approved.isSelfApproved"/>
             <set field="lastUpdatedStamp" from="approved.lastUpdatedStamp"/>
         </actions>
@@ -4440,7 +4458,7 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
     <service verb="request" noun="HoldRelease" allow-remote="false">
         <description>Ask for an open hold to be released: the request is recorded on the hold and the BillHoldRelease
-            notification goes to the topic's subscribers. Refuses a released hold. Needs PAYABLE_EDIT in the
+            notification goes to the organization's users who may release it (INVOICE_HOLD_RELEASE). Refuses a released hold. Needs PAYABLE_EDIT in the
             organization.</description>
         <in-parameters>
             <parameter name="invoiceHoldId" required="true"/>
@@ -4465,20 +4483,19 @@ along with this software (see the LICENSE.md file). If not, see
                     in-map="{invoiceHoldId:invoiceHoldId, releaseRequestedByUserId:ec.user.userId,
                         releaseRequestedDate:ec.user.nowTimestamp, releaseRequestNote:releaseRequestNote}"/>
             <set field="invoiceId" from="hold.invoiceId"/>
-            <set field="message" from="{invoiceId:invoiceId, invoiceHoldId:invoiceHoldId,
-                organizationPartyId:scope.organizationPartyId, note:releaseRequestNote}"/>
-            <script><![CDATA[
-                const notification = ec.makeNotificationMessage().topic('BillHoldRelease').message(message)
-                    .record('mantle.account.invoice.Invoice', invoiceId).actorUserId(ec.user.userId)
-                notification.send()
-                notificationMessageId = notification.getNotificationMessageId()
-            ]]></script>
+            <set field="payables" value="component://mr-mantle/service/mantle/account/Payables.js"/>
+            <set field="notified" from="ec.resource.script(payables).execute('notify', {topic:'BillHoldRelease',
+                permission:'INVOICE_HOLD_RELEASE', organizationPartyId:scope.organizationPartyId, invoiceId:invoiceId,
+                message:{invoiceId:invoiceId, invoiceHoldId:invoiceHoldId, organizationPartyId:scope.organizationPartyId,
+                    note:releaseRequestNote}})"/>
+            <set field="notificationMessageId" from="notified.notificationMessageId"/>
         </actions>
     </service>
     <service verb="release" noun="InvoiceHold" allow-remote="false">
-        <description>Release an open hold, recording who released it, when and why. Refuses the user who placed the hold
-            (HOLD_RELEASE_SELF), a released hold and a release without a reason. Needs INVOICE_HOLD_RELEASE in the
-            organization.</description>
+        <description>Release an open hold, recording who released it, when and why, and mark its BillHoldRelease
+            notifications read. When the last hold of an approved bill is released, the payments for it left unapplied
+            (PAYMENT_HELD) are applied (apply#InvoiceForPayments). Refuses the user who placed the hold (HOLD_RELEASE_SELF),
+            a released hold and a release without a reason. Needs INVOICE_HOLD_RELEASE in the organization.</description>
         <in-parameters>
             <parameter name="invoiceHoldId" required="true"/>
             <parameter name="organizationPartyId"/>
@@ -4507,6 +4524,16 @@ along with this software (see the LICENSE.md file). If not, see
             <service-call name="update#mantle.account.invoice.InvoiceHold" disable-authz="true"
                     in-map="{invoiceHoldId:invoiceHoldId, releasedByUserId:ec.user.userId, releasedDate:releasedDate,
                         releaseComment:releaseComment}"/>
+            <set field="payables" value="component://mr-mantle/service/mantle/account/Payables.js"/>
+            <script>ec.resource.script(payables).execute('clearNotices', {topic:'BillHoldRelease', invoiceId:invoiceId,
+                invoiceHoldId:invoiceHoldId})</script>
+            <!-- the last hold of an approved bill released: the payments left unapplied while it was held apply now -->
+            <entity-find-count entity-name="mantle.account.invoice.InvoiceHold" count-field="stillOpenCount"
+                    disable-authz="true">
+                <econdition field-name="invoiceId"/><econdition field-name="releasedDate" from="null"/></entity-find-count>
+            <if condition="!stillOpenCount &amp;&amp; scope.record.statusId == 'InvoiceApproved'">
+                <service-call name="mantle.account.PaymentServices.apply#InvoiceForPayments" in-map="{invoiceId:invoiceId}"
+                        disable-authz="true"/></if>
         </actions>
     </service>
     <service verb="get" noun="InvoiceHolds" allow-remote="false">
