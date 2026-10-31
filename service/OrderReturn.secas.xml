@@ -65,28 +65,47 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </seca>
 
-    <!-- Return processing on approval -->
+    <!-- Return processing on approval. With the organization's PartyAcctgPreference.returnSettlementRequired (D11) it
+        only creates the return shipment: responses come from settle#Return. -->
     <seca id="ReturnApprovedProcess" service="update#mantle.order.return.ReturnHeader" when="post-service">
         <condition><expression>statusChanged &amp;&amp; statusId == 'ReturnApproved'</expression></condition>
         <actions>
             <!-- Create Return Shipment on Approved -->
             <service-call name="mantle.order.ReturnServices.create#ReturnShipment" in-map="context"/>
             <!-- On ReturnHeader Approved process#ReturnItemResponses, for those with responseImmediate=Y -->
-            <service-call name="mantle.order.ReturnServices.process#ReturnItemResponses" in-map="context"/>
+            <service-call name="mantle.order.ReturnServices.get#ReturnSettlementMode" out-map="settlementMode"
+                    in-map="{returnId:returnId}"/>
+            <if condition="!settlementMode.settlementRequired">
+                <service-call name="mantle.order.ReturnServices.process#ReturnItemResponses" in-map="context"/></if>
         </actions>
     </seca>
 
-    <!-- Receive ReturnItems when Return Shipment Delivered (statusId=ShipDelivered, shipmentTypeEnumId=ShpTpSalesReturn) -->
+    <!-- Receive ReturnItems when Return Shipment Delivered (statusId=ShipDelivered, shipmentTypeEnumId=ShpTpSalesReturn);
+        for an organization with returnSettlementRequired, its received quantities only (sync#ReturnShipmentReceipts) -->
     <seca id="ShipmentDeliveredReturnReceive" service="update#mantle.shipment.Shipment" when="post-service">
         <condition><expression>statusChanged &amp;&amp; statusId == 'ShipDelivered'</expression></condition>
-        <actions><service-call name="mantle.order.ReturnServices.receive#ReturnShipmentItems" in-map="context"/></actions>
+        <actions>
+            <service-call name="mantle.order.ReturnServices.get#ReturnSettlementMode" out-map="settlementMode"
+                    in-map="{shipmentId:shipmentId}"/>
+            <if condition="!settlementMode.settlementRequired"><then>
+                <service-call name="mantle.order.ReturnServices.receive#ReturnShipmentItems" in-map="context"/>
+            </then><else-if condition="settlementMode.returnId">
+                <service-call name="mantle.order.ReturnServices.sync#ReturnShipmentReceipts" in-map="{shipmentId:shipmentId}"/>
+            </else-if></if>
+        </actions>
     </seca>
 
     <!-- On ReturnHeader Received process#ReturnItemResponses, all responses not yet processed;
-        consolidates responses as possible (especially for check refunds, replacement orders) -->
+        consolidates responses as possible (especially for check refunds, replacement orders); not with
+        returnSettlementRequired, where settle#Return responds -->
     <seca id="ReturnReceivedProcess" service="update#mantle.order.return.ReturnHeader" when="post-service">
         <condition><expression>statusChanged &amp;&amp; statusId == 'ReturnReceived'</expression></condition>
-        <actions><service-call name="mantle.order.ReturnServices.process#ReturnItemResponses" in-map="context"/></actions>
+        <actions>
+            <service-call name="mantle.order.ReturnServices.get#ReturnSettlementMode" out-map="settlementMode"
+                    in-map="{returnId:returnId}"/>
+            <if condition="!settlementMode.settlementRequired">
+                <service-call name="mantle.order.ReturnServices.process#ReturnItemResponses" in-map="context"/></if>
+        </actions>
     </seca>
     <!-- On ReturnItem Received process#ReturnItemResponses, all responses not yet processed;
         more immediate response, but no consolidation (which is nice for check refunds, replacement orders)

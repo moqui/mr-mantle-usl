@@ -5100,4 +5100,74 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="alreadyCreated" from="false"/>
         </actions>
     </service>
+    <service verb="refund" noun="OrderPayment" allow-remote="false">
+        <description>Refund a captured order payment that an order change between pack and ship no longer needs (D3):
+            through create#RefundPayment, so the refund is linked to the original and limited to what is left of it, and
+            through the original's gateway with refund#SinglePayment when it has one (a refund the gateway leaves pending
+            stays promised: resultCode REFUND_PENDING); without a gateway the refund is delivered now. Refuses a payment
+            that is not a customer's payment to the organization for an order, one not captured, and more than is unapplied
+            and not refunded (get#PaymentRefundSummary). Needs PAYMENT_EDIT in the organization. The same operationKey and
+            request answers the first result.</description>
+        <in-parameters>
+            <parameter name="paymentId" required="true"/>
+            <parameter name="amount" type="BigDecimal" required="true"/>
+            <parameter name="reason" required="true"/>
+            <parameter name="operationKey" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="refundPaymentId"/>
+            <parameter name="statusId"/>
+            <parameter name="resultCode"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="invoiceLib"
+                    from="ec.resource.script('component://mr-mantle/service/mantle/account/InvoiceWorkflowLib.js')"/>
+            <entity-find-one entity-name="mantle.account.payment.Payment" value-field="payment" disable-authz="true"/>
+            <if condition="payment == null || !payment.orderId">
+                <return error="true" message="ORDER_PAYMENT_REQUIRED: Payment ${paymentId} is not an order's payment"/></if>
+            <script>invoiceLib.organization(payment.toPartyId, 'PAYMENT_EDIT', true)</script>
+            <set field="refundOperation" from="invoiceLib.entityLib.operation(context, 'OrderPaymentRefund', payment.toPartyId,
+                {paymentId:paymentId, amount:String(amount), reason:reason})"/>
+            <if condition="refundOperation.old">
+                <set field="earlier" from="invoiceLib.previous(refundOperation)"/>
+                <set field="refundPaymentId" from="earlier.refundPaymentId"/>
+                <set field="statusId" from="earlier.statusId"/>
+                <set field="resultCode" from="earlier.resultCode"/>
+                <set field="alreadyApplied" from="true"/>
+                <return/>
+            </if>
+            <entity-find-one entity-name="mantle.account.payment.Payment" value-field="payment" for-update="true"
+                    disable-authz="true"/>
+            <if condition="payment.refundForPaymentId || payment.paymentTypeEnumId == 'PtRefund'">
+                <return error="true" message="ORDER_PAYMENT_REQUIRED: Payment ${paymentId} is itself a refund"/></if>
+            <service-call name="mantle.account.PaymentServices.get#PaymentRefundSummary" out-map="refundSummaryOut"
+                    in-map="{paymentId:paymentId, organizationPartyId:payment.toPartyId}"/>
+            <if condition="!refundSummaryOut.canRefund">
+                <return error="true" message="${refundSummaryOut.reasonCode}: Payment ${paymentId} cannot be refunded now"/></if>
+            <set field="amount" from="invoiceLib.amount(amount, payment.amountUomId)"/>
+            <if condition="amount.compare(refundSummaryOut.refundSummary.refundableAmount) &gt; 0">
+                <return error="true"
+                        message="REFUND_AMOUNT_INVALID: Refund at most ${refundSummaryOut.refundSummary.refundableAmount}"/>
+            </if>
+            <if condition="payment.paymentGatewayConfigId"><then>
+                <service-call name="mantle.account.PaymentServices.create#RefundPayment" out-map="refundOut"
+                        in-map="{paymentId:paymentId, amount:amount, statusId:'PmntPromised', comments:reason}"/>
+                <set field="refundPaymentId" from="refundOut.paymentId"/>
+                <service-call name="mantle.account.PaymentServices.refund#SinglePayment"
+                        in-map="{paymentId:paymentId, refundPaymentId:refundPaymentId, operationKey:operationKey}"/>
+            </then><else>
+                <service-call name="mantle.account.PaymentServices.create#RefundPayment" out-map="refundOut"
+                        in-map="{paymentId:paymentId, amount:amount, statusId:'PmntDelivered', comments:reason}"/>
+                <set field="refundPaymentId" from="refundOut.paymentId"/>
+            </else></if>
+            <entity-find-one entity-name="mantle.account.payment.Payment" value-field="refundPayment" disable-authz="true">
+                <field-map field-name="paymentId" from="refundPaymentId"/></entity-find-one>
+            <set field="statusId" from="refundPayment.statusId"/>
+            <set field="resultCode" from="['PmntDelivered', 'PmntConfirmed'].includes(statusId) ? 'REFUNDED' : 'REFUND_PENDING'"/>
+            <set field="alreadyApplied" from="false"/>
+            <script>invoiceLib.complete(refundOperation, 'mantle.account.payment.Payment', refundPaymentId,
+                {refundPaymentId:refundPaymentId, statusId:statusId, resultCode:resultCode})</script>
+        </actions>
+    </service>
 </services>

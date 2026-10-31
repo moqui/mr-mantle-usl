@@ -4579,6 +4579,181 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="payableCapabilities" from="read.payableCapabilities"/>
         </actions>
     </service>
+    <!-- The sales invoice between pack and ship (D3, behind PartyAcctgPreference.salesInvoiceFinalizedAtShip): the pack
+        SECA leaves it in process, the ship SECA finalizes it, and a package reopened before ship takes its lines off. -->
+    <service verb="finalize" noun="ShipmentInvoices" allow-remote="false">
+        <description>Finalize the shipment's sales invoices still in process, as create#SalesShipmentInvoices does at pack
+            without the flag, dated the ship day (invoice date, book day and due date): each moves to InvoiceFinalized
+            (whose SECAs post it, apply the payments that name it and send
+            it), and the order parts' captured payments are applied (apply#OrderPaymentsToInvoice). Run by the
+            ShipmentShippedFinalizeInvoices SECA.</description>
+        <in-parameters><parameter name="shipmentId" required="true"/></in-parameters>
+        <out-parameters><parameter name="invoiceIdList" type="List"/></out-parameters>
+        <actions>
+            <entity-find entity-name="mantle.order.OrderItemBilling" list="shipmentBillingList" disable-authz="true">
+                <econdition field-name="shipmentId"/>
+                <order-by field-name="invoiceId"/>
+            </entity-find>
+            <set field="invoiceIdList" from="[]"/>
+            <set field="orderPartsByInvoice" from="{}"/>
+            <set field="shipDate" from="ec.user.nowTimestamp"/>
+            <entity-find-one entity-name="mantle.shipment.Shipment" value-field="shipment" disable-authz="true"/>
+            <iterate list="shipmentBillingList" entry="billing">
+                <entity-find-one entity-name="mantle.order.OrderItem" value-field="billedOrderItem" disable-authz="true">
+                    <field-map field-name="orderId" from="billing.orderId"/>
+                    <field-map field-name="orderItemSeqId" from="billing.orderItemSeqId"/>
+                </entity-find-one>
+                <script>(orderPartsByInvoice[billing.invoiceId] ??= new Set()).add(billing.orderId + ':' +
+                    billedOrderItem?.orderPartSeqId)</script>
+            </iterate>
+            <iterate list="Object.keys(orderPartsByInvoice)" entry="invoiceId">
+                <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice" for-update="true"
+                        disable-authz="true"/>
+                <!-- the shipper's sales invoices still in process: a pack invoice -->
+                <if condition="invoice?.statusId != 'InvoiceInProcess' || invoice.invoiceTypeEnumId != 'InvoiceSales' ||
+                        invoice.fromPartyId != shipment.fromPartyId"><continue/></if>
+                <!-- dated the ship day, so revenue, receivable and the due date come at shipment, not at pack -->
+                <service-call name="update#mantle.account.invoice.Invoice" disable-authz="true"
+                        in-map="{invoiceId:invoiceId, invoiceDate:shipDate,
+                            accountingDate:ec.l10n.format(shipDate, 'yyyy-MM-dd')}"/>
+                <service-call name="mantle.account.InvoiceServices.checkSet#InvoiceDueDate" disable-authz="true"
+                        in-map="{invoiceId:invoiceId, overrideExisting:true}"/>
+                <service-call name="update#mantle.account.invoice.Invoice"
+                        in-map="{invoiceId:invoiceId, statusId:'InvoiceFinalized'}"/>
+                <iterate list="Array.from(orderPartsByInvoice[invoiceId])" entry="orderPartKey">
+                    <service-call name="mantle.account.PaymentServices.apply#OrderPaymentsToInvoice"
+                            in-map="{orderId:orderPartKey.split(':')[0], orderPartSeqId:orderPartKey.split(':')[1],
+                                invoiceId:invoiceId}"/>
+                </iterate>
+                <script>invoiceIdList.push(invoiceId)</script>
+            </iterate>
+        </actions>
+    </service>
+    <service verb="release" noun="ShipmentDraftInvoice" allow-remote="false">
+        <description>Take a packed shipment's lines off its sales invoice before it ships, for a reopened package or an
+            order change (D3): the invoice lines billed for the shipment and their billing links (OrderItemBilling) are
+            removed, the shipment's sources and issuances no longer name the invoice, and an invoice left with no line is
+            cancelled, so packing again bills the shipment again. Captured payments stay unapplied
+            (PaymentServices.refund#OrderPayment refunds one when the change reduces the order). Refuses a shipment that
+            shipped (SHIPMENT_SHIPPED: after ship a change is a return or a credit memo) and an invoice no longer in
+            process (INVOICE_FINALIZED). Needs RECEIVABLE_EDIT in the shipping organization. The same operationKey and
+            request answers the first result.</description>
+        <in-parameters>
+            <parameter name="shipmentId" required="true"/>
+            <parameter name="reason" required="true"/>
+            <parameter name="operationKey"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceIdList" type="List"/>
+            <parameter name="cancelledInvoiceIdList" type="List"/>
+            <parameter name="releasedItemCount" type="Integer"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="invoiceLib"
+                    from="ec.resource.script('component://mr-mantle/service/mantle/account/InvoiceWorkflowLib.js')"/>
+            <entity-find-one entity-name="mantle.shipment.Shipment" value-field="shipment" disable-authz="true"/>
+            <if condition="shipment == null">
+                <return error="true" message="SHIPMENT_UNAVAILABLE: Shipment ${shipmentId} is not available"/></if>
+            <script>invoiceLib.organization(shipment.fromPartyId, 'RECEIVABLE_EDIT', true)</script>
+            <set field="releaseOperation" from="operationKey ? invoiceLib.entityLib.operation(context,
+                'ShipmentInvoiceRelease', shipment.fromPartyId, {shipmentId:shipmentId, reason:reason}) : null"/>
+            <if condition="releaseOperation?.old">
+                <set field="earlier" from="invoiceLib.previous(releaseOperation)"/>
+                <set field="invoiceIdList" from="earlier.invoiceIdList"/>
+                <set field="cancelledInvoiceIdList" from="earlier.cancelledInvoiceIdList"/>
+                <set field="releasedItemCount" from="earlier.releasedItemCount"/>
+                <set field="alreadyApplied" from="true"/>
+                <return/>
+            </if>
+            <entity-find-one entity-name="mantle.shipment.Shipment" value-field="shipment" for-update="true"
+                    disable-authz="true"/>
+            <if condition="['ShipShipped', 'ShipDelivered'].includes(shipment.statusId)">
+                <return error="true"
+                        message="SHIPMENT_SHIPPED: Shipment ${shipmentId} has shipped; change it with a return or a credit memo"/>
+            </if>
+            <entity-find entity-name="mantle.order.OrderItemBilling" list="shipmentBillingList" disable-authz="true">
+                <econdition field-name="shipmentId"/>
+            </entity-find>
+            <set field="invoiceIdList" from="Array.from(new Set(Array.from(shipmentBillingList).map((row) =&gt; row.invoiceId)))
+                .sort()"/>
+            <iterate list="invoiceIdList" entry="invoiceId">
+                <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice" for-update="true"
+                        disable-authz="true"/>
+                <if condition="invoice.statusId != 'InvoiceInProcess'">
+                    <return error="true"
+                            message="INVOICE_FINALIZED: Invoice ${invoiceId} is not in process; correct it with a credit memo"/>
+                </if>
+            </iterate>
+            <!-- the calculated tax lines of a draft go first; it is taxed again when it is issued -->
+            <iterate list="invoiceIdList" entry="invoiceId">
+                <service-call name="mantle.other.TaxServices.calculate#InvoiceSalesTax" disable-authz="true"
+                        in-map="{invoiceId:invoiceId, clear:true}"/>
+            </iterate>
+            <!-- children first: a line with child lines cannot be deleted -->
+            <set field="lineKeys"
+                    from="Array.from(shipmentBillingList).map((row) =&gt; row.invoiceId + ':' + row.invoiceItemSeqId)"/>
+            <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="invoiceLineList" disable-authz="true">
+                <econdition field-name="invoiceId" operator="in" from="invoiceIdList"/>
+            </entity-find>
+            <set field="releasedLines" from="Array.from(invoiceLineList).filter((line) =&gt;
+                lineKeys.includes(line.invoiceId + ':' + line.invoiceItemSeqId) ||
+                lineKeys.includes(line.invoiceId + ':' + line.parentItemSeqId))
+                .sort((a, b) =&gt; (b.parentItemSeqId ? 1 : 0) - (a.parentItemSeqId ? 1 : 0))"/>
+            <iterate list="releasedLines" entry="line">
+                <entity-find entity-name="mantle.shipment.ShipmentItemSource" list="sourceList" for-update="true"
+                        disable-authz="true">
+                    <econdition field-name="invoiceId" from="line.invoiceId"/>
+                    <econdition field-name="invoiceItemSeqId" from="line.invoiceItemSeqId"/>
+                </entity-find>
+                <iterate list="sourceList" entry="source">
+                    <service-call name="update#mantle.shipment.ShipmentItemSource" disable-authz="true"
+                            in-map="{shipmentItemSourceId:source.shipmentItemSourceId, invoiceId:null, invoiceItemSeqId:null}"/>
+                </iterate>
+                <entity-find entity-name="mantle.product.issuance.AssetIssuance" list="issuanceList" for-update="true"
+                        disable-authz="true">
+                    <econdition field-name="invoiceId" from="line.invoiceId"/>
+                    <econdition field-name="invoiceItemSeqId" from="line.invoiceItemSeqId"/>
+                </entity-find>
+                <iterate list="issuanceList" entry="issuance">
+                    <service-call name="update#mantle.product.issuance.AssetIssuance" disable-authz="true"
+                            in-map="{assetIssuanceId:issuance.assetIssuanceId, invoiceId:null, invoiceItemSeqId:null}"/>
+                </iterate>
+                <service-call name="mantle.account.InvoiceServices.delete#InvoiceItem" disable-authz="true"
+                        in-map="{invoiceId:line.invoiceId, invoiceItemSeqId:line.invoiceItemSeqId}"/>
+            </iterate>
+            <set field="cancelledInvoiceIdList" from="[]"/>
+            <iterate list="invoiceIdList" entry="invoiceId">
+                <entity-find-count entity-name="mantle.account.invoice.InvoiceItem" count-field="lineCount"
+                        disable-authz="true">
+                    <econdition field-name="invoiceId"/>
+                </entity-find-count>
+                <if condition="lineCount == 0">
+                    <!-- the order's payments no longer wait for this invoice -->
+                    <entity-find entity-name="mantle.account.payment.Payment" list="waitingList" for-update="true"
+                            disable-authz="true">
+                        <econdition field-name="forInvoiceId" from="invoiceId"/>
+                    </entity-find>
+                    <iterate list="waitingList" entry="waiting">
+                        <service-call name="update#mantle.account.payment.Payment" disable-authz="true"
+                                in-map="{paymentId:waiting.paymentId, forInvoiceId:null}"/>
+                    </iterate>
+                    <service-call name="update#mantle.account.invoice.Invoice" disable-authz="true"
+                            in-map="{invoiceId:invoiceId, statusId:'InvoiceCancelled'}"/>
+                    <script>cancelledInvoiceIdList.push(invoiceId)</script>
+                </if>
+            </iterate>
+            <set field="releasedItemCount" from="releasedLines.length"/>
+            <set field="alreadyApplied" from="false"/>
+            <log level="info"
+                    message="Released ${releasedItemCount} lines of shipment ${shipmentId} from ${invoiceIdList}: ${reason}"/>
+            <if condition="releaseOperation">
+                <script>invoiceLib.complete(releaseOperation, 'mantle.shipment.Shipment', shipmentId,
+                    {invoiceIdList:invoiceIdList, cancelledInvoiceIdList:cancelledInvoiceIdList,
+                        releasedItemCount:releasedItemCount, reason:reason})</script>
+            </if>
+        </actions>
+    </service>
 
     <!-- ========== Payment terms: the due schedule (PaymentTerms.js) ========== -->
     <service verb="store" noun="InvoiceDueSchedule" allow-remote="false">

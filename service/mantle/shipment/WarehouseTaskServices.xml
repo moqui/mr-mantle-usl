@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<!-- Warehouse task entry points (design-warehouse §17 WH-RETURN). receive#ReturnItems is Warehouse's contract, built with
+    Accounting's return settlement (impl-accounting P17); Warehouse adds its other tasks here. -->
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="receive" noun="ReturnItems" allow-remote="false">
+        <description>Receive a customer return shipment's lines: for each return item the quantity that arrived, accepted
+            and rejected (quarantined) alike, received as stock (AssetReceipt) on the item's shipment source, added to
+            ReturnItem.receivedQuantity. It never changes returnQuantity and processes no response, so a second box, or
+            units rejected at the dock, can still be received and credited against the authorization by settle#Return.
+            An item reaches ReturnReceived (ReturnManResp for a manual response) when its received quantity equals the
+            authorized quantity, the return when every item is handled, and the shipment ShipDelivered when every source
+            is handled. Refuses more than was authorized (RECEIPT_EXCEEDS_RETURN), an item not on the shipment, a closed
+            item, a shipment that is not a customer return, and an organization that does not settle returns separately
+            (RETURN_SETTLEMENT_OFF: Mantle receives its returns when the shipment is delivered). Needs STOCK_RECEIVE in
+            the receiving organization.</description>
+        <in-parameters>
+            <parameter name="shipmentId" required="true"/>
+            <parameter name="facilityId"><description>Defaults to the shipment's destination facility.</description></parameter>
+            <parameter name="itemList" type="List" required="true"><description>Maps of returnId, returnItemSeqId,
+                quantityAccepted, quantityRejected, rejectionReasonEnumId and, for the stock, statusId (default
+                AstOnHold) and lotNumber.</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="receivedItems" type="List"><description>Each item's returnId, returnItemSeqId,
+                receivedQuantity, statusId and assetReceiptIds.</description></parameter>
+            <parameter name="shipmentDelivered" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/order/ReturnSettlement.js"/>
+            <set field="answer" from="ec.resource.script(module).execute('receive', context)"/>
+            <set field="receivedItems" from="answer.receivedItems"/>
+            <set field="shipmentDelivered" from="answer.shipmentDelivered"/>
+        </actions>
+    </service>
+</services>
