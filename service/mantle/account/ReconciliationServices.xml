@@ -666,7 +666,8 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="found" from="ec.resource.script(module).execute('bankLines', context)"/>
             <script>for (const field of ['lineRows', 'organizationPartyId', 'recordCount', 'pageIndex', 'pageSize',
                 'pageMaxIndex', 'pageRangeLow', 'pageRangeHigh', 'lineRowsCount', 'lineRowsPageIndex', 'lineRowsPageSize',
-                'lineRowsPageMaxIndex', 'lineRowsPageRangeLow', 'lineRowsPageRangeHigh']) context.put(field, found[field])</script>
+                'lineRowsPageMaxIndex', 'lineRowsPageRangeLow', 'lineRowsPageRangeHigh'])
+                context.put(field, found[field])</script>
         </actions>
     </service>
     <service verb="find" noun="BankLineCandidates" allow-remote="false">
@@ -845,8 +846,10 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="statementImport" from="Object.assign(found.getMap(), {rowsJson:null, warningsJson:null,
                     formatText:format?.description || found.formatEnumId, statusText:status?.description || found.statusId,
                     createdDateText:ec.l10n.format(found.createdDate, 'yyyy-MM-dd HH:mm'),
-                    statementFromDateText:found.statementFromDate ? calendar.calendarDateText(found.statementFromDate) : '',
-                    statementThruDateText:found.statementThruDate ? calendar.calendarDateText(found.statementThruDate) : '',
+                    statementFromDateText:found.statementFromDate
+                        ? calendar.calendarDateText(found.statementFromDate) : '',
+                    statementThruDateText:found.statementThruDate
+                        ? calendar.calendarDateText(found.statementThruDate) : '',
                     committedDateText:found.committedDate ? ec.l10n.format(found.committedDate, 'yyyy-MM-dd HH:mm') : ''})"/>
             <set field="statusTexts" from="{new:'New', duplicate:'Duplicate', rejected:'Rejected', failed:'Failed',
                     imported:'Imported'}"/>
