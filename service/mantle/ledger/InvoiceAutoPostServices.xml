@@ -97,8 +97,24 @@ along with this software (see the LICENSE.md file). If not, see
                 <if condition="itemTotal.isZero()"><continue/></if>
                 <set field="invoiceTotal" from="invoiceTotal.add(itemTotal)"/>
 
+<!-- the line's cost center, else its order line's (AC-22) -->
+                <set field="itemCostCenterId" from="invoiceItem.costCenterId"/>
+                <if condition="!itemCostCenterId">
+                    <entity-find entity-name="mantle.order.OrderItemBilling" list="costCenterBillings" limit="1">
+                        <econdition field-name="invoiceId" from="invoiceItem.invoiceId"/>
+                        <econdition field-name="invoiceItemSeqId" from="invoiceItem.invoiceItemSeqId"/>
+                    </entity-find>
+                    <if condition="costCenterBillings.length">
+                        <entity-find-one entity-name="mantle.order.OrderItem" value-field="costCenterOrderItem">
+                            <field-map field-name="orderId" from="costCenterBillings[0].orderId"/>
+                            <field-map field-name="orderItemSeqId" from="costCenterBillings[0].orderItemSeqId"/>
+                        </entity-find-one>
+                        <set field="itemCostCenterId" from="costCenterOrderItem?.costCenterId ?? null"/>
+                    </if>
+                </if>
                 <set field="entryCommonMap" from="{invoiceItemSeqId:invoiceItem.invoiceItemSeqId,
-                        productId:invoiceItem.productId, assetId:invoiceItem.assetId, description:invoiceItem.description}"/>
+                        productId:invoiceItem.productId, assetId:invoiceItem.assetId, description:invoiceItem.description,
+                        costCenterId:itemCostCenterId}"/>
 
                 <!-- entry for from Party (sales invoice) -->
                 <if condition="fromPartyAcctgPreference != null">
@@ -417,8 +433,23 @@ along with this software (see the LICENSE.md file). If not, see
             <if condition="itemTotal.isZero()"><return/></if>
             <set field="invoiceTotal" from="invoiceTotal.add(itemTotal)"/>
 
+<!-- the line's cost center, else its order line's (AC-22) -->
+            <set field="itemCostCenterId" from="invoiceItem.costCenterId"/>
+            <if condition="!itemCostCenterId">
+                <entity-find entity-name="mantle.order.OrderItemBilling" list="costCenterBillings" limit="1">
+                    <econdition field-name="invoiceId" from="invoiceItem.invoiceId"/>
+                    <econdition field-name="invoiceItemSeqId" from="invoiceItem.invoiceItemSeqId"/>
+                </entity-find>
+                <if condition="costCenterBillings.length">
+                    <entity-find-one entity-name="mantle.order.OrderItem" value-field="costCenterOrderItem">
+                        <field-map field-name="orderId" from="costCenterBillings[0].orderId"/>
+                        <field-map field-name="orderItemSeqId" from="costCenterBillings[0].orderItemSeqId"/>
+                    </entity-find-one>
+                    <set field="itemCostCenterId" from="costCenterOrderItem?.costCenterId ?? null"/>
+                </if>
+            </if>
             <set field="entryCommonMap" from="{invoiceItemSeqId:invoiceItem.invoiceItemSeqId,
-                    productId:invoiceItem.productId, assetId:invoiceItem.assetId}"/>
+                    productId:invoiceItem.productId, assetId:invoiceItem.assetId, costCenterId:itemCostCenterId}"/>
 
             <!-- entry for from Party (sales invoice) -->
             <if condition="fromPartyAcctgPreference">

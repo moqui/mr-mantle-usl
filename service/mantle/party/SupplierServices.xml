@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<!-- An organization's suppliers: the supplier profile (SupplierProfile, effective-dated) and a supplier's finance with the
+    organization. The finance fields are here; Purchasing adds the buyer fields under SUPPLIER_PROFILE_EDIT. -->
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="store" noun="SupplierProfile" allow-remote="false">
+        <description>Change an organization's profile of a supplier: the row in effect ends at fromDate (now by default) and
+            the next starts there with the fields given and the others carried over; nothing changes when nothing differs.
+            The finance fields, the default payment term of the supplier's bills (settlementTermId) and self-billing
+            (selfBillingIndicator, Y or N), need SUPPLIER_TERMS_EDIT in the organization. Refuses an unknown term, a
+            supplier another user keeps private and a start before the row in effect.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="supplierPartyId" required="true"/>
+            <parameter name="settlementTermId"/>
+            <parameter name="selfBillingIndicator"/>
+            <parameter name="fromDate" type="Timestamp"/>
+            <parameter name="changeReason"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="supplierProfileId"/>
+            <parameter name="changed" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="financeFields" from="['settlementTermId', 'selfBillingIndicator'].filter((field) => field in context)"/>
+            <if condition="!financeFields.length">
+                <return error="true" message="PROFILE_EMPTY: Give a supplier profile field to change"/></if>
+            <set field="workflow" value="component://mr-mantle/service/mantle/account/InvoiceWorkflow.js"/>
+            <script>ec.resource.script(workflow).execute('organization',
+                {organizationPartyId:organizationPartyId, permission:'SUPPLIER_TERMS_EDIT', lock:true})</script>
+            <entity-find-one entity-name="mantle.party.Party" value-field="supplier" disable-authz="true">
+                <field-map field-name="partyId" from="supplierPartyId"/></entity-find-one>
+            <if condition="supplier == null || (supplier.privateOwnerUserId &amp;&amp;
+                    supplier.privateOwnerUserId != ec.user.userId)">
+                <return error="true" message="SUPPLIER_UNAVAILABLE: Choose an available supplier"/></if>
+            <if condition="settlementTermId">
+                <entity-find-one entity-name="mantle.account.invoice.SettlementTerm" value-field="settlementTerm"
+                        disable-authz="true"/>
+                <if condition="settlementTerm == null">
+                    <return error="true" message="TERM_INVALID: Choose an existing payment term"/></if>
+            </if>
+            <if condition="selfBillingIndicator &amp;&amp; !['Y', 'N'].includes(selfBillingIndicator)">
+                <return error="true" message="SELF_BILLING_INVALID: Self-billing is Y or N"/></if>
+            <set field="fromDate" from="fromDate ?? ec.user.nowTimestamp"/>
+            <entity-find entity-name="mantle.party.supplier.SupplierProfile" list="currentList" for-update="true"
+                    disable-authz="true">
+                <date-filter valid-date="fromDate"/>
+                <econdition field-name="organizationPartyId"/><econdition field-name="supplierPartyId"/>
+                <order-by field-name="-fromDate"/>
+            </entity-find>
+            <set field="current" from="currentList[0] ?? null"/>
+            <set field="values" from="{settlementTermId:current?.settlementTermId ?? null,
+                selfBillingIndicator:current?.selfBillingIndicator ?? 'N'}"/>
+            <iterate list="financeFields" entry="field">
+                <script>values[field] = context[field] || null</script></iterate>
+            <set field="values.selfBillingIndicator" from="values.selfBillingIndicator || 'N'"/>
+            <if condition="current &amp;&amp; current.settlementTermId == values.settlementTermId &amp;&amp;
+                    (current.selfBillingIndicator || 'N') == values.selfBillingIndicator">
+                <set field="supplierProfileId" from="current.supplierProfileId"/>
+                <set field="changed" from="false"/>
+                <return/>
+            </if>
+            <if condition="current &amp;&amp; Number(current.fromDate) &gt;= Number(fromDate)">
+                <return error="true" message="DATE_INVALID: The change must start after the profile in effect"/></if>
+            <if condition="current">
+                <service-call name="update#mantle.party.supplier.SupplierProfile" disable-authz="true"
+                        in-map="{supplierProfileId:current.supplierProfileId, thruDate:fromDate}"/></if>
+            <service-call name="create#mantle.party.supplier.SupplierProfile" out-map="created" disable-authz="true"
+                    in-map="{organizationPartyId:organizationPartyId, supplierPartyId:supplierPartyId, fromDate:fromDate,
+                        settlementTermId:values.settlementTermId, selfBillingIndicator:values.selfBillingIndicator,
+                        changeReason:changeReason, changedByUserId:ec.user.userId}"/>
+            <set field="supplierProfileId" from="created.supplierProfileId"/>
+            <set field="changed" from="true"/>
+        </actions>
+    </service>
+    <service verb="get" noun="SupplierFinance" allow-remote="false">
+        <description>A supplier's finance with an organization for a finance reader (ACCOUNTING_VIEW, ACCOUNTING_ADMIN or
+            PAYABLE_VIEW): its name, the bills (find#Payables) and payments, by currency the open payable, the amount in
+            review, the part on hold and the overdue, agreements, and the supplier profile's rows, newest first, with the one
+            in effect. Payment methods (masked) only for treasury (BANK_RECONCILE and PAYMENT_EDIT), identifications for
+            PAYABLE_EDIT, tax registrations for TAX_STATEMENT_EDIT. Refuses a supplier with no business relationship with
+            the organization (check#CustomerScope).</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="supplierPartyId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="supplier" type="Map"/>
+            <parameter name="capabilities" type="Map"/>
+            <parameter name="bills" type="List"/>
+            <parameter name="payments" type="List"/>
+            <parameter name="summaryRows" type="List"/>
+            <parameter name="agreements" type="List"/>
+            <parameter name="profile" type="Map"/>
+            <parameter name="profileRows" type="List"/>
+            <parameter name="paymentMethods" type="List"/>
+            <parameter name="identifications" type="List"/>
+            <parameter name="taxRegistrations" type="List"/>
+            <parameter name="incomplete" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="workflow" value="component://mr-mantle/service/mantle/account/InvoiceWorkflow.js"/>
+            <set field="held" from="ec.resource.script(workflow).execute('permissions', {permissions:['ACCOUNTING_VIEW',
+                'ACCOUNTING_ADMIN', 'PAYABLE_VIEW', 'PAYABLE_EDIT', 'BANK_RECONCILE', 'PAYMENT_EDIT', 'TAX_STATEMENT_EDIT',
+                'SUPPLIER_TERMS_EDIT']})"/>
+            <if condition="!held.ACCOUNTING_VIEW &amp;&amp; !held.ACCOUNTING_ADMIN &amp;&amp; !held.PAYABLE_VIEW">
+                <return error="true" message="PERMISSION_DENIED: PAYABLE_VIEW authority is required"/></if>
+            <service-call name="mantle.account.CustomerFinanceServices.check#CustomerScope" out-map="scope" disable-authz="true"
+                    in-map="{organizationPartyId:organizationPartyId, customerPartyId:supplierPartyId, side:'supplier'}"/>
+            <set field="supplier" from="scope.customer"/>
+            <set field="capabilities" from="{canEditTerms:held.SUPPLIER_TERMS_EDIT, canEditIdentifications:held.PAYABLE_EDIT,
+                canReadPaymentMethods:held.BANK_RECONCILE &amp;&amp; held.PAYMENT_EDIT,
+                canEditPaymentMethods:held.BANK_RECONCILE &amp;&amp; held.PAYMENT_EDIT,
+                canReadTaxRegistrations:held.TAX_STATEMENT_EDIT, canEditTaxRegistrations:held.TAX_STATEMENT_EDIT}"/>
+
+            <service-call name="mantle.account.InvoiceServices.find#Payables" out-map="payables" disable-authz="true"
+                    in-map="{organizationPartyId:organizationPartyId, supplierPartyId:supplierPartyId, pageSize:100}"/>
+            <set field="bills" from="payables.records"/>
+            <entity-find entity-name="mantle.account.payment.Payment" list="paymentList" limit="101" disable-authz="true">
+                <econdition field-name="fromPartyId" from="organizationPartyId"/>
+                <econdition field-name="toPartyId" from="supplierPartyId"/>
+                <order-by field-name="-effectiveDate"/><order-by field-name="paymentId"/>
+            </entity-find>
+            <set field="payments" from="Array.from(paymentList).slice(0, 100).map((row) => ({paymentId:row.paymentId,
+                statusId:row.statusId, effectiveDate:row.effectiveDate, amount:row.amount, amountUomId:row.amountUomId,
+                paymentRefNum:row.paymentRefNum, unappliedTotal:row.unappliedTotal}))"/>
+            <set field="payablesModule" value="component://mr-mantle/service/mantle/account/Payables.js"/>
+            <set field="summary" from="ec.resource.script(payablesModule).execute('supplierSummary',
+                {organizationPartyId:organizationPartyId, supplierPartyId:supplierPartyId})"/>
+            <set field="summaryRows" from="summary.summaryRows"/>
+            <set field="incomplete" from="payables.recordsCount &gt; 100 || paymentList.length &gt; 100 || summary.incomplete"/>
+
+            <entity-find entity-name="mantle.party.agreement.AgreementParty" list="supplierAgreementList" limit="500"
+                    disable-authz="true"><econdition field-name="partyId" from="supplierPartyId"/></entity-find>
+            <set field="agreements" from="[]"/>
+            <if condition="supplierAgreementList.length">
+                <entity-find entity-name="mantle.party.agreement.AgreementParty" list="sharedAgreementList" disable-authz="true">
+                    <econdition field-name="partyId" from="organizationPartyId"/>
+                    <econdition field-name="agreementId" operator="in"
+                            from="Array.from(supplierAgreementList).map((row) => row.agreementId)"/>
+                </entity-find>
+                <if condition="sharedAgreementList.length">
+                    <entity-find entity-name="mantle.party.agreement.Agreement" list="agreements" limit="200"
+                            disable-authz="true">
+                        <econdition field-name="agreementId" operator="in"
+                                from="Array.from(sharedAgreementList).map((row) => row.agreementId)"/>
+                        <order-by field-name="-fromDate"/>
+                    </entity-find>
+                </if>
+            </if>
+
+            <entity-find entity-name="mantle.party.supplier.SupplierProfile" list="profileRows" limit="100"
+                    disable-authz="true">
+                <econdition field-name="organizationPartyId"/><econdition field-name="supplierPartyId"/>
+                <order-by field-name="-fromDate"/>
+            </entity-find>
+            <set field="nowMillis" from="Number(ec.user.nowTimestamp)"/>
+            <set field="profile" from="Array.from(profileRows).find((row) => Number(row.fromDate) &lt;= nowMillis &amp;&amp;
+                (row.thruDate == null || Number(row.thruDate) &gt; nowMillis))?.getMap() ?? null"/>
+
+            <set field="paymentMethods" from="[]"/>
+            <set field="identifications" from="[]"/>
+            <set field="taxRegistrations" from="[]"/>
+            <if condition="capabilities.canReadPaymentMethods">
+                <set field="finance" value="component://mr-mantle/service/mantle/account/CustomerFinance.js"/>
+                <set field="paymentMethods" from="ec.resource.script(finance).execute('paymentMethods',
+                    {customerPartyId:supplierPartyId}).paymentMethods"/>
+            </if>
+            <if condition="capabilities.canEditIdentifications">
+                <entity-find entity-name="mantle.party.PartyIdentification" list="identifications" limit="100"
+                        disable-authz="true">
+                    <econdition field-name="partyId" from="supplierPartyId"/></entity-find>
+            </if>
+            <if condition="capabilities.canReadTaxRegistrations">
+                <entity-find entity-name="mantle.other.tax.TaxAuthorityParty" list="taxRegistrations" limit="100"
+                        disable-authz="true"><econdition field-name="partyId" from="supplierPartyId"/></entity-find>
+            </if>
+        </actions>
+    </service>
+</services>

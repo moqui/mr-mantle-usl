@@ -15,15 +15,19 @@ along with this software (see the LICENSE.md file). If not, see
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
     <service verb="define" noun="CustomerScope" type="interface">
-        <description>An organization and one of its customers.</description>
+        <description>An organization and one of its customers, or with side supplier one of its suppliers.</description>
         <in-parameters>
             <parameter name="organizationPartyId" required="true"/>
-            <parameter name="customerPartyId" required="true"/>
+            <parameter name="customerPartyId" required="true"><description>The customer, or the supplier.</description>
+            </parameter>
+            <parameter name="side" default-value="customer"><description>customer, the default, or supplier: a supplier's
+                identifications need PAYABLE_EDIT in place of RECEIVABLE_EDIT.</description></parameter>
         </in-parameters>
     </service>
     <service verb="check" noun="CustomerScope" allow-remote="false">
         <description>The customer of an organization the user works in: the permission given, a customer no other user keeps
-            private, and an invoice, order or current relationship between the two. Refuses otherwise.</description>
+            private, and an invoice, order or current relationship between the two, or for a supplier its profile. Refuses
+            otherwise.</description>
         <implements service="mantle.account.CustomerFinanceServices.define#CustomerScope"/>
         <in-parameters><parameter name="permission"/></in-parameters>
         <out-parameters><parameter name="customer" type="Map"/></out-parameters>
@@ -44,8 +48,12 @@ along with this software (see the LICENSE.md file). If not, see
                 </econditions>
             </entity-find-count>
             <entity-find-count entity-name="mantle.order.OrderPart" count-field="orderCount" disable-authz="true">
-                <econdition field-name="vendorPartyId" from="organizationPartyId"/>
-                <econdition field-name="customerPartyId"/>
+                <econditions combine="or">
+                    <econditions><econdition field-name="vendorPartyId" from="organizationPartyId"/>
+                        <econdition field-name="customerPartyId"/></econditions>
+                    <econditions><econdition field-name="vendorPartyId" from="customerPartyId"/>
+                        <econdition field-name="customerPartyId" from="organizationPartyId"/></econditions>
+                </econditions>
             </entity-find-count>
             <entity-find-count entity-name="mantle.party.PartyRelationship" count-field="relationshipCount" disable-authz="true">
                 <date-filter/>
@@ -56,7 +64,15 @@ along with this software (see the LICENSE.md file). If not, see
                         <econdition field-name="toPartyId" from="organizationPartyId"/></econditions>
                 </econditions>
             </entity-find-count>
-            <if condition="!invoiceCount &amp;&amp; !orderCount &amp;&amp; !relationshipCount">
+            <set field="profileCount" from="0"/>
+            <if condition="side == 'supplier'">
+                <entity-find-count entity-name="mantle.party.supplier.SupplierProfile" count-field="profileCount"
+                        disable-authz="true">
+                    <econdition field-name="organizationPartyId"/>
+                    <econdition field-name="supplierPartyId" from="customerPartyId"/>
+                </entity-find-count>
+            </if>
+            <if condition="!invoiceCount &amp;&amp; !orderCount &amp;&amp; !relationshipCount &amp;&amp; !profileCount">
                 <return error="true"
                         message="CUSTOMER_SCOPE_INVALID: Customer has no business relationship with this organization"/></if>
             <set field="customer" from="{partyId:party.partyId, partyTypeEnumId:party.partyTypeEnumId,
@@ -243,7 +259,8 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
     <service verb="store" noun="CustomerIdentification" allow-remote="false">
         <description>Add or change a customer's identification of a PartyIdType; a change needs the lastUpdatedStamp read.
-            Only the fields given are written. Needs RECEIVABLE_EDIT in the organization.</description>
+            Only the fields given are written. Needs RECEIVABLE_EDIT in the organization, PAYABLE_EDIT for a
+            supplier's.</description>
         <implements service="mantle.account.CustomerFinanceServices.define#CustomerScope"/>
         <in-parameters>
             <parameter name="partyIdTypeEnumId" required="true"/>
@@ -260,7 +277,7 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <service-call name="mantle.account.CustomerFinanceServices.check#CustomerScope" disable-authz="true"
                     in-map="{organizationPartyId:organizationPartyId, customerPartyId:customerPartyId,
-                        permission:'RECEIVABLE_EDIT'}"/>
+                        permission:(side == 'supplier' ? 'PAYABLE_EDIT' : 'RECEIVABLE_EDIT')}"/>
             <entity-find-one entity-name="moqui.basic.Enumeration" value-field="idType" cache="true" disable-authz="true">
                 <field-map field-name="enumId" from="partyIdTypeEnumId"/></entity-find-one>
             <if condition="idType?.enumTypeId != 'PartyIdType'">

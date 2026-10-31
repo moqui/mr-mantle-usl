@@ -170,6 +170,26 @@ function totalsMany(records, asOfDate = null) {
     }
     return values
 }
+// The open holds of the invoices given (InvoiceHold with no releasedDate), by invoice ID.
+function openHolds(invoiceIds) {
+    const ids = [...new Set(Array.from(invoiceIds || []).filter(Boolean))]
+    if (!ids.length) return {}
+    const holds = {}
+    const found = find("mantle.account.invoice.InvoiceHold")
+        .condition("invoiceId", "in", ids)
+        .condition("releasedDate", "is-null", null)
+        .orderBy("placedDate")
+        .list()
+    for (const row of Array.from(found)) (holds[row.invoiceId] = holds[row.invoiceId] || []).push(map(row))
+    return holds
+}
+// The hold guard: a payable with an open hold is not approved and no payment or credit is applied to it.
+function requireNotHeld(invoiceId) {
+    const held = openHolds([invoiceId])[invoiceId]
+    if (!held) return
+    const reason = one("moqui.basic.Enumeration", {enumId: held[0].holdReasonEnumId})
+    denied("INVOICE_HELD", "Bill " + invoiceId + " is on hold (" + (reason?.description || held[0].holdReasonEnumId) + ")")
+}
 function escapeHtml(value) {
     const entities = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}
     return String(value ?? "").replace(/[&<>"']/g, character => entities[character])
@@ -211,5 +231,7 @@ function escapeHtml(value) {
     partyNames,
     page,
     probe,
+    openHolds,
+    requireNotHeld,
     escapeHtml
 })

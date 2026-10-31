@@ -42,6 +42,10 @@ function capabilities() {
         match: has("INVOICE_MATCH"),
         taxEdit: has("TAX_STATEMENT_EDIT"),
         approve: has("INVOICE_APPROVE"),
+        holdPlace: has("INVOICE_HOLD"),
+        holdRelease: has("INVOICE_HOLD_RELEASE"),
+        payableImport: has("PAYABLE_IMPORT"),
+        supplierTermsEdit: has("SUPPLIER_TERMS_EDIT"),
         fiscalClose: has("FISCAL_CLOSE"),
         fiscalReopen: has("FISCAL_REOPEN")
     }

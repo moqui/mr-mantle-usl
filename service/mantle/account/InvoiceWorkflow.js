@@ -163,6 +163,7 @@ const transitions = {
 function issue(scope, p, preference, action) {
     const record = scope.record
     if (!draftStatuses.includes(record.statusId)) denied("STATE_TRANSITION_INVALID", "This invoice cannot be finalized now")
+    if (!scope.receivable) lib.requireNotHeld(record.invoiceId)
     if (!find("mantle.account.invoice.InvoiceItem", {invoiceId: record.invoiceId}).count())
         denied("INVOICE_EMPTY", "An invoice needs at least one line")
     if (lib.totals(record).invoiceTotal.compare(0) < 0) denied("INVOICE_NEGATIVE", "Reverse a negative draft before finalizing")

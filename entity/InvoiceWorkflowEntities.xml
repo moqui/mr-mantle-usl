@@ -63,6 +63,7 @@ along with this software (see the LICENSE.md file). If not, see
         <alias entity-alias="SRC" name="sourceFromPartyId" field="fromPartyId"/>
         <alias entity-alias="SRC" name="sourceToPartyId" field="toPartyId"/>
         <alias entity-alias="FROMP" name="fromPrivateOwnerUserId" field="privateOwnerUserId"/>
+        <alias entity-alias="FROMP" name="fromPartyTypeEnumId" field="partyTypeEnumId"/>
         <alias entity-alias="TOP" name="toPrivateOwnerUserId" field="privateOwnerUserId"/>
     </view-entity>
     <extend-entity entity-name="PartyIdentification" package="mantle.party">
