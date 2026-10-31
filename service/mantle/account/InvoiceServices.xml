@@ -3344,6 +3344,8 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="sourceVersion"/>
             <parameter name="operationKey"/>
             <parameter name="changeReason"/>
+            <parameter name="budgetOverrideReason"><description>Approving a bill: passes a budget Stop for a user holding
+                BUDGET_OVERRIDE (mantle.other.BudgetServices.convert#Commitment).</description></parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="invoiceId"/>
@@ -3633,9 +3635,11 @@ along with this software (see the LICENSE.md file). If not, see
                 <econdition field-name="unpaidTotal" operator="greater" from="toDecimal(0)"/>
                 <order-by field-name="invoiceDate"/><order-by field-name="invoiceId"/>
             </entity-find>
-            <set field="budgetRows" from="[]"/>
-            <set field="budgetAvailable" from="false"/>
-            <set field="budgetUnavailableReason" value="Invoice budget links are not available in the current budget model"/>
+            <!-- the invoice's budget evidence: the commitments it recorded against a budget (BudgetCommitment) -->
+            <set field="budgetRows" from="ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js')
+                .execute('invoiceCommitments', invoiceId)"/>
+            <set field="budgetAvailable" from="true"/>
+            <set field="budgetUnavailableReason" from="null"/>
         </actions>
     </service>
     <service verb="reverse" noun="DraftInvoice" allow-remote="false">
@@ -4417,8 +4421,12 @@ along with this software (see the LICENSE.md file). If not, see
     <service verb="approve" noun="Payable" allow-remote="false">
         <description>Approve a bill: its posting day when given (accountingDate, a draft's book day in an open period),
             then change#InvoiceState's approval, which posts it and stamps the approver (self-approved when the approver
-            drafted it), and its BillApproval notifications marked read. Refuses a receivable, a bill on hold (INVOICE_HELD)
-            and a stale lastUpdatedStamp. Needs INVOICE_APPROVE in the organization.</description>
+            drafted it), its budget commitments converted to actual (change#InvoiceState calls
+            mantle.other.BudgetServices.convert#Commitment with invoiceId: a purchase order line's commitment passes to
+            the bill line, and a Stop over budget refuses the approval unless budgetOverrideReason is given by a user
+            holding BUDGET_OVERRIDE), and its BillApproval notifications marked read. Refuses a receivable, a bill on hold
+            (INVOICE_HELD), a budget Stop (BUDGET_EXCEEDED) and a stale lastUpdatedStamp. Needs INVOICE_APPROVE in the
+            organization.</description>
         <in-parameters>
             <parameter name="invoiceId" required="true"/>
             <parameter name="organizationPartyId"/>
@@ -4426,6 +4434,7 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="accountingDate" type="Date"/>
             <parameter name="operationKey"/>
             <parameter name="changeReason"/>
+            <parameter name="budgetOverrideReason"/>
         </in-parameters>
         <out-parameters>
             <parameter name="statusId"/>
@@ -4448,7 +4457,8 @@ along with this software (see the LICENSE.md file). If not, see
             </if>
             <service-call name="mantle.account.InvoiceServices.change#InvoiceState" out-map="changed" disable-authz="true"
                     in-map="{invoiceId:invoiceId, organizationPartyId:scope.organizationPartyId, action:'approve',
-                        lastUpdatedStamp:lastUpdatedStamp, operationKey:operationKey, changeReason:changeReason}"/>
+                        lastUpdatedStamp:lastUpdatedStamp, operationKey:operationKey, changeReason:changeReason,
+                        budgetOverrideReason:budgetOverrideReason}"/>
             <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="approved" disable-authz="true"/>
             <set field="statusId" from="approved.statusId"/>
             <set field="payables" value="component://mr-mantle/service/mantle/account/Payables.js"/>
