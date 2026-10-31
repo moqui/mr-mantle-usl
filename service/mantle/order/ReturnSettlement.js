@@ -336,7 +336,10 @@ function plan(p, lock) {
     if (receiptless && scope.supplierReturn)
         denied("RECEIPTLESS_CUSTOMER_ONLY", "Only a customer return is credited without receipt")
     const itemQuery = find(RI, {returnId: header.returnId}).orderBy("returnItemSeqId")
-    const items = Array.from((lock ? itemQuery.forUpdate(true) : itemQuery).list()).filter(row => !row.parentItemSeqId)
+    const allItems = Array.from((lock ? itemQuery.forUpdate(true) : itemQuery).list())
+    const items = allItems.filter(row => !row.parentItemSeqId)
+    // an item's adjustments (discount, tax) follow it, prorated by the quantity settled
+    const children = allItems.filter(row => row.parentItemSeqId && row.statusId !== "ReturnCancelled")
     const ownBillings = standing(rows(RIB, {returnId: header.returnId}))
     const productIds = [...new Set(items.map(row => row.productId).filter(Boolean))]
     const productNames = productIds.length
@@ -429,6 +432,31 @@ function plan(p, lock) {
             originalInvoiceItemSeqId: row.originalInvoiceItemSeqId,
             assetReceiptId: row.assetReceiptId
         })
+    }
+    for (const line of [...lineRows]) {
+        const parent = items.find(item => item.returnItemSeqId === line.returnItemSeqId)
+        if (dec(parent.returnQuantity).isZero()) continue
+        const ratio = line.quantity.divide(dec(parent.returnQuantity)).setScale(6, "HALF_UP")
+        for (const child of children.filter(row => row.parentItemSeqId === line.returnItemSeqId)) {
+            const childQuantity = dec(child.returnQuantity ?? 1)
+                .multiply(ratio)
+                .setScale(6, "HALF_UP")
+            const unitAmount = dec(child.returnPrice)
+            if (childQuantity.isZero() || unitAmount.isZero()) continue
+            lineRows.push({
+                returnItemSeqId: child.returnItemSeqId,
+                parentItemSeqId: line.returnItemSeqId,
+                productName: child.description || line.productName,
+                quantity: childQuantity,
+                returnResponseEnumId: line.returnResponseEnumId,
+                responseName: line.responseName,
+                unitAmount,
+                amount: ec.l10n.roundCurrency(childQuantity.multiply(unitAmount), currencyUomId),
+                originalInvoiceId: null,
+                originalInvoiceItemSeqId: null,
+                assetReceiptId: line.assetReceiptId
+            })
+        }
     }
     const total = response =>
         lineRows.filter(row => row.returnResponseEnumId === response).reduce((t, row) => t.add(row.amount), zero())
@@ -531,6 +559,8 @@ function preview(p) {
 
 function settle(p) {
     const peek = returnScope(p, false)
+    const writer = peek.supplierReturn ? "PAYABLE_EDIT" : "RECEIVABLE_EDIT"
+    if (!has(writer)) denied("FORBIDDEN", writer + " authority is required")
     const request = {
         returnId: p.returnId,
         lineList: Array.from(p.lineList || []).map(line => ({
@@ -683,31 +713,35 @@ function supplierCredits(out, scope, billingFields, result) {
     }
 }
 
-// An item settled for all it authorizes is complete; one credited without receipt has its remainder closed first.
+// An item settled for all it authorizes is complete, with its adjustments; one credited without receipt has its
+// remainder closed first (Received), as a return authorizer closes it.
 function completeSettled(out, planned) {
     const settledNow = standing(rows(RIB, {returnId: out.returnId}))
-    for (const line of out.lineRows) {
+    const closing = []
+    for (const line of out.lineRows.filter(row => !row.parentItemSeqId)) {
         const item = one(RI, {returnId: out.returnId, returnItemSeqId: line.returnItemSeqId})
         const settled = sum(
             settledNow.filter(row => row.returnItemSeqId === line.returnItemSeqId),
             "quantity"
         )
         if (settled.compare(dec(item.returnQuantity)) < 0) continue
-        if (["ReturnApproved"].includes(item.statusId)) {
-            if (!planned.receiptless) continue
-            call("update#" + RI, {returnId: item.returnId, returnItemSeqId: item.returnItemSeqId, statusId: "ReturnReceived"})
-            call("mantle.order.ReturnServices.checkUpdate#ReturnHeaderStatus", {
-                returnId: item.returnId,
-                statusId: "ReturnReceived",
-                itemStatusIds: ["ReturnReceived", "ReturnManResp", "ReturnCompleted", "ReturnCancelled"]
-            })
-        }
-        if (["ReturnReceived", "ReturnShipped", "ReturnManResp"].includes(item.statusId) || planned.receiptless)
-            call("mantle.order.ReturnServices.complete#ReturnItem", {
-                returnId: item.returnId,
-                returnItemSeqId: item.returnItemSeqId
-            })
+        if (item.statusId === "ReturnApproved" && !planned.receiptless) continue
+        closing.push(...rows(RI, {returnId: out.returnId, parentItemSeqId: item.returnItemSeqId}), item)
     }
+    const open = closing.filter(item =>
+        ["ReturnApproved", "ReturnShipped", "ReturnReceived", "ReturnManResp"].includes(item.statusId)
+    )
+    if (planned.receiptless) {
+        for (const item of open.filter(row => row.statusId === "ReturnApproved"))
+            call("update#" + RI, {returnId: item.returnId, returnItemSeqId: item.returnItemSeqId, statusId: "ReturnReceived"})
+        call("mantle.order.ReturnServices.checkUpdate#ReturnHeaderStatus", {
+            returnId: out.returnId,
+            statusId: "ReturnReceived",
+            itemStatusIds: ["ReturnReceived", "ReturnManResp", "ReturnCompleted", "ReturnCancelled"]
+        })
+    }
+    for (const item of open)
+        call("mantle.order.ReturnServices.complete#ReturnItem", {returnId: item.returnId, returnItemSeqId: item.returnItemSeqId})
 }
 
 const operations = {receive, preview, settle}

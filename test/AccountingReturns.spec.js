@@ -54,8 +54,9 @@ function user(kind, permissions) {
 function preference(fields) {
     svc("update#mantle.ledger.config.PartyAcctgPreference", Object.assign({organizationPartyId: org}, fields))
 }
-// A sales order of the lines, paid by a delivered check for its total, placed and approved.
-function sale(lines) {
+// A sales order of the lines, with a discount on the first one when given, paid by a delivered check for its total,
+// placed and approved.
+function sale(lines, discount = 0) {
     login("john.doe")
     const order = svc("mantle.order.OrderServices.create#Order", {
         vendorPartyId: org,
@@ -69,6 +70,16 @@ function sale(lines) {
             productId,
             quantity,
             unitAmount
+        })
+    if (discount)
+        svc("mantle.order.OrderServices.create#OrderItem", {
+            orderId: order.orderId,
+            orderPartSeqId: order.orderPartSeqId,
+            parentItemSeqId: itemSeq(order.orderId, lines[0][0]),
+            itemTypeEnumId: "ItemDiscount",
+            itemDescription: "Loyalty discount",
+            quantity: 1,
+            unitAmount: -discount
         })
     const payment = svc("mantle.order.OrderServices.add#OrderPartPayment", {
         orderId: order.orderId,
@@ -162,10 +173,13 @@ spec({
         user("treasury", ["RECEIVABLE_EDIT", "RECEIVABLE_VIEW", "PAYMENT_EDIT", "PAYMENT_VIEW"])
         user("approver", ["RECEIVABLE_EDIT", "RECEIVABLE_VIEW", "RETURN_CREDIT_APPROVE"])
         user("ap", ["PAYABLE_EDIT", "PAYABLE_VIEW"])
-        ids.sale = sale([
-            [productA, 5, 20],
-            [productB, 2, 20]
-        ])
+        ids.sale = sale(
+            [
+                [productA, 5, 20],
+                [productB, 2, 20]
+            ],
+            5
+        )
         login("john.doe")
         svc("mantle.shipment.ShipmentServices.ship#OrderPart", {orderId: ids.sale.orderId, orderPartSeqId: "01"})
     },
@@ -242,9 +256,26 @@ feature("a partial receipt credits only what arrived, and a second box is credit
         login(users.ar)
         const second = svc(R + "settle#Return", settleRequest(ids.returnA, [{returnItemSeqId: seqA}]))
         const item = one("mantle.order.return.ReturnItem", {returnId: ids.returnA, returnItemSeqId: seqA})
-        return {first, read, readerSettle, over, changed, settled, retry, rest, afterFirstBox, second, item}
+        // the discount on the order line follows it, prorated: a credit line under each settlement of the item
+        const discount = rows("mantle.order.return.ReturnItem", {returnId: ids.returnA, parentItemSeqId: seqA})[0]
+        const discountLines = billings(ids.returnA).filter(row => row.returnItemSeqId === discount.returnItemSeqId)
+        return {
+            first,
+            read,
+            readerSettle,
+            over,
+            changed,
+            settled,
+            retry,
+            rest,
+            afterFirstBox,
+            second,
+            item,
+            discount,
+            discountLines
+        }
     },
-    then({first, read, readerSettle, over, changed, settled, retry, rest, afterFirstBox, second, item}) {
+    then({first, read, readerSettle, over, changed, settled, retry, rest, afterFirstBox, second, item, discount, discountLines}) {
         first.receivedItems[0].receivedQuantity == 2
         first.receivedItems[0].statusId == "ReturnApproved"
         read.itemRows[0].eligibleQuantity == 2
@@ -264,6 +295,11 @@ feature("a partial receipt credits only what arrived, and a second box is credit
         second.settledLines[0].quantity == "1"
         item.receivedQuantity == 3
         item.statusId == "ReturnCompleted"
+        discountLines.length == 3
+        discountLines
+            .reduce((total, row) => total.add(toDecimal(row.quantity).multiply(row.amount)), toDecimal(0))
+            .compare(-2.9) < 0
+        discount.statusId == "ReturnCompleted"
     }
 })
 
@@ -272,7 +308,7 @@ feature("a refund goes back to the original payment and stays within what was pa
         const seqB = returnSeq(ids.returnA, productB)
         receiveBox(ids.returnA, productB, 2)
         login("john.doe")
-        // another refund of the original leaves 30 of its 140
+        // another refund of the original leaves 25 of its 135
         const other = svc("mantle.account.PaymentServices.create#RefundPayment", {
             paymentId: ids.sale.paymentId,
             amount: 110,
