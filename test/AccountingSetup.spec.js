@@ -215,6 +215,8 @@ feature("open items: a bad row is named and the rest kept; importing again makes
         r.opened == 3
         r.invoice.statusId == "InvoiceFinalized"
         r.bill.statusId == "InvoiceApproved"
+        r.bill.approvedByUserId == users.admin
+        r.bill.isSelfApproved == "Y"
         bookDay(r.invoice.dueDate) == day(-10)
         bookDay(r.invoice.invoiceDate) == day(-40)
         r.posting.isPosted == "Y"
@@ -281,6 +283,8 @@ feature("readiness names the untied open items and blocks activation, which post
         r.row("SINGLE_CURRENCY").message.includes("Single currency until base-currency posting")
         r.row("REMINDER_JOB").status == "ok"
         r.row("POSTED_HISTORY").status == "ok"
+        r.row("PRODUCTION_ACCOUNTS").status == "warning"
+        r.row("PRODUCTION_ACCOUNTS").detailText.includes("Applied production labor")
         r.row("WIP_TRANSFER").status == "ok"
         r.row("BANK_METHODS").status == "warning"
         r.blocked.includes("SETUP_NOT_READY")
@@ -383,3 +387,92 @@ feature("aging, dunning and a payment run work on the imported items", {
         runItems.some(row => row.invoiceId == items["OLD-BILL-1"] && row.selectedIndicator == "Y")
     }
 })
+
+feature("a rolled-up organization inherits its configuration: it is not set up from a template, keeps its parent's basis, and needs the guard for open items", {
+    when() {
+        login("john.doe")
+        const parent = prefix + "_PARENT",
+            child = prefix + "_CHILD"
+        party(parent, "OrgInternal")
+        party(child, "OrgInternal")
+        svc("mantle.ledger.LedgerServices.init#PartyAccountingConfiguration", {
+            organizationPartyId: parent,
+            sourcePartyId: "DefaultSettings",
+            baseCurrencyUomId: "USD"
+        })
+        svc("create#mantle.party.PartyRelationship", {
+            relationshipTypeEnumId: "PrtOrgRollup",
+            fromPartyId: child,
+            fromRoleTypeId: "OrgInternal",
+            toPartyId: parent,
+            toRoleTypeId: "OrgInternal",
+            fromDate: 0
+        })
+        login(users.admin)
+        const status = svc("mantle.ledger.SetupServices.get#Readiness", {organizationPartyId: child}).setupStatus
+        const preview = setup("preview#OpeningBalances", {organizationPartyId: child})
+        const otherCurrency = refused("store#SetupRun", {organizationPartyId: child, baseCurrencyUomId: "EUR", openingDate: opening})
+        const stored = setup("store#SetupRun", {organizationPartyId: child, baseCurrencyUomId: "USD", openingDate: opening})
+        // the parent's posting guard is off (init's default), so an open item would post on its document date
+        const unguarded = setup("import#OpenItems", {
+            organizationPartyId: child,
+            verifyOnly: true,
+            rows: [{direction: "receivable", partyId: customer, documentNumber: "CHILD-1", documentDate: day(-9),
+                dueDate: day(9), openAmount: "10"}]
+        })
+        const readiness = setup("check#Readiness", {organizationPartyId: child})
+        return {
+            status,
+            preview,
+            otherCurrency,
+            stored,
+            unguarded,
+            row: code => readiness.readinessRows.find(row => row.code == code),
+            own: one("mantle.ledger.config.PartyAcctgPreference", {organizationPartyId: child}),
+            run: rows("mantle.ledger.config.AccountingSetupRun", {organizationPartyId: child})[0]
+        }
+    },
+    then(r) {
+        r.status == "configured"
+        r.preview.configured == true
+        r.preview.inheritedFrom == prefix + "_PARENT"
+        r.preview.defaultMigrationGlAccountId == "913000000"
+        r.otherCurrency.includes("BASIS_INHERITED")
+        r.stored.runVersion == 1
+        r.own == null
+        r.run.sourcePartyId == null
+        r.unguarded.rowResults[0].reasonCode == "POSTING_GUARD_REQUIRED"
+        r.row("WIP_TRANSFER").status == "ok"
+        r.row("CHART").status == "ok"
+        r.row("POSTING_GUARD").status == "blocker"
+    }
+})
+
+feature("a credit on an open item posts to the account mapped to opening balances, never to migration clearing", {
+    when() {
+        login("john.doe")
+        const credit = key => ({
+            organizationPartyId: org,
+            originalInvoiceId: items["OLD-INV-2"],
+            amount: "20",
+            linkToOriginal: true,
+            allocateToLines: true,
+            operationKey: "SETUP-CREDIT-" + key
+        })
+        const unmapped = refused("mantle.account.InvoiceServices.create#InvoiceCreditMemo", credit("A"))
+        svc("create#mantle.ledger.config.ItemTypeGlAccount", {
+            organizationPartyId: org,
+            itemTypeEnumId: "ItemOpeningBalance",
+            direction: "O",
+            glAccountId: "412000000"
+        })
+        const made = svc("mantle.account.InvoiceServices.create#InvoiceCreditMemo", credit("B"))
+        return {unmapped, lines: rows("mantle.account.invoice.InvoiceItem", {invoiceId: made.invoiceId})}
+    },
+    then({unmapped, lines}) {
+        unmapped.includes("CREDIT_ACCOUNT_MISSING")
+        lines.length == 1
+        lines[0].overrideGlAccountId == "412000000"
+    }
+})
+

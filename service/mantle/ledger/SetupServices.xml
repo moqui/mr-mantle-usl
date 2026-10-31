@@ -546,16 +546,17 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
     <!-- ========== Setup and activation (AC-01) ========== -->
     <service verb="store" noun="SetupRun" allow-remote="false">
-        <description>Start or change the organization's accounting setup run. An organization with no accounting preference
-            of its own is set up from a chart template (init#PartyAccountingConfiguration with sourcePartyId, the base
-            currency, fiscal year start and costing basis, and the posting guard and single-currency documents on); for one
-            with its own preference a changed basis goes through store#Preferences. The fiscal periods of the opening day
-            are made when missing. The opening balances are replaced (balances, or balancesCsvText with the headers account,
-            debit and credit) or one line is saved (balanceLine; empty amounts remove it). Each change raises runVersion.
-            Refuses a user without finance administration, a source that is not a chart template, a stale runVersion, an
-            activated run, a new opening day or migration account once open items are imported, a migration or line
-            account that is not an active posting account of the organization, a line of the migration account, a line
-            with both a debit and a credit, and an account on two lines.</description>
+        <description>Start or change the organization's accounting setup run. An organization with no accounting preference,
+            its own or one inherited through its rollup, is set up from a chart template (init#PartyAccountingConfiguration with
+            sourcePartyId, the base currency, fiscal year start and costing basis, and the posting guard and single-currency
+            documents on); for one with its own preference a changed basis goes through store#Preferences, and one that inherits
+            keeps its parent's basis (a change is refused, BASIS_INHERITED). The fiscal periods of the opening day are made when
+            missing. The opening balances are replaced (balances, or balancesCsvText with the headers account, debit and credit)
+            or one line is saved (balanceLine; empty amounts remove it). Each change raises runVersion. Refuses a user without
+            finance administration, a source that is not a chart template, a stale runVersion, an activated run, a new opening day
+            or migration account once open items are imported, a migration or line account that is not an active posting account
+            of the organization, a line of the migration account, a line with both a debit and a credit, and an account on two
+            lines.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
             <parameter name="sourcePartyId"><description>The chart template, for an organization not set up
@@ -604,7 +605,11 @@ along with this software (see the LICENSE.md file). If not, see
                     disable-authz="true">
                 <field-map field-name="organizationPartyId"/>
             </entity-find-one>
-            <if condition="!ownPreference">
+            <!-- an organization configured through its rollup (PrtOrgRollup) inherits its parent's preference: it is
+                configured, is not set up from a template and keeps the parent's basis -->
+            <set field="effectivePreference" from="policy.preference(organizationPartyId)"/>
+            <set field="initialized" from="false"/>
+            <if condition="!ownPreference &amp;&amp; !effectivePreference.organizationPartyId">
                 <then>
                     <if condition="!sourcePartyId">
                         <return error="true" message="TEMPLATE_REQUIRED: Choose the chart template"/>
@@ -631,7 +636,19 @@ along with this software (see the LICENSE.md file). If not, see
                                 baseCurrencyUomId:baseCurrencyUomId, fiscalYearStartMonth:startMonth,
                                 fiscalYearStartDay:startDay, cogsMethodEnumId:cogsMethodEnumId || null,
                                 postingGuardEnabled:'Y', singleCurrencyDocumentsOnly:'Y'}"/>
+                    <set field="initialized" from="true"/>
                 </then>
+                <else-if condition="!ownPreference">
+                    <set field="inheritedChanges" from="[['baseCurrencyUomId', baseCurrencyUomId],
+                            ['fiscalYearStartMonth', fiscalYearStartMonth], ['fiscalYearStartDay', fiscalYearStartDay],
+                            ['cogsMethodEnumId', cogsMethodEnumId]].filter(([field, value]) =&gt; value != null
+                                &amp;&amp; value !== '' &amp;&amp; String(value) !== String(effectivePreference[field] ?? ''))"/>
+                    <if condition="inheritedChanges.length">
+                        <set field="refusal" from="'BASIS_INHERITED: The organization inherits its accounting basis from '
+                                + effectivePreference.organizationPartyId + '; change it there'"/>
+                        <return error="true" message="${refusal}"/>
+                    </if>
+                </else-if>
                 <else>
                     <!-- a changed basis through store#Preferences, which refuses one that posted history depends on -->
                     <set field="basisChanges" from="Object.fromEntries([['baseCurrencyUomId', baseCurrencyUomId],
@@ -682,7 +699,7 @@ along with this software (see the LICENSE.md file). If not, see
                     <service-call name="create#mantle.ledger.config.AccountingSetupRun" out-map="createdRun"
                             disable-authz="true"
                             in-map="{organizationPartyId:organizationPartyId, statusId:'AsrDraft',
-                                sourcePartyId:(ownPreference ? null : sourcePartyId), openingDate:openingDay,
+                                sourcePartyId:(initialized ? sourcePartyId : null), openingDate:openingDay,
                                 migrationGlAccountId:migrationGlAccountId, runVersion:1, createdByUserId:ec.user.userId,
                                 createdDate:ec.user.nowTimestamp}"/>
                     <set field="setupRunId" from="createdRun.setupRunId"/>
@@ -774,6 +791,8 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="currencyUomId"/>
             <parameter name="setupRun" type="Map"/>
             <parameter name="lastImport" type="Map"/>
+            <parameter name="lastCheck" type="Map"/>
+            <parameter name="inheritedFrom"/>
             <parameter name="templateOptions" type="List"/>
             <parameter name="defaultMigrationGlAccountId"/>
             <parameter name="balanceRows" type="List"/>
@@ -804,11 +823,11 @@ along with this software (see the LICENSE.md file). If not, see
     <service verb="import" noun="OpenItems" allow-remote="false">
         <description>Import the open customer invoices and supplier bills at cutover, from rows or a CSV text or file with the
             headers direction (receivable or payable), partyId, documentNumber, documentDate, dueDate and openAmount, and
-            optionally currencyUomId and description. Each row goes through create#OpenItem in its own transaction: a
-            refused row is named with its reason and the others are kept; a row imported before answers its invoice, so
-            importing again makes nothing twice. The counts and refused rows are kept on the run
-            (preview#OpeningBalances lastImport). With verifyOnly the rows are checked and nothing is made. Refuses a user
-            without finance administration, a file without the headers and more than 5,000 rows.</description>
+            optionally currencyUomId and description. Each row goes through create#OpenItem in its own transaction: a refused row
+            is named with its reason and the others are kept; a row imported before answers its invoice, so importing again makes
+            nothing twice. The counts and refused rows are kept on the run (preview#OpeningBalances lastImport), a check's apart
+            (lastCheck). With verifyOnly the rows are checked and nothing is made. Refuses a user without finance administration,
+            a file without the headers and more than 5,000 rows.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
             <parameter name="rows" type="List"/>
@@ -831,16 +850,15 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
     <service verb="create" noun="OpenItem" allow-remote="false">
         <description>One open customer invoice or supplier bill at cutover, for import#OpenItems: a real invoice with the
-            opening flag (openingSetupRunId), dated at its document date, due at its own due date, booked on the opening
-            day, with one line of its open amount on the migration clearing account; it is finalized (an invoice) or
-            approved (a bill) through update#Invoice, so its posting and due schedule SECAs run, and the posting must
-            complete. The same organization, side, party and document number answers the invoice made before. Raises the
-            run's version. With verifyOnly only checks. Refuses a user without finance administration (and, for a bill,
-            INVOICE_APPROVE), no setup run or an activated one, a side that is not receivable or payable, an unknown,
-            private or internal party, no document number, a date that is not yyyy-MM-dd, a document after the opening
-            day, a currency other than the base currency (single currency until base-currency posting), an amount that is
-            not positive or finer than the currency, and a document imported before with another amount or due
-            date.</description>
+            opening flag (openingSetupRunId), dated at its document date, due at its own due date, booked on the opening day, with
+            one line of its open amount on the migration clearing account; it is finalized (an invoice) or approved (a bill)
+            through update#Invoice, so its posting and due schedule SECAs run, and the posting must complete. The same
+            organization, side, party and document number answers the invoice made before. Raises the run's version. With
+            verifyOnly only checks. Refuses a user without finance administration (and, for a bill, INVOICE_APPROVE), no setup run
+            or an activated one, the posting guard off, a side that is not receivable or payable, an unknown, private or internal
+            party, no document number, a date that is not yyyy-MM-dd, a document after the opening day, a currency other than the
+            base currency (single currency until base-currency posting), an amount that is not positive or finer than the
+            currency, and a document imported before with another amount or due date.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
             <parameter name="direction"/>
@@ -862,11 +880,15 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="activation"
                     from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingActivation.js')"/>
             <set field="organizationPartyId" from="policy.organization(context, 'admin').organizationPartyId"/>
-            <entity-find-one entity-name="mantle.party.Party" value-field="organization" for-update="true" disable-authz="true">
-                <field-map field-name="partyId" from="organizationPartyId"/>
-            </entity-find-one>
-            <entity-find entity-name="mantle.ledger.config.AccountingSetupRun" list="runList" for-update="true"
-                    disable-authz="true">
+            <!-- an import locks the organization, which serializes every writer of its setup run; a check takes no
+                lock -->
+            <if condition="!verifyOnly">
+                <entity-find-one entity-name="mantle.party.Party" value-field="organization" for-update="true"
+                        disable-authz="true">
+                    <field-map field-name="partyId" from="organizationPartyId"/>
+                </entity-find-one>
+            </if>
+            <entity-find entity-name="mantle.ledger.config.AccountingSetupRun" list="runList" disable-authz="true">
                 <econdition field-name="organizationPartyId"/>
             </entity-find>
             <set field="setupRun" from="runList[0] || null"/>
@@ -875,6 +897,10 @@ along with this software (see the LICENSE.md file). If not, see
             </if>
             <if condition="setupRun.statusId == 'AsrActivated'">
                 <return error="true" message="SETUP_ACTIVATED: Accounting is activated; open items are not imported now"/>
+            </if>
+            <!-- the posting guard dates an open item's posting on the opening day (its accountingDate) -->
+            <if condition="policy.preference(organizationPartyId).postingGuardEnabled != 'Y'">
+                <return error="true" message="POSTING_GUARD_REQUIRED: Turn on the posting guard before importing open items"/>
             </if>
             <set field="side" from="String(direction || '').trim().toLowerCase()"/>
             <set field="receivable" from="['receivable', 'ar', 'customer', 'invoice'].includes(side)"/>
@@ -923,8 +949,9 @@ along with this software (see the LICENSE.md file). If not, see
             </if>
             <set field="amount" from="policy.lib.amount(String(openAmount ?? '').trim(), currencyUomId)"/>
             <!-- the document imported before (the same organization, side, party and number) answers its invoice -->
-            <entity-find entity-name="mantle.account.invoice.Invoice" list="importedList" for-update="true" disable-authz="true">
+            <entity-find entity-name="mantle.account.invoice.Invoice" list="importedList" disable-authz="true">
                 <econdition field-name="openingSetupRunId" operator="is-not-null"/>
+                <econdition field-name="statusId" operator="not-equals" value="InvoiceCancelled"/>
                 <econdition field-name="referenceNumber" from="documentNumber"/>
                 <econdition field-name="fromPartyId" from="receivable ? organizationPartyId : partyId"/>
                 <econdition field-name="toPartyId" from="receivable ? partyId : organizationPartyId"/>
@@ -955,9 +982,10 @@ along with this software (see the LICENSE.md file). If not, see
                         description:(description || 'Opening balance ' + documentNumber),
                         openingSetupRunId:setupRun.setupRunId}"/>
             <set field="invoiceId" from="created.invoiceId"/>
-            <!-- booked on the opening day, so its posting is dated then -->
+            <!-- booked on the opening day, so its posting is dated then; a bill carries its importer's approval -->
             <service-call name="update#mantle.account.invoice.Invoice" disable-authz="true"
-                    in-map="{invoiceId:invoiceId, accountingDate:openingDay}"/>
+                    in-map="Object.assign({invoiceId:invoiceId, accountingDate:openingDay}, receivable ? {}
+                        : {approvedByUserId:ec.user.userId, approvedDate:ec.user.nowTimestamp, isSelfApproved:'Y'})"/>
             <service-call name="mantle.account.InvoiceServices.create#InvoiceItem" disable-authz="true"
                     in-map="{invoiceId:invoiceId, itemTypeEnumId:'ItemOpeningBalance', quantity:1, amount:amount,
                         overrideGlAccountId:setupRun.migrationGlAccountId,
@@ -988,11 +1016,11 @@ along with this software (see the LICENSE.md file). If not, see
         <description>Whether the organization's accounting can be activated, as rows each with its state (ready, check or
             blocks activation), message and the items it names: preferences, chart, the open periods of the opening day, the
             posting guard, the migration clearing, receivable and payable accounts, mappings to summary accounts and mapped
-            accounts not in the chart, the inventory WIP and transfer accounts and costing basis, single currency until
-            base-currency posting (open documents and active prices), the sales tax method, bank accounts, the paused past
-            due email job, entries posted before the opening balances, balanced opening balances and the open items'
-            tie-out. One check that fails is named and the
-            others go on. Refuses a user without finance administration.</description>
+            accounts not in the chart, the inventory WIP and transfer accounts and costing basis, single currency until base-
+            currency posting (open documents and active prices), the sales tax method, bank accounts, the paused past due email
+            job, the production cost accounts (a warning until Manufacturing), entries posted before the opening balances,
+            balanced opening balances and the open items' tie-out. One check that fails is named and the others go on. Refuses a
+            user without finance administration.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
         </in-parameters>

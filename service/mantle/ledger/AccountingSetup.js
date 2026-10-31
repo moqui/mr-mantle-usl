@@ -138,7 +138,7 @@ function readiness(p) {
         ? run.statusId === "AsrActivated"
             ? "active"
             : "inSetup"
-        : one(PREF, {organizationPartyId: org})
+        : lib.preference(org).organizationPartyId
           ? "configured"
           : "unconfigured"
     for (const [name, check] of [

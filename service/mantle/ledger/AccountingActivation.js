@@ -177,17 +177,20 @@ function preview(p) {
     if (!scope.organizationPartyId) return Object.assign(out, {organizationPartyId: null, setupRun: null})
     const org = scope.organizationPartyId
     const own = one("mantle.ledger.config.PartyAcctgPreference", {organizationPartyId: org})
+    // configured with its own preference or one inherited through its rollup (PrtOrgRollup)
     const preference = policy.preference(org)
+    const configured = !!preference.organizationPartyId
     out.organizationPartyId = org
-    out.configured = !!own
+    out.configured = configured
+    out.inheritedFrom = configured && !own ? preference.organizationPartyId : null
     out.basis = Object.assign(
         policy.pick(map(preference), ["baseCurrencyUomId", "fiscalYearStartMonth", "fiscalYearStartDay", "cogsMethodEnumId"]),
-        {configured: !!own}
+        {configured}
     )
     out.currencyUomId = preference.baseCurrencyUomId || null
     const run = setupRun(org)
     if (!run) {
-        const migration = own
+        const migration = configured
             ? call("mantle.ledger.LedgerServices.get#DefaultGlAccountByType", {
                   organizationPartyId: org,
                   glAccountTypeEnumId: "GatMigrationClearing"
@@ -199,8 +202,10 @@ function preview(p) {
     const names = accountNames([run.migrationGlAccountId, ...tie.lines.map(row => row.glAccountId)])
     const status = one("moqui.basic.StatusItem", {statusId: run.statusId})
     out.lastImport = entityLib.json(run.lastImportJson, null)
+    out.lastCheck = entityLib.json(run.lastCheckJson, null)
     const shown = display(run)
     delete shown.lastImportJson
+    delete shown.lastCheckJson
     out.setupRun = Object.assign(shown, {
         statusDescription: status?.description || run.statusId,
         migrationAccountName: names[run.migrationGlAccountId] || run.migrationGlAccountId,
@@ -267,18 +272,27 @@ const labels = {
     TAX_METHOD: "Sales tax",
     BANK_METHODS: "Bank accounts",
     REMINDER_JOB: "Past due email job",
+    PRODUCTION_ACCOUNTS: "Production cost accounts",
     POSTED_HISTORY: "Entries already posted",
     OPENING_BALANCED: "Opening balances",
     OPEN_ITEM_TIE: "Open items against the opening balances"
 }
 // Every posting mapping row of the organization naming an account, as [kind label, key text, account ID].
+// The mapping rows that apply to the organization: its own, else those of the nearest organization it rolls up to.
+function chainRows(entity, org, orderBy) {
+    for (const organizationPartyId of policy.organizationChain(org)) {
+        const found = Array.from(find(entity, {organizationPartyId}).orderBy(orderBy).list())
+        if (found.length) return found
+    }
+    return []
+}
 function mappedAccounts(org) {
     const out = []
     for (const [kind, descriptor] of Object.entries(setup.mappings)) {
         if (kind === "assignment") continue
         const entity = descriptor[0].includes(".") ? descriptor[0] : "mantle.ledger.config." + descriptor[0]
         const accountFields = descriptor[2].filter(field => field === "glAccountId" || field.endsWith("GlAccountId"))
-        for (const row of find(entity, {organizationPartyId: org}).orderBy(descriptor[1].join(",")).list())
+        for (const row of chainRows(entity, org, descriptor[1].join(",")))
             for (const field of accountFields)
                 if (row[field]) out.push([kind, descriptor[1].map(key => row[key]).filter(Boolean).join(" / "), row[field]])
     }
@@ -409,7 +423,7 @@ function readiness(p) {
         [
             "WIP_TRANSFER",
             () => {
-                const inventory = rows("mantle.ledger.config.AssetTypeGlAccount", {organizationPartyId: org}).filter(
+                const inventory = chainRows("mantle.ledger.config.AssetTypeGlAccount", org, "assetTypeGlAccountId").filter(
                     row => row.assetTypeEnumId === "AstTpInventory"
                 )
                 if (!inventory.length) return ["blocker", "Map the inventory accounts"]
@@ -489,6 +503,24 @@ function readiness(p) {
                 return !job || job.paused === "Y"
                     ? ["ok", "Paused: dunning sends the payment reminders"]
                     : ["warning", "Pause the send_SalesInvoicePastDueEmails job; dunning sends the payment reminders"]
+            }
+        ],
+        [
+            "PRODUCTION_ACCOUNTS",
+            () => {
+                // the account types the production cost close (Manufacturing, not built yet) posts to
+                const missing = ["GatLaborApplied", "GatOverheadApplied", "GatOutsideProcessAccrued", "GatProductionVariance"]
+                    .filter(
+                        glAccountTypeEnumId =>
+                            !call("mantle.ledger.LedgerServices.get#DefaultGlAccountByType", {
+                                organizationPartyId: org,
+                                glAccountTypeEnumId
+                            }).glAccountId
+                    )
+                    .map(id => one("moqui.basic.Enumeration", {enumId: id})?.description || id)
+                return missing.length
+                    ? ["warning", "Map the production cost accounts before closing production runs", missing]
+                    : ["ok", "Mapped"]
             }
         ],
         [
@@ -653,13 +685,14 @@ function importItems(p) {
         failedCount: count("failed"),
         complete: count("failed") === 0
     }
-    // the counts and the refused rows (the first 500, with how many there were) kept on the run for review
-    const run = find(RUN, {organizationPartyId: scope.organizationPartyId}).forUpdate(true).one()
+    // the counts and the refused rows (the first 500, with how many there were) kept on the run for review: an import's
+    // and a check's apart, so a check never hides what the last import refused
+    const run = find(RUN, {organizationPartyId: scope.organizationPartyId}).one()
     if (run) {
         const failedRows = rowResults.filter(row => row.result === "failed")
         call("update#" + RUN, {
             setupRunId: run.setupRunId,
-            lastImportJson: JSON.stringify(
+            [p.verifyOnly === true ? "lastCheckJson" : "lastImportJson"]: JSON.stringify(
                 Object.assign(policy.pick(result, ["createdCount", "existingCount", "validCount", "failedCount"]), {
                     verifyOnly: p.verifyOnly === true,
                     importedDate: ec.l10n.format(ec.user.nowTimestamp, "yyyy-MM-dd HH:mm"),
