@@ -2178,8 +2178,10 @@ along with this software (see the LICENSE.md file). If not, see
 
             <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="originalInvoice">
                 <field-map field-name="invoiceId" from="originalInvoiceId"/></entity-find-one>
+            <!-- in item order, so the new items are numbered as the originals are (unordered, Postgres returns them in
+                row-storage order: F429) -->
             <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="originalInvoiceItemList">
-                <econdition field-name="invoiceId" from="originalInvoiceId"/></entity-find>
+                <econdition field-name="invoiceId" from="originalInvoiceId"/><order-by field-name="invoiceItemSeqId"/></entity-find>
             <iterate list="originalInvoiceItemList" entry="originalInvoiceItem">
                 <!-- if there is a TimeEntry with this as a vendor InvoiceItem skip it so it isn't double billed (and at the incorrect rate) -->
                 <entity-find entity-name="mantle.work.time.TimeEntry" list="timeEntryList">

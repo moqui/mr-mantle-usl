@@ -39,9 +39,10 @@ along with this software (see the LICENSE.md file). If not, see
             <if condition="['InvoiceInProcess', 'InvoiceIncoming', 'InvoiceReceived', 'InvoiceCancelled'].includes(invoice.statusId)">
                 <return message="Invoice ${invoiceId} cannot be posted in status ${invoice.statusId}"/></if>
 
-            <!-- get all InvoiceItems, including sub-items and all types as we'll post them flat -->
+            <!-- get all InvoiceItems, including sub-items and all types as we'll post them flat; in item order, so the
+                entries are numbered as the items are (unordered, Postgres returns them in row-storage order: F429) -->
             <entity-find entity-name="mantle.account.invoice.InvoiceItem" list="invoiceItemList">
-                <econdition field-name="invoiceId"/></entity-find>
+                <econdition field-name="invoiceId"/><order-by field-name="invoiceItemSeqId"/></entity-find>
             <if condition="!invoiceItemList?.length"><return message="Invoice ${invoiceId} has no items, not posting to GL"/></if>
 
             <service-call name="mantle.ledger.InvoiceAutoPostServices.get#InvoicePartyAcctgPreferences"
