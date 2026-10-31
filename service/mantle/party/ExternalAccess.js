@@ -86,6 +86,7 @@ function create(p) {
         recordId: p.recordId,
         scopes: scopes.join(","),
         tokenDigest: ec.user.singleUseCodeHash(token),
+        issuerKind: p.issuerKind === "contact" ? "contact" : "organization",
         fromDate: ec.user.nowTimestamp,
         thruDate,
         createdByUserId: ec.user.userId
@@ -96,27 +97,18 @@ function create(p) {
     const url = siteId ? apps.pageUrl(siteId, kind.page.app, kind.page.path + encodeURIComponent(token)) : null
     return {capabilityId: out.capabilityId, token, url, thruDate, organizationPartyId: record.organizationPartyId}
 }
-// Who is looking a token up: a registered PASS deployment forwards its browser's address. This is Account.js's
-// requesterKey, which the framework does not export (reported for the framework).
-function requesterKey() {
-    const request = ec.web?.request
-    if (!request) return "service"
-    const clientId = request.getHeader("x-pass-client") || "",
-        forwarded = request.getHeader("x-pass-client-ip") || ""
-    const account = ec.resource.script("component://framework/service/org/moqui/public/Account.js")
-    if (forwarded && account.clientRegistered(clientId, request.getHeader("x-pass-client-secret") || "", null))
-        return "client:" + clientId + ":" + forwarded.slice(0, 64)
-    return request.remoteAddr || "service"
-}
 // The capability a token names while it is in effect, or null. Every lookup counts against the requester's limit
 // before the lookup, so a requester over it is refused whether its token is good or not.
+// The requester as the framework's sign-in limits know it: a registered PASS deployment's browser address, else the
+// request's own (behind a proxy, configure the framework's trusted proxies so this is the browser's).
+const account = () => ec.resource.script("component://framework/service/org/moqui/public/Account.js")
 const TOKEN_LOOKUPS = 100
 function tokenCapability(token) {
     const allowed = ec.service
         .sync()
         .throwOnError(true)
         .name("org.moqui.public.AccountServices.record#Attempt")
-        .parameters({input: {key: "access-token:" + requesterKey(), limit: TOKEN_LOOKUPS, windowMillis: 600000}})
+        .parameters({input: {key: "access-token:" + account().requesterKey(), limit: TOKEN_LOOKUPS, windowMillis: 600000}})
         .requireNewTransaction(true)
         .call().result.allowed
     if (!allowed) {
@@ -187,10 +179,16 @@ function revoke(p) {
         call("update#" + C, {capabilityId: row.capabilityId, revokedDate: ec.user.nowTimestamp, revokedByUserId: ec.user.userId})
     return {capabilityId: row.capabilityId, revoked: true}
 }
-// End a record's links in effect for a scope; the caller has checked who may (a new pay link replaces the earlier ones).
-function revokeActive(recordType, recordId, scope) {
+// End a record's links in effect for a scope made by one kind of issuer (the organization, or a contact); the caller has
+// checked who may. A new pay link replaces its issuer kind's earlier ones, never the other kind's.
+function revokeActive(recordType, recordId, scope, issuerKind = "organization") {
     for (const row of rows(C, {recordType, recordId}))
-        if (!row.revokedDate && lib.entityLib.active(row) && scopeList(row.scopes).includes(scope))
+        if (
+            !row.revokedDate &&
+            lib.entityLib.active(row) &&
+            scopeList(row.scopes).includes(scope) &&
+            (row.issuerKind || "organization") === issuerKind
+        )
             call("update#" + C, {capabilityId: row.capabilityId, revokedDate: ec.user.nowTimestamp, revokedByUserId: ec.user.userId})
 }
 // The links of a record, newest first, without their tokens.

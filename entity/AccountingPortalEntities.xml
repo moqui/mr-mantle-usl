@@ -51,9 +51,12 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="contactPartyId" type="id"/>
         <field name="returnKeyDigest" type="text-medium"/>
         <field name="createdDate" type="date-time"/>
+        <field name="settledDate" type="date-time"><description>When the payment stopped being pending; the return
+            reference reads the attempt for a day after it.</description></field>
         <relationship type="one" related="mantle.account.payment.Payment"/>
         <relationship type="one" related="mantle.account.invoice.Invoice"/>
         <index name="PORTAL_PAY_INVOICE"><index-field name="invoiceId"/></index>
+        <index name="PORTAL_PAY_OPEN"><index-field name="settledDate"/><index-field name="createdDate"/></index>
     </entity>
     <extend-entity entity-name="PartyAcctgPreference" package="mantle.ledger.config">
         <field name="invoicePayGatewayConfigId" type="id" enable-audit-log="update">

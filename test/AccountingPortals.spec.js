@@ -515,8 +515,12 @@ feature("pending attempts resolve: the invoice page asks the gateway, the job se
         const stuckStart = portal("start#InvoicePayment", {siteId: site, token: stuckToken, operationId: "portal-res-0003", confirm: true})
         login("john.doe")
         ec.artifactExecution.disableAuthz()
-        // the gateway gave neither a reference to ask about nor a page to go to
+        // the gateway gave neither a reference to ask about nor a page to go to, and the start-up grace has passed
         settlement().call("update#mantle.account.payment.Payment", {paymentId: stuckStart.attempt.attemptId, paymentRefNum: null})
+        settlement().call("update#mantle.account.payment.PortalPaymentAttempt", {
+            paymentId: stuckStart.attempt.attemptId,
+            createdDate: new Date(Date.now() - 10 * 60000)
+        })
         for (const row of settlement().lib.rows("mantle.account.method.PaymentGatewayResponse", {paymentId: stuckStart.attempt.attemptId}))
             settlement().call("update#mantle.account.method.PaymentGatewayResponse", {
                 paymentGatewayResponseId: row.paymentGatewayResponseId,
@@ -618,6 +622,114 @@ feature("a new pay link ends the invoice's earlier ones, an expiry is capped at 
         second.revokedDate == null
         Number(far.thruDate) <= Date.now() + 367 * 86400000
         revoked.revoked == true
+    }
+})
+
+feature("the return's reference reads for a day after its attempt settles and only while the invoice stands; a young attempt waits and an abandoned one fails", {
+    when() {
+        const c = settlement().call
+        const paidId = invoice("21"),
+            waitId = invoice("22"),
+            youngId = invoice("23")
+        login(f.users.ar)
+        const token = id => access("create#AccessCapability", {recordType: "Invoice", recordId: id, scopes: "InvoicePay"}).token
+        const paidToken = token(paidId),
+            waitToken = token(waitId),
+            youngToken = token(youngId)
+        const keyOf = out => decodeURIComponent(/[?&]key=([^&]+)/.exec(out.attempt.redirectUrl)[1])
+        login("john.doe")
+        payThrough("ACCT_PORTAL_HOSTED")
+        logout()
+        const paid = portal("start#InvoicePayment", {siteId: site, token: paidToken, operationId: "portal-key-0001", confirm: true})
+        const paidKey = keyOf(paid)
+        const paidRead = portal("get#PaymentResult", {siteId: site, attemptId: paid.attempt.attemptId, returnKey: paidKey})
+        login("john.doe")
+        ec.artifactExecution.disableAuthz()
+        c("update#mantle.account.payment.PortalPaymentAttempt", {
+            paymentId: paid.attempt.attemptId,
+            settledDate: new Date(Date.now() - 25 * 3600000)
+        })
+        payThrough("ACCT_PORTAL_WAIT")
+        logout()
+        const paidLater = portal("get#PaymentResult", {siteId: site, attemptId: paid.attempt.attemptId, returnKey: paidKey})
+        const wait = portal("start#InvoicePayment", {siteId: site, token: waitToken, operationId: "portal-key-0002", confirm: true})
+        const waitKey = keyOf(wait)
+        const waitRead = portal("get#PaymentResult", {siteId: site, attemptId: wait.attempt.attemptId, returnKey: waitKey})
+        const young = portal("start#InvoicePayment", {siteId: site, token: youngToken, operationId: "portal-key-0003", confirm: true})
+        login("john.doe")
+        ec.artifactExecution.disableAuthz()
+        c("update#mantle.account.invoice.Invoice", {invoiceId: waitId, statusId: "InvoiceCancelled"})
+        // the young attempt lost its reference and page at once: still within its start-up grace
+        c("update#mantle.account.payment.Payment", {paymentId: young.attempt.attemptId, paymentRefNum: null})
+        for (const row of settlement().lib.rows("mantle.account.method.PaymentGatewayResponse", {paymentId: young.attempt.attemptId}))
+            c("update#mantle.account.method.PaymentGatewayResponse", {paymentGatewayResponseId: row.paymentGatewayResponseId, redirectUrl: null})
+        logout()
+        const waitCancelled = portal("get#PaymentResult", {siteId: site, attemptId: wait.attempt.attemptId, returnKey: waitKey})
+        const youngView = portal("get#Invoice", {siteId: site, token: youngToken})
+        login("john.doe")
+        ec.artifactExecution.disableAuthz()
+        // pending at the gateway for eight days: abandoned
+        c("update#mantle.account.payment.Payment", {paymentId: young.attempt.attemptId, paymentRefNum: "TEST-HOSTED-OLD"})
+        c("update#mantle.account.payment.PortalPaymentAttempt", {
+            paymentId: young.attempt.attemptId,
+            createdDate: new Date(Date.now() - 8 * 86400000)
+        })
+        logout()
+        const abandonedView = portal("get#Invoice", {siteId: site, token: youngToken})
+        login("john.doe")
+        ec.artifactExecution.disableAuthz()
+        return {
+            paidRead,
+            paidLater,
+            waitRead,
+            waitCancelled,
+            youngView,
+            abandonedView,
+            youngStatus: one("mantle.account.payment.Payment", {paymentId: young.attempt.attemptId}).statusId
+        }
+    },
+    then({paidRead, paidLater, waitRead, waitCancelled, youngView, abandonedView, youngStatus}) {
+        paidRead.attempt.state == "paid"
+        paidLater.errorKind == "NotFound"
+        waitRead.attempt.state == "pending"
+        waitCancelled.errorKind == "NotFound"
+        youngView.attempt.state == "pending"
+        abandonedView.attempt == null
+        youngStatus == "PmntCancelled"
+    }
+})
+
+feature("a contact's shared pay link never ends the organization's emailed link; each kind replaces only its own", {
+    when() {
+        const invoiceId = invoice("19")
+        const issue = input => settlement().call("mantle.account.PortalServices.issue#InvoiceAccess", {input}).result
+        login(f.users.ar)
+        const emailed = issue({invoiceId})
+        login("acct.portal.payer")
+        const shared = issue({siteId: site, invoiceId})
+        const sharedAgain = issue({siteId: site, invoiceId})
+        const revoked = id => {
+            login("john.doe")
+            ec.artifactExecution.disableAuthz()
+            return one("mantle.party.ExternalAccessCapability", {capabilityId: id}).revokedDate != null
+        }
+        const emailedAfterShares = revoked(emailed.capabilityId)
+        login(f.users.ar)
+        const emailedAgain = issue({invoiceId})
+        return {
+            emailedAfterShares,
+            emailed: revoked(emailed.capabilityId),
+            shared: revoked(shared.capabilityId),
+            sharedAgain: revoked(sharedAgain.capabilityId),
+            emailedAgain: revoked(emailedAgain.capabilityId)
+        }
+    },
+    then({emailedAfterShares, emailed, shared, sharedAgain, emailedAgain}) {
+        emailedAfterShares == false
+        emailed == true
+        shared == true
+        sharedAgain == false
+        emailedAgain == false
     }
 })
 

@@ -502,7 +502,8 @@ Accounting's customer and supplier pages are the PASS Billing and Supplier apps 
   signed-in user holds a contact grant for, on that organization's app; anything else NotFound). `invite#Contact` makes a
   PASS invitation bound to an app and an outside organization; `redeem#Invitation` then gives the account's party an
   `ExternalAccessContact` grant for that organization, app and party, with no user group. Every token lookup counts
-  against the requester's limit before it is made. A new pay link revokes the invoice's earlier ones.
+  against the requester's limit (the framework's `requesterKey`) before it is made. A new pay link revokes the earlier
+  ones its issuer kind made (`issuerKind`: the organization's, or a contact's).
 - **Site apps.** `public/PublicApps.js` lists the apps a site may mount; Billing and Supplier take an internal
   organization as target (`PublicSiteApp.targetId`), which only an operator sets and a core mount save keeps, and add
   readiness checks (`check#AppReadiness`). `pageUrl` builds a page's address from the canonical host and the mount.
@@ -518,8 +519,9 @@ Accounting's customer and supplier pages are the PASS Billing and Supplier apps 
   operation, resumes an attempt still pending, else creates a promised card payment for what is due
   (`forInvoiceId`) with its `PortalPaymentAttempt` (in its own transaction), then calls `authorize#SinglePayment` with
   `returnUrl`, the app's return path carrying the attempt and a reference only it holds. The pages show, refresh and
-  capture only portal attempts; the invoice page and the `resolve_PortalPayments` job ask the gateway, and an attempt
-  with nothing to ask and no page is cancelled. A hosted gateway answers
+  capture only portal attempts; the invoice page and the `resolve_PortalPayments` job (unsettled attempts only) ask the
+  gateway; an attempt with nothing to ask and no page after five minutes, or pending for seven days, is cancelled. The
+  return reference reads its attempt while pending and for a day after it settles, while the invoice is issued. A hosted gateway answers
   pending with its page (`PaymentGatewayResponse.redirectUrl`); `get#PaymentResult` asks the gateway
   (`get#SinglePaymentGatewayDetails`) and captures an authorization, and `PaymentApplyForInvoice` applies a delivered
   payment. Nothing the payer's browser brings back is read. Test gateway: `hostedPending#PaymentAuthorization`,

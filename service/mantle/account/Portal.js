@@ -131,16 +131,35 @@ function asPortalPayment(paymentId, work) {
         else shared[PORTAL_PAYMENT] = before
     }
 }
+// How long an attempt with no reference yet may wait (the gateway may still be answering), and how long a hosted attempt
+// may stay pending before it is taken as abandoned.
+const STARTING_MS = 5 * 60000,
+    ABANDONED_MS = 7 * 86400000
+// Whether a pending attempt has failed without asking the gateway: nothing to ask and no page after its start-up grace,
+// or pending past the abandonment cutoff.
+function failedWithoutAnswer(payment, attempt) {
+    const age = Date.now() - (lib.ms(attempt?.createdDate) ?? 0)
+    if (age > ABANDONED_MS) return true
+    return !payment.paymentRefNum && !redirectOf(payment.paymentId) && age > STARTING_MS
+}
+// Record when an attempt stopped being pending, which bounds how long its return reference reads it.
+function settle(paymentId) {
+    const payment = one(P, {paymentId}),
+        attempt = one(ATT, {paymentId})
+    if (attempt && !attempt.settledDate && !pending(payment))
+        call("update#" + ATT, {paymentId, settledDate: ec.user.nowTimestamp})
+    return payment
+}
 // Look the gateway up for a pending portal payment, under its lock, and capture an authorization: the outcome is the
-// gateway's, never what the payer's browser carries back. A pending payment with no reference to look up and no page to
-// send the payer to has failed, and is cancelled.
+// gateway's, never what the payer's browser carries back. An attempt that failed without an answer is cancelled.
 function refresh(paymentId) {
     const payment = find(P, {paymentId}).forUpdate(true).one()
-    if (!pending(payment)) return payment
-    if (!payment.paymentRefNum) {
-        if (!redirectOf(paymentId)) call("update#" + P, {paymentId, statusId: "PmntCancelled"})
-        return one(P, {paymentId})
+    if (!pending(payment)) return settle(paymentId)
+    if (failedWithoutAnswer(payment, one(ATT, {paymentId}))) {
+        call("update#" + P, {paymentId, statusId: "PmntCancelled"})
+        return settle(paymentId)
     }
+    if (!payment.paymentRefNum) return payment
     asPortalPayment(paymentId, () => {
         try {
             call("mantle.account.PaymentServices.get#SinglePaymentGatewayDetails", {paymentId})
@@ -151,7 +170,7 @@ function refresh(paymentId) {
         if (one(P, {paymentId}).statusId === "PmntAuthorized")
             call("mantle.account.PaymentServices.capture#SinglePayment", {paymentId, operationKey: "pay-capture-" + paymentId})
     })
-    return one(P, {paymentId})
+    return settle(paymentId)
 }
 // The invoice's attempt still pending after asking the gateway, or null.
 function openAttempt(invoiceId) {
@@ -216,8 +235,10 @@ function issueInvoiceAccess(p) {
         siteId = apps.sitesFor("billing", access.requireIssuer("Invoice", p.invoiceId).organizationPartyId)[0]
         if (!siteId) return {issued: false}
     }
-    access.revokeActive("Invoice", p.invoiceId, "InvoicePay")
-    const created = access.create({recordType: "Invoice", recordId: p.invoiceId, scopes: "InvoicePay", validDays: 120})
+    // a contact's link ends its own earlier links, the organization's its own: a contact never ends the emailed link
+    const issuerKind = p.siteId ? "contact" : "organization"
+    access.revokeActive("Invoice", p.invoiceId, "InvoicePay", issuerKind)
+    const created = access.create({recordType: "Invoice", recordId: p.invoiceId, scopes: "InvoicePay", validDays: 120, issuerKind})
     const url = apps.pageUrl(siteId, "billing", "/InvoicePay?token=" + encodeURIComponent(created.token))
     return {issued: !!url, capabilityId: created.capabilityId, token: created.token, url, expiresAt: created.thruDate}
 }
@@ -230,8 +251,14 @@ function beginPayment(p) {
         invoiceId: invoice.invoiceId
     })
     if (operation.old) return Object.assign(lib.previous(operation), {alreadyApplied: true})
-    const open = openAttempt(invoice.invoiceId)
-    if (open) return {attemptId: open.paymentId, resumed: true}
+    // an attempt still pending is resumed; start#InvoicePayment asks its gateway after this transaction, not under the
+    // invoice's lock. One that failed without an answer is cancelled here, which needs no gateway.
+    for (const payment of attempts(invoice.invoiceId).filter(pending)) {
+        if (!failedWithoutAnswer(payment, one(ATT, {paymentId: payment.paymentId})))
+            return {attemptId: payment.paymentId, resumed: true}
+        call("update#" + P, {paymentId: payment.paymentId, statusId: "PmntCancelled"})
+        settle(payment.paymentId)
+    }
     const due = lib.totals(invoice).unpaidTotal
     if (due.compare(0) <= 0) fail("Conflict", "Nothing is due on this invoice")
     const paymentId = call("mantle.account.PaymentServices.create#Payment", {
@@ -309,20 +336,25 @@ function startInvoicePayment(p) {
     // pending with nothing to look up and no page to go to: failed, not left to be resumed
     const after = one(P, {paymentId})
     if (pending(after) && !after.paymentRefNum && !redirectOf(paymentId)) call("update#" + P, {paymentId, statusId: "PmntCancelled"})
-    return {attempt: attemptView(one(P, {paymentId})), resumed: false}
+    return {attempt: attemptView(settle(paymentId)), resumed: false}
 }
 // An attempt's outcome, for its invoice's link or contact, or for the reference its gateway return carries (returnKey),
 // which reads this attempt and its invoice only, on the site it was started from.
+const RETURN_READ_MS = 86400000
 function getPaymentResult(p) {
     const row = p.attemptId && one(ATT, {paymentId: p.attemptId})
     if (!row) unavailable()
     if (p.returnKey) {
+        // the reference reads while the attempt is pending or for a day after it settled, and only while the invoice can
+        // still be reached (issued, not cancelled), on the organization's site it came from
         const organizationPartyId = served(p.siteId, "billing")
-        const invoice = one(I, {invoiceId: row.invoiceId})
+        const record = access.recordOf("Invoice", row.invoiceId)
+        const settledLongAgo = row.settledDate && Date.now() - lib.ms(row.settledDate) > RETURN_READ_MS
         if (
             row.siteId !== p.siteId ||
             row.returnKeyDigest !== ec.user.singleUseCodeHash(String(p.returnKey)) ||
-            invoice?.fromPartyId !== organizationPartyId
+            record?.organizationPartyId !== organizationPartyId ||
+            settledLongAgo
         )
             unavailable()
     } else checkInvoice(p, row.invoiceId)
@@ -331,19 +363,14 @@ function getPaymentResult(p) {
 // The job (resolve_PortalPayments): the portal payments still pending, oldest first, each asked of its gateway in its own
 // transaction; one that fails is named and the rest go on.
 function resolvePending(p) {
-    // the payments still promised or authorized, through their attempts (a payment once settled is not read again)
+    // the portal attempts not yet settled, oldest first (no other payment is read)
     const ids = Array.from(
-        find(P)
-            .condition("statusId", "in", ["PmntPromised", "PmntAuthorized"])
-            .condition("paymentInstrumentEnumId", "PiCreditCard")
-            .condition("forInvoiceId", "is-not-null", null)
-            .orderBy("paymentId")
-            .limit(1000)
+        find(ATT)
+            .condition("settledDate", "is-null", null)
+            .orderBy("createdDate")
+            .limit(Number(p.limit || 200))
             .list()
-    )
-        .map(row => row.paymentId)
-        .filter(paymentId => !!one(ATT, {paymentId}))
-        .slice(0, Number(p.limit || 200))
+    ).map(row => row.paymentId)
     let resolved = 0,
         failed = 0
     for (const paymentId of ids) {

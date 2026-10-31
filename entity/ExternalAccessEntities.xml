@@ -31,6 +31,9 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="recordId" type="id"/>
         <field name="scopes" type="text-medium"/>
         <field name="tokenDigest" type="text-medium"/>
+        <field name="issuerKind" type="id">
+            <description>organization (an internal user's link) or contact (a signed-in contact's shared
+                link).</description></field>
         <field name="fromDate" type="date-time"/>
         <field name="thruDate" type="date-time"/>
         <field name="revokedDate" type="date-time"/>
