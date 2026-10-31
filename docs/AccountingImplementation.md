@@ -499,9 +499,10 @@ Accounting's customer and supplier pages are the PASS Billing and Supplier apps 
   customer invoice with `RECEIVABLE_EDIT`, a purchase order with `PAYABLE_EDIT`, in the record's organization; answers
   the record's page on the organization's site), `revoke#`, `find#AccessCapabilities`, `check#AccessToken` (misses limited
   per requester) and `check#AccessCapability` (a token's record within its scope, or a record whose outside party the
-  signed-in user is a contact of; anything else NotFound). `invite#Contact` makes a PASS invitation bound to an app and
-  an outside organization; `redeem#Invitation` then makes the account's party a contact (`PrtContact`) of it, with no
-  user group.
+  signed-in user holds a contact grant for, on that organization's app; anything else NotFound). `invite#Contact` makes a
+  PASS invitation bound to an app and an outside organization; `redeem#Invitation` then gives the account's party an
+  `ExternalAccessContact` grant for that organization, app and party, with no user group. Every token lookup counts
+  against the requester's limit before it is made. A new pay link revokes the invoice's earlier ones.
 - **Site apps.** `public/PublicApps.js` lists the apps a site may mount; Billing and Supplier take an internal
   organization as target (`PublicSiteApp.targetId`), which only an operator sets and a core mount save keeps, and add
   readiness checks (`check#AppReadiness`). `pageUrl` builds a page's address from the canonical host and the mount.
@@ -515,17 +516,22 @@ Accounting's customer and supplier pages are the PASS Billing and Supplier apps 
 - **Invoice payment.** The organization's gateway is `PartyAcctgPreference.invoicePayGatewayConfigId` (one of its
   PaymentGatewayOrganization bindings; `store#Preferences`). `start#InvoicePayment` locks the invoice, answers a retried
   operation, resumes an attempt still pending, else creates a promised card payment for what is due
-  (`forInvoiceId`) and calls `authorize#SinglePayment` with `returnUrl`, the app's return path. A hosted gateway answers
+  (`forInvoiceId`) with its `PortalPaymentAttempt` (in its own transaction), then calls `authorize#SinglePayment` with
+  `returnUrl`, the app's return path carrying the attempt and a reference only it holds. The pages show, refresh and
+  capture only portal attempts; the invoice page and the `resolve_PortalPayments` job ask the gateway, and an attempt
+  with nothing to ask and no page is cancelled. A hosted gateway answers
   pending with its page (`PaymentGatewayResponse.redirectUrl`); `get#PaymentResult` asks the gateway
   (`get#SinglePaymentGatewayDetails`) and captures an authorization, and `PaymentApplyForInvoice` applies a delivered
   payment. Nothing the payer's browser brings back is read. Test gateway: `hostedPending#PaymentAuthorization`,
   `alwaysPending#` and `alwaysDecline#PaymentDetails`.
 - **Supplier bills.** `submit#SupplierBill` answers a repeat of the operation or of the supplier's bill number with the
-  first `SupplierBillSubmission`, stages the file under `pass_media_root/bills` and scans it (`pass_scanner_service`),
+  first `SupplierBillSubmission`, stages the file under `pass_media_root/bills`, checks its leading bytes are the PDF,
+  PNG or JPEG it says (kept with that extension) and scans it (`pass_scanner_service`),
   and makes the incoming draft through `import#Bill`'s core (`Payables.js` `portalBill`, the capability in place of
   `PAYABLE_IMPORT`), the file becoming its content only when clean. It never approves.
-- **Posting guard.** A source document's own posting by no user or a public account (a customer's payment, a gateway's
-  answer, a job) skips the user's organization check; manual postings and reversals do not (F370).
+- **Posting guard.** While Portal.js completes one checked portal payment it names it in the execution context's shared
+  map (`PostingGuard.PORTAL_PAYMENT`); that payment's posting, or its application's, to the organization it is paid to
+  skips the user's organization check. Nothing else does (F378).
 
 ## Libraries
 
