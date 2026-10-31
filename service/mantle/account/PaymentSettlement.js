@@ -221,14 +221,22 @@ function adjustmentRow(scope, date, byKey, row, index) {
     const target = byKey[key("invoice", row.invoiceId)],
         amount = lib.amount(row.amount, scope.currencyUomId)
     let glAccountId = row.glAccountId
-    // A prompt-payment discount the invoice's due schedule offers on the date posts to the discount account; any other
-    // discount or write-off names its account.
-    if (!glAccountId && row.itemTypeEnumId === "ItemPromptDiscount") {
+    // A prompt-payment discount the invoice's due schedule offers on the date posts to the discount account and is issued
+    // at once (create#InvoiceCreditMemo promptDiscount); any other discount or write-off names its account, and on a bill
+    // its credit is approved, which needs INVOICE_APPROVE.
+    const promptDiscount =
+        row.itemTypeEnumId === "ItemPromptDiscount" &&
+        (row.promptDiscount === true || row.promptDiscount === "true" || !glAccountId)
+    if (promptDiscount) {
         const offered = terms().schedule(one(I, {invoiceId: row.invoiceId}), date.timestamp).discountAvailable
         if (offered.isZero() || amount.compare(offered) > 0)
             denied("DISCOUNT_NOT_AVAILABLE", "The invoice's terms offer no discount of this amount on the accounting date")
-        glAccountId = terms().discountAccount(scope.organizationPartyId, scope.direction === "receivable")
-    }
+        glAccountId = glAccountId || terms().discountAccount(scope.organizationPartyId, scope.direction === "receivable")
+    } else if (scope.direction === "payable" && !lib.has("INVOICE_APPROVE"))
+        denied(
+            "ADJUSTMENT_APPROVAL_REQUIRED",
+            "A write-off or a discount outside the bill's terms is approved as a credit; ask a user who approves bills"
+        )
     if (!glAccountId) denied("ADJUSTMENT_ACCOUNT_REQUIRED", "Choose an explicit adjustment account")
     const account = policy.account(scope.organizationPartyId, glAccountId, date.timestamp)
     return {
@@ -240,6 +248,7 @@ function adjustmentRow(scope, date, byKey, row, index) {
         amount: String(amount),
         currencyUomId: scope.currencyUomId,
         glAccountId,
+        promptDiscount,
         accountCode: account.row.accountCode,
         accountName: account.row.accountName,
         reason: String(row.reason).trim()
@@ -380,7 +389,7 @@ function normalized(p, lock = false) {
         accountingDate: date.day,
         allocations: allocationRows.map(row => policy.pick(row, ["sourceKey", "targetKey", "amount"])),
         adjustments: adjustmentRows.map(row =>
-            policy.pick(row, ["invoiceId", "itemTypeEnumId", "amount", "glAccountId", "reason"])
+            policy.pick(row, ["invoiceId", "itemTypeEnumId", "amount", "glAccountId", "reason", "promptDiscount"])
         ),
         sourceVersions
     }
@@ -566,10 +575,12 @@ function createAdjustment(row, plan, request) {
         amount: row.amount,
         itemTypeEnumId: row.itemTypeEnumId,
         overrideGlAccountId: row.glAccountId,
-        description: row.reason
+        description: row.reason,
+        promptDiscount: !!row.promptDiscount
     })
-    for (const statusId of receivable ? ["InvoiceFinalized"] : ["InvoiceReceived", "InvoiceApproved"])
-        call("update#" + I, {invoiceId: made.invoiceId, statusId, statusId_changeReason: row.reason})
+    if (!row.promptDiscount)
+        for (const statusId of receivable ? ["InvoiceFinalized"] : ["InvoiceReceived", "InvoiceApproved"])
+            call("update#" + I, {invoiceId: made.invoiceId, statusId, statusId_changeReason: row.reason})
     const invoiceIds = verifyPosting(rows(T, {invoiceId: made.invoiceId}), plan.lines, request.organizationPartyId)
     const application = writeApplication(
         {sourceKey: key("credit", made.invoiceId), targetKey: row.targetKey, amount: row.amount},

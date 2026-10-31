@@ -134,24 +134,35 @@ function termLines(p) {
         )
     }
 }
-function addDays(date, days) {
-    const value = new Date(Number(date))
-    value.setDate(value.getDate() + days)
-    return value.getTime()
+// Calendar days (yyyy-MM-dd): an invoice's book day, a day some days later, and a date or timestamp's day. A schedule is
+// kept and compared in days, so the zone of the server or the user never moves a due or discount date.
+const day = value => (value == null || value === "" ? null : lib.policy.calendarDateText(value))
+// The day of a timestamp in the user's zone (a day text stays as it is).
+const stampDay = value =>
+    value == null || value === ""
+        ? null
+        : /^\d{4}-\d{2}-\d{2}$/.test(String(value))
+          ? String(value)
+          : lib.entityLib.bookDay(null, value)
+function bookDay(invoice) {
+    return lib.entityLib.bookDay(invoice.accountingDate, invoice.invoiceDate || ec.user.nowTimestamp)
 }
-// The end of a timestamp's day in the server's zone: a discount may be taken through its last day.
-function endOfDay(time) {
-    const value = new Date(Number(time))
-    value.setHours(23, 59, 59, 999)
-    return value.getTime()
+function addDays(dayText, days) {
+    const [year, month, date] = dayText.split("-").map(Number)
+    const value = new Date(Date.UTC(year, month - 1, date + days))
+    const pad = n => String(n).padStart(2, "0")
+    return value.getUTCFullYear() + "-" + pad(value.getUTCMonth() + 1) + "-" + pad(value.getUTCDate())
 }
 // The schedule an invoice's term gives it: each line's portion of the total and its discount, the last portion taking
 // what rounding leaves; a term without lines is one portion due on the invoice's due date.
 function plannedSchedule(invoice, total) {
     const currency = invoice.currencyUomId,
+        start = bookDay(invoice),
         lines = linesInEffect(invoice.settlementTermId, invoice.invoiceDate || ec.user.nowTimestamp)
     if (!lines.length)
-        return [{scheduleSeqId: "01", dueDate: invoice.dueDate, amount: total, settlementTermId: invoice.settlementTermId}]
+        return [
+            {scheduleSeqId: "01", dueDate: stampDay(invoice.dueDate), amount: total, settlementTermId: invoice.settlementTermId}
+        ]
     let left = total
     return lines.map((line, index) => {
         const last = index === lines.length - 1
@@ -160,9 +171,9 @@ function plannedSchedule(invoice, total) {
         const discount = toDecimal(line.discountPercent || 0)
         return {
             scheduleSeqId: String(index + 1).padStart(2, "0"),
-            dueDate: addDays(invoice.invoiceDate, Number(line.daysBasis || 0)),
+            dueDate: addDays(start, Number(line.daysBasis || 0)),
             amount,
-            discountDate: discount.isZero() ? null : endOfDay(addDays(invoice.invoiceDate, Number(line.discountDays || 0))),
+            discountDate: discount.isZero() ? null : addDays(start, Number(line.discountDays || 0)),
             discountAmount: discount.isZero() ? null : ec.l10n.roundCurrency(amount.multiply(discount).divide(100), currency),
             settlementTermId: invoice.settlementTermId,
             settlementTermLineId: line.settlementTermLineId
@@ -180,49 +191,70 @@ function writeSchedule(p) {
     for (const row of plannedSchedule(invoice, total)) call("create#" + S, Object.assign({invoiceId: p.invoiceId}, row))
     return {written: true}
 }
-// A day as yyyy-MM-dd in the user's zone.
-const day = value => (value == null ? null : ec.l10n.format(value, "yyyy-MM-dd"))
-// An invoice's schedule rows (stored, else planned from its term without storing), each with its discount open on the
-// day given; and the discount open on that day less prompt-payment discounts already credited.
-function schedule(invoice, onDate = ec.user.nowTimestamp) {
-    const stored = rows(S, {invoiceId: invoice.invoiceId}).sort((a, b) => a.scheduleSeqId.localeCompare(b.scheduleSeqId))
-    const list = stored.length ? stored.map(lib.map) : plannedSchedule(invoice, lib.totals(invoice).invoiceTotal)
-    const onDay = day(onDate)
-    let open = toDecimal(0)
-    const out = list.map(row => {
-        const available = row.discountAmount != null && row.discountDate != null && onDay <= day(row.discountDate)
-        if (available) open = open.add(row.discountAmount)
-        return Object.assign({}, row, {
-            dueDateText: day(row.dueDate),
-            discountDateText: row.discountDate ? day(row.discountDate) : null,
-            discountOpen: available
-        })
-    })
-    const taken = rows(I, {creditForInvoiceId: invoice.invoiceId})
-        .filter(row => row.statusId !== "InvoiceCancelled")
-        .filter(row =>
-            rows("mantle.account.invoice.InvoiceItem", {invoiceId: row.invoiceId}).some(
-                item => item.itemTypeEnumId === "ItemPromptDiscount"
-            )
-        )
-        .reduce((sum, row) => sum.add(lib.totals(row).invoiceTotal), toDecimal(0))
-    const unpaid = lib.totals(invoice).unpaidTotal
-    let discountAvailable = open.subtract(taken)
-    if (discountAvailable.compare(0) < 0) discountAvailable = toDecimal(0)
-    if (discountAvailable.compare(unpaid) > 0) discountAvailable = unpaid
-    const openRows = out.filter(row => row.discountOpen)
-    return {
-        rows: out,
-        stored: stored.length > 0,
-        discountAvailable,
-        discountDate: openRows.length ? openRows[0].discountDate : null,
-        discountDateText: openRows.length ? openRows[0].discountDateText : null,
-        nextDueDate: (out.find(row => day(row.dueDate) >= day(ec.user.nowTimestamp)) || out[out.length - 1])?.dueDate ?? null
-    }
+// An issued invoice changed back for edits (Resume Changes, the InvoiceResumedDueSchedule SECA): its schedule is removed,
+// so issuing it again writes the schedule of what it then is. Nothing is applied to an invoice being changed.
+function clearSchedule(p) {
+    const stored = rows(S, {invoiceId: p.invoiceId})
+    for (const row of stored) call("delete#" + S, {invoiceId: row.invoiceId, scheduleSeqId: row.scheduleSeqId})
+    return {cleared: stored.length}
 }
-// The schedules of several invoices by invoice ID, for a page of open items or a run's selection.
+const inIds = (entity, field, ids) => (ids.length ? Array.from(find(entity).condition(field, "in", ids).list()) : [])
+// The schedules of invoices by invoice ID (stored, else planned from the term without storing), read in a few queries:
+// each row with its discount open on the day given, the discount still available then (open discounts less prompt-payment
+// credits already issued, at most the unpaid total) and the next portion due on or after that day.
 function schedules(invoices, onDate = ec.user.nowTimestamp) {
-    return Object.fromEntries(invoices.map(row => [row.invoiceId, schedule(row, onDate)]))
+    const list = Array.from(invoices || [])
+    const ids = list.map(row => row.invoiceId)
+    const onDay = stampDay(onDate)
+    const stored = {},
+        taken = {}
+    for (const row of inIds(S, "invoiceId", ids)) (stored[row.invoiceId] = stored[row.invoiceId] || []).push(lib.map(row))
+    const credits = inIds(I, "creditForInvoiceId", ids).filter(row => row.statusId !== "InvoiceCancelled")
+    const discountCredits = new Set(
+        inIds(
+            "mantle.account.invoice.InvoiceItem",
+            "invoiceId",
+            credits.map(row => row.invoiceId)
+        )
+            .filter(item => item.itemTypeEnumId === "ItemPromptDiscount")
+            .map(item => item.invoiceId)
+    )
+    for (const row of credits.filter(row => discountCredits.has(row.invoiceId)))
+        taken[row.creditForInvoiceId] = (taken[row.creditForInvoiceId] || toDecimal(0)).add(row.invoiceTotal ?? 0)
+    const totals = lib.totalsMany(list)
+    return Object.fromEntries(
+        list.map(invoice => {
+            const own = (stored[invoice.invoiceId] || []).sort((a, b) => a.scheduleSeqId.localeCompare(b.scheduleSeqId))
+            const scheduleRows = own.length ? own : plannedSchedule(invoice, totals[invoice.invoiceId].invoiceTotal)
+            let open = toDecimal(0)
+            const out = scheduleRows.map(row => {
+                const discountDateText = day(row.discountDate)
+                const available = row.discountAmount != null && discountDateText != null && onDay <= discountDateText
+                if (available) open = open.add(row.discountAmount)
+                return Object.assign({}, row, {dueDateText: day(row.dueDate), discountDateText, discountOpen: available})
+            })
+            const unpaid = totals[invoice.invoiceId].unpaidTotal
+            let discountAvailable = open.subtract(taken[invoice.invoiceId] || 0)
+            if (discountAvailable.compare(0) < 0) discountAvailable = toDecimal(0)
+            if (discountAvailable.compare(unpaid) > 0) discountAvailable = unpaid
+            const openRows = out.filter(row => row.discountOpen)
+            const next = out.find(row => row.dueDateText && row.dueDateText >= onDay) || out[out.length - 1]
+            return [
+                invoice.invoiceId,
+                {
+                    rows: out,
+                    stored: own.length > 0,
+                    discountAvailable,
+                    discountDate: openRows.length ? openRows[0].discountDateText : null,
+                    discountDateText: openRows.length ? openRows[0].discountDateText : null,
+                    nextDueDate: next?.dueDateText ?? null
+                }
+            ]
+        })
+    )
+}
+function schedule(invoice, onDate = ec.user.nowTimestamp) {
+    return schedules([invoice], onDate)[invoice.invoiceId]
 }
 // The account a prompt-payment discount posts to: the organization's ItemPromptDiscount account for the side (outgoing
 // for customer invoices, incoming for bills).
@@ -234,6 +266,16 @@ function discountAccount(organizationPartyId, receivable) {
     })
     if (!found.glAccountId) denied("DISCOUNT_ACCOUNT_MISSING", "The prompt-payment discount account is not configured")
     return found.glAccountId
+}
+// A prompt-payment discount credit on an invoice (create#InvoiceCreditMemo with promptDiscount): the side's edit
+// permission or PAYMENT_EDIT, and no more than the due schedule offers on the credit's day.
+function checkPromptDiscount(p) {
+    if (!lib.has(p.editPermission) && !lib.has("PAYMENT_EDIT"))
+        denied("PERMISSION_DENIED", p.editPermission + " or PAYMENT_EDIT authority is required")
+    const invoice = one(I, {invoiceId: p.invoiceId})
+    const offered = schedule(invoice, p.onDate || ec.user.nowTimestamp).discountAvailable
+    if (offered.isZero() || toDecimal(p.amount ?? 0).compare(offered) > 0)
+        denied("DISCOUNT_NOT_AVAILABLE", "The invoice's terms offer no discount of this amount on the date")
 }
 // The read service: an invoice's schedule for a user who may read it.
 function dueSchedule(p) {
@@ -253,11 +295,11 @@ function dueSchedule(p) {
     }
 }
 
-const operations = {storeLines, termLines, writeSchedule, dueSchedule}
+const operations = {storeLines, termLines, writeSchedule, clearSchedule, dueSchedule}
 function execute(op, parameters) {
     if (!operations[op]) throw new Error("Unknown payment terms operation " + op)
     const result = operations[op](parameters)
     ec.context.putAll(result)
     return result
 }
-;({execute, lineDays, linesInEffect, schedule, schedules, discountAccount, day, endOfDay})
+;({execute, checkPromptDiscount, lineDays, linesInEffect, schedule, schedules, discountAccount, day, stampDay, addDays})

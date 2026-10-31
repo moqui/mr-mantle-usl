@@ -36,13 +36,28 @@ function runScope(p, permission = null, lock = false) {
     if (lock) run = find(R, {paymentRunId: p.paymentRunId}).forUpdate(true).one()
     return run
 }
-// The organization's bank account a run pays from: its own, current and a bank account.
-function bankMethod(organizationPartyId, paymentMethodId) {
+// The organization's bank account a run pays from: its own, current and a bank account; for ACH with what a NACHA file
+// needs (generate#NachaFile's file and batch header fields), so a run never pays into a file that cannot be written.
+function bankMethod(organizationPartyId, paymentMethodId, ach = false) {
     const method = paymentMethodId && one(M, {paymentMethodId})
     if (!method || method.ownerPartyId !== organizationPartyId || !lib.policy.lib.active(method))
         denied("BANK_ACCOUNT_INVALID", "Choose a current bank account of the organization")
-    if (!one("mantle.account.method.BankAccount", {paymentMethodId}))
-        denied("BANK_ACCOUNT_INVALID", "Choose a current bank account of the organization")
+    const bank = one("mantle.account.method.BankAccount", {paymentMethodId})
+    if (!bank) denied("BANK_ACCOUNT_INVALID", "Choose a current bank account of the organization")
+    if (ach) {
+        const missing = [
+            ["nachaImmedDest", "immediate destination"],
+            ["nachaImmedOrig", "immediate origin"],
+            ["nachaCompanyId", "company ID"],
+            ["nachaEntryDescription", "entry description"]
+        ]
+            .filter(([field]) => !bank[field])
+            .map(([, label]) => label)
+        if (!bank.nachaImmedDestName && !bank.bankName) missing.push("bank name")
+        if (!bank.nachaCompanyName && !method.companyNameOnAccount) missing.push("company name")
+        if (missing.length)
+            denied("BANK_ACCOUNT_NACHA_MISSING", "The bank account is not set up for ACH files: " + missing.join(", "))
+    }
     return method
 }
 // A supplier's current bank account (the newest), or null.
@@ -97,8 +112,8 @@ function editable(run) {
 
 function create(p) {
     const organizationPartyId = lib.organization(p.organizationPartyId, "PAYABLE_EDIT")
-    bankMethod(organizationPartyId, p.paymentMethodId)
     if (!instruments.includes(p.paymentInstrumentEnumId)) denied("INSTRUMENT_INVALID", "Pay by ACH or by check")
+    bankMethod(organizationPartyId, p.paymentMethodId, p.paymentInstrumentEnumId === "PiAch")
     const dueThroughDate = dayText(p.dueThroughDate),
         payDate = dayText(p.payDate)
     if (!dueThroughDate || !payDate) denied("RUN_DATES_REQUIRED", "Give the due-through date and the pay date")
@@ -135,9 +150,12 @@ function select(p) {
             .condition("invoiceTypeEnumId", "not-equals", "InvoiceCreditMemo")
             .condition("unpaidTotal", "greater", 0)
             .orderBy("dueDate,invoiceId")
-            .limit(maxBills)
+            .limit(maxBills + 1)
             .list()
     )
+    // more than the cap: the first by due date are selected and the run says that more are due
+    const truncated = bills.length > maxBills
+    if (truncated) bills.length = maxBills
     const parties = Object.fromEntries(
         bills.length
             ? Array.from(
@@ -154,7 +172,7 @@ function select(p) {
     const payTime = startOf(payDay)
     const dueSchedules = terms.schedules(visible, payTime)
     const due = visible.filter(row => {
-        const dueDay = row.dueDate ? ec.l10n.format(row.dueDate, "yyyy-MM-dd") : null
+        const dueDay = terms.stampDay(row.dueDate)
         return !dueDay || dueDay <= dueThrough || dueSchedules[row.invoiceId].discountAvailable.compare(0) > 0
     })
     const ids = due.map(row => row.invoiceId)
@@ -172,7 +190,19 @@ function select(p) {
                 .list()
         ))
             if (openRunStatuses.includes(one(R, {paymentRunId: row.paymentRunId})?.statusId))
-                otherRuns[row.invoiceId] = row.paymentRunId
+                otherRuns[row.invoiceId] = "Run " + row.paymentRunId
+    // a run's payment made for a bill and not yet applied to it (its file or application pending) holds the bill too
+    if (ids.length)
+        for (const row of Array.from(
+            find(RI)
+                .condition("invoiceId", "in", ids)
+                .condition("paymentRunId", "not-equals", run.paymentRunId)
+                .condition("paymentId", "is-not-null", null)
+                .condition("resultEnumId", "not-in", ["PrrPaid", "PrrReturned"])
+                .list()
+        ))
+            if (!["PmntDeclined", "PmntVoid", "PmntCancelled"].includes(one(P, {paymentId: row.paymentId})?.statusId))
+                otherRuns[row.invoiceId] = "Payment " + row.paymentId + " of run " + row.paymentRunId + " is not applied yet"
     const userExcluded = Object.fromEntries(
         items(run.paymentRunId, {excludeReasonEnumId: "PrxUser"}).map(row => [row.invoiceId, row.excludeComment || ""])
     )
@@ -196,7 +226,7 @@ function select(p) {
                 .join(", ")
         } else if (otherRuns[bill.invoiceId]) {
             excludeReasonEnumId = "PrxInOtherRun"
-            excludeComment = "Run " + otherRuns[bill.invoiceId]
+            excludeComment = otherRuns[bill.invoiceId]
         } else if (ach && !bank) {
             excludeReasonEnumId = "PrxNoBankAccount"
         } else if (bill.invoiceId in userExcluded) {
@@ -214,7 +244,7 @@ function select(p) {
             invoiceId: bill.invoiceId,
             supplierPartyId: bill.fromPartyId,
             toPaymentMethodId: ach && bank ? bank.paymentMethodId : null,
-            dueDate: bill.dueDate,
+            dueDate: terms.stampDay(bill.dueDate),
             discountDate: discount.compare(0) > 0 ? schedule.discountDate : null,
             unpaidAmount: unpaid,
             discountAmount: discount,
@@ -224,7 +254,7 @@ function select(p) {
             excludeComment
         })
     })
-    return {itemCount: due.length, selectedCount, excludedCount: due.length - selectedCount, selectedTotal}
+    return {itemCount: due.length, selectedCount, excludedCount: due.length - selectedCount, selectedTotal, truncated}
 }
 // Put a bill in the run or leave it out. A held bill, one in another open run or one without the supplier's bank account
 // for ACH is not put in.
@@ -312,12 +342,19 @@ function voidRunApproval(p) {
     const supplierPartyId = p.supplierPartyId || method?.ownerPartyId
     if (!supplierPartyId || one("mantle.party.PartyRole", {partyId: supplierPartyId, roleTypeId: "OrgInternal"}))
         return {voidedRunIds: []}
-    const pending = Array.from(find(RI, {supplierPartyId}).condition("paymentId", "is-null", null).list())
-    // a change: the method was made by this request's update (Mantle's copy of a changed account), or a run's account
-    // for the supplier has ended; an update that changed nothing voids nothing
+    // the supplier's bills in open runs that are not executing
+    const pending = Array.from(find(RI, {supplierPartyId}).condition("paymentId", "is-null", null).list()).filter(row => {
+        const run = one(R, {paymentRunId: row.paymentRunId})
+        return run && openRunStatuses.includes(run.statusId) && !run.executeOperationKey
+    })
+    // a change: the method given was ended, or an ACH run pays the supplier into an account that is no longer its current
+    // one (ended, or a newer one added: Mantle's copy of a changed account is a new method); an update that changed
+    // nothing voids nothing. A check run does not pay into a bank account.
+    const now = lib.ms(ec.user.nowTimestamp)
+    const newest = supplierBank(supplierPartyId)?.paymentMethodId || null
     const changed =
-        (method?.originalPaymentMethodId && lib.ms(method.fromDate) === lib.ms(ec.user.nowTimestamp)) ||
-        pending.some(row => row.toPaymentMethodId && !currentBank(row))
+        (method?.thruDate && lib.ms(method.thruDate) <= now) ||
+        pending.some(row => row.toPaymentMethodId && (!currentBank(row) || row.toPaymentMethodId !== newest))
     if (!changed) return {voidedRunIds: []}
     const runIds = [...new Set(pending.map(row => row.paymentRunId))].sort()
     const voidedRunIds = [],
@@ -345,54 +382,85 @@ function failMessage(error) {
     const text = String(error?.message || error).split("\n")[0]
     return (code && !text.startsWith(code) ? code + ": " : "") + text.slice(0, 250)
 }
-// Execute an approved run: claim it under its operation key, pay each supplier in its own transaction (a failure is
-// recorded on that supplier's bills and the others go on), write the bank file, apply ACH payments once the file has
-// delivered them, and mark the run executed. A retry with the same key goes on where it stopped and answers the result;
-// a supplier already paid is not paid again.
+// Execute an approved run under its operation key. A completed execution under the key is answered first from its
+// operation record (PostingOperation, CX-POSTING); the run's claim (executeOperationKey) keeps one key on a run while it
+// executes. Each supplier is paid in its own transaction (a failure is recorded on that supplier's bills and the others go
+// on), the bank file is written and the ACH payments it delivered are applied. The run is executed only when every
+// payment made is applied; otherwise it stays approved with the reason, and the same key resumes it where it stopped. A
+// supplier already paid is never paid again. A pay date in the past is refused before anything is paid.
 function execute(p) {
     const operationKey = String(p.operationKey || "")
     if (!operationKey || operationKey.length > 40)
         denied("OPERATION_KEY_REQUIRED", "An operation key of at most 40 characters is required")
     let run = runScope(p, "PAYMENT_EDIT")
-    if (run.executeOperationKey === operationKey && run.statusId === "PrunExecuted")
-        return Object.assign(result(run), {alreadyExecuted: true})
+    // EntityLib's operation: InvoiceWorkflowLib's locks the organization, which the payments lock in their own transactions
+    const op = lib.entityLib.operation({operationKey}, "PaymentRunExecute", run.organizationPartyId, {
+        paymentRunId: run.paymentRunId
+    })
+    if (lib.previous(op)) return Object.assign(result(run), {alreadyExecuted: true, complete: true})
     if (run.executeOperationKey && run.executeOperationKey !== operationKey)
         denied("RUN_EXECUTED", "The payment run is being or was executed")
+    const late = dayText(run.payDate) < today()
+    if (late && !run.executeOperationKey)
+        denied("PAY_DATE_PAST", "The pay date has passed; refresh the selection with a new pay date")
     probe(services + "claim#RunExecution", {
         paymentRunId: run.paymentRunId,
         operationKey,
         lastUpdatedStamp: p.lastUpdatedStamp
     })
-    const pending = selectedItems(run.paymentRunId).filter(row => !row.paymentId)
-    for (const supplierPartyId of [...new Set(pending.map(row => row.supplierPartyId))].sort()) {
+    const unpaid = () => selectedItems(run.paymentRunId).filter(row => !row.paymentId)
+    const fail = (supplierPartyId, message) => {
+        for (const item of unpaid().filter(row => row.supplierPartyId === supplierPartyId))
+            probe("update#" + RI, {
+                paymentRunId: item.paymentRunId,
+                paymentRunItemSeqId: item.paymentRunItemSeqId,
+                resultEnumId: "PrrFailed",
+                resultMessage: message
+            })
+    }
+    for (const supplierPartyId of [...new Set(unpaid().map(row => row.supplierPartyId))].sort()) {
+        // resumed after its pay date: no new payment is made, so no discount is taken after its date
+        if (late) {
+            fail(supplierPartyId, "PAY_DATE_PAST: The pay date passed before this supplier was paid")
+            continue
+        }
         try {
             probe(services + "pay#RunSupplier", {paymentRunId: run.paymentRunId, supplierPartyId})
         } catch (error) {
             const message = failMessage(error)
             ec.logger.error("Payment run " + run.paymentRunId + " supplier " + supplierPartyId + ": " + message)
-            for (const item of pending.filter(row => row.supplierPartyId === supplierPartyId))
-                probe("update#" + RI, {
-                    paymentRunId: item.paymentRunId,
-                    paymentRunItemSeqId: item.paymentRunItemSeqId,
-                    resultEnumId: "PrrFailed",
-                    resultMessage: message
-                })
+            fail(supplierPartyId, message)
         }
     }
+    let fileError = null
     try {
         probe(services + "generate#RunFile", {paymentRunId: run.paymentRunId})
     } catch (error) {
-        ec.logger.error("Payment run " + run.paymentRunId + " bank file: " + failMessage(error))
+        fileError = failMessage(error)
+        ec.logger.error("Payment run " + run.paymentRunId + " bank file: " + fileError)
     }
     run = find(R, {paymentRunId: run.paymentRunId}).forUpdate(true).one()
-    if (run.statusId === "PrunApproved")
-        call("update#" + R, {
-            paymentRunId: run.paymentRunId,
-            statusId: "PrunExecuted",
-            executedByUserId: ec.user.userId,
-            executedDate: ec.user.nowTimestamp
-        })
-    return Object.assign(result(one(R, {paymentRunId: run.paymentRunId})), {alreadyExecuted: false})
+    if (run.statusId === "PrunExecuted") return Object.assign(result(run), {alreadyExecuted: true, complete: true})
+    const waiting = selectedItems(run.paymentRunId).filter(row => row.paymentId && row.resultEnumId === "PrrSent")
+    if (fileError || waiting.length) {
+        const executionMessage = fileError
+            ? "The bank file was not written: " + fileError
+            : waiting.length +
+              " bills are paid and not yet applied" +
+              (waiting[0].resultMessage ? ": " + waiting[0].resultMessage : "")
+        call("update#" + R, {paymentRunId: run.paymentRunId, executionMessage: executionMessage.slice(0, 255)})
+        return Object.assign(result(one(R, {paymentRunId: run.paymentRunId})), {alreadyExecuted: false, complete: false})
+    }
+    call("update#" + R, {
+        paymentRunId: run.paymentRunId,
+        statusId: "PrunExecuted",
+        executedByUserId: ec.user.userId,
+        executedDate: ec.user.nowTimestamp,
+        executionMessage: null
+    })
+    const out = result(one(R, {paymentRunId: run.paymentRunId}))
+    lib.complete(op, R, run.paymentRunId, out)
+    return Object.assign(out, {alreadyExecuted: false, complete: true})
 }
 // Claim an approved run for execution, in its own transaction: the approved selection must be the run's now.
 function claim(p) {
@@ -413,21 +481,24 @@ function result(run) {
         paidCount: count("PrrPaid"),
         sentCount: count("PrrSent"),
         failedCount: count("PrrFailed"),
-        paymentMethodFileId: run.paymentMethodFileId || null
+        waitingCount: count("PrrSent"),
+        paymentMethodFileId: run.paymentMethodFileId || null,
+        executionMessage: run.executionMessage || null
     }
 }
 // Pay one supplier's selected bills of an executing run with one payment, in the caller's (new) transaction: the bills
 // locked and their holds, status, balances, discounts and the supplier's bank account read again. A check is numbered,
 // delivered and applied now; an ACH payment is authorized for the bank file and applied when the file delivers it.
 function paySupplier(p) {
-    const run = runScope(p, "PAYMENT_EDIT")
+    // the run is locked first: a concurrent execution under the same key waits here, then finds the supplier paid
+    const run = runScope(p, "PAYMENT_EDIT", true)
     if (run.statusId !== "PrunApproved" || !run.executeOperationKey)
         denied("RUN_NOT_EXECUTING", "The payment run is not being executed")
     const list = selectedItems(run.paymentRunId).filter(row => row.supplierPartyId === p.supplierPartyId && !row.paymentId)
     if (!list.length) return {}
     const ach = run.paymentInstrumentEnumId === "PiAch",
         payTime = startOf(dayText(run.payDate))
-    bankMethod(run.organizationPartyId, run.paymentMethodId)
+    bankMethod(run.organizationPartyId, run.paymentMethodId, ach)
     const bills = Object.fromEntries(
         Array.from(
             find(I)
@@ -509,31 +580,18 @@ function applyItems(run, paymentId) {
         })
     }
 }
-// The discount a run takes: a credit memo the organization issues against the bill, linked to it, on the organization's
-// prompt-payment discount account, finalized and applied to the bill. Issued by the organization (create#InvoiceCreditMemo
-// makes it from the bill's payer), it is finalized as the organization's own documents are, with no bill approval: the
-// run's approval stands for it.
+// The discount a run takes: the prompt-payment discount the bill's due schedule offers on the pay date, a credit memo the
+// organization issues against the bill through create#InvoiceCreditMemo (linkToOriginal, promptDiscount: on the discount
+// account, within the bill's credits, finalized with no approval step), applied to the bill.
 function takeDiscount(run, item, payTime) {
     const credit = call("mantle.account.InvoiceServices.create#InvoiceCreditMemo", {
         originalInvoiceId: item.invoiceId,
+        organizationPartyId: run.organizationPartyId,
+        linkToOriginal: true,
+        promptDiscount: true,
         invoiceDate: payTime,
         amount: item.discountAmount,
-        itemTypeEnumId: "ItemPromptDiscount",
-        overrideGlAccountId: terms.discountAccount(run.organizationPartyId, false),
         description: "Prompt payment discount, payment run " + run.paymentRunId
-    })
-    call("update#" + I, {
-        invoiceId: credit.invoiceId,
-        creditForInvoiceId: item.invoiceId,
-        draftedByUserId: ec.user.userId,
-        accountingDate: dayText(run.payDate),
-        financeOrganizationPartyId: run.organizationPartyId,
-        financeDirection: "payable"
-    })
-    call("update#" + I, {
-        invoiceId: credit.invoiceId,
-        statusId: "InvoiceFinalized",
-        statusId_changeReason: "Payment run " + run.paymentRunId
     })
     call("mantle.account.PaymentServices.apply#InvoiceToInvoice", {
         invoiceId: credit.invoiceId,
@@ -615,7 +673,7 @@ function writeFile(p) {
     return {}
 }
 function applyPayment(p) {
-    const run = runScope(p, "PAYMENT_EDIT")
+    const run = runScope(p, "PAYMENT_EDIT", true)
     if (!items(run.paymentRunId, {paymentId: p.paymentId}).length) denied("PAYMENT_UNAVAILABLE", "The payment is not the run's")
     applyItems(run, p.paymentId)
     return {}
@@ -635,14 +693,31 @@ function file(run) {
 function runFile(p) {
     return file(runScope(p, "PAYMENT_EDIT"))
 }
-// A bank's NACHA return file for the run's bank account (import#NachaReturn): a returned payment is declined, which
-// reverses its posting and unapplies it (the PaymentUnDeliverCleanup SECA), and a discount the run took on its bills is
-// cancelled, so each bill is open again in full.
+// A bank's NACHA return file for the run's bank account (import#NachaReturn, which skips a payment already returned): a
+// returned payment is declined, which reverses its posting and unapplies it (the PaymentUnDeliverCleanup SECA). Its bills,
+// in whichever run of the bank account paid them, show Returned with the bank's reason, and the discount credits those
+// runs took on them are cancelled, so each bill is open again in full.
 function importReturn(p) {
     const run = runScope(p, "PAYMENT_EDIT")
     if (run.paymentInstrumentEnumId !== "PiAch" || !run.executeOperationKey)
         denied("RUN_NOT_ACH", "Bank returns are imported for an executed ACH run")
     if (!String(p.nachaString || "").trim()) denied("RETURN_FILE_REQUIRED", "Choose the bank's return file")
+    const runIds = Array.from(
+        find(R, {organizationPartyId: run.organizationPartyId, paymentMethodId: run.paymentMethodId})
+            .condition("executeOperationKey", "is-not-null", null)
+            .list()
+    ).map(row => row.paymentRunId)
+    const paidItems = () =>
+        Array.from(
+            find(RI)
+                .condition("paymentRunId", "in", runIds)
+                .condition("paymentId", "is-not-null", null)
+                .condition("resultEnumId", "not-in", ["PrrReturned"])
+                .list()
+        )
+    const declined = items =>
+        new Set(items.filter(row => one(P, {paymentId: row.paymentId})?.statusId === "PmntDeclined").map(row => row.paymentId))
+    const before = declined(paidItems())
     ec.message.pushErrors()
     let errors = ""
     try {
@@ -659,9 +734,9 @@ function importReturn(p) {
     }
     if (errors) denied("RETURN_FILE_INVALID", errors.split("\n")[0])
     const returnedPaymentIds = []
-    for (const item of selectedItems(run.paymentRunId).filter(row => row.paymentId && row.resultEnumId !== "PrrReturned")) {
-        const payment = one(P, {paymentId: item.paymentId})
-        if (payment?.statusId !== "PmntDeclined") continue
+    const after = paidItems()
+    const nowDeclined = declined(after)
+    for (const item of after.filter(row => nowDeclined.has(row.paymentId) && !before.has(row.paymentId))) {
         if (!returnedPaymentIds.includes(item.paymentId)) returnedPaymentIds.push(item.paymentId)
         const response = Array.from(
             find("mantle.account.method.PaymentGatewayResponse", {paymentId: item.paymentId})
@@ -734,7 +809,8 @@ function getRun(p) {
         canSelect: has("PAYABLE_EDIT") && openRunStatuses.includes(run.statusId) && !executing,
         canRequestApproval: has("PAYABLE_EDIT") && run.statusId === "PrunDraft" && selected.length > 0,
         canApprove: has("PAYMENT_RUN_APPROVE") && run.statusId === "PrunDraft" && selected.length > 0,
-        canExecute: has("PAYMENT_EDIT") && run.statusId === "PrunApproved",
+        canExecute: has("PAYMENT_EDIT") && run.statusId === "PrunApproved" && !executing,
+        canResume: has("PAYMENT_EDIT") && run.statusId === "PrunApproved" && executing,
         canReadFile: has("PAYMENT_EDIT") && executing,
         canImportReturn: has("PAYMENT_EDIT") && executing && run.paymentInstrumentEnumId === "PiAch",
         canCancel: has("PAYABLE_EDIT") && openRunStatuses.includes(run.statusId) && !executing
@@ -754,6 +830,9 @@ function getRun(p) {
             paidCount: selected.filter(row => row.resultEnumId === "PrrPaid").length,
             failedCount: selected.filter(row => row.resultEnumId === "PrrFailed").length,
             returnedCount: selected.filter(row => row.resultEnumId === "PrrReturned").length,
+            waitingCount: selected.filter(row => row.resultEnumId === "PrrSent").length,
+            // the claim's key only for a user who may resume the execution with it
+            executeOperationKey: capabilities.canResume ? run.executeOperationKey : null,
             fileTypeText: fileRow ? one("moqui.basic.Enumeration", {enumId: fileRow.fileTypeEnumId})?.description : null,
             fileEntryCount: fileRow?.entryCount ?? null,
             approvedByName: run.approvedByUserId

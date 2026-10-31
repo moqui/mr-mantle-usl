@@ -44,6 +44,7 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="selectedCount" type="Integer"/>
             <parameter name="excludedCount" type="Integer"/>
             <parameter name="selectedTotal" type="BigDecimal"/>
+            <parameter name="truncated" type="Boolean"/>
         </out-parameters>
         <actions>
             <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
@@ -62,6 +63,7 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="selectedCount" type="Integer"/>
             <parameter name="excludedCount" type="Integer"/>
             <parameter name="selectedTotal" type="BigDecimal"/>
+            <parameter name="truncated" type="Boolean"/>
         </out-parameters>
         <actions>
             <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
@@ -138,11 +140,13 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
     <service verb="execute" noun="Run" allow-remote="false">
         <description>Execute an approved run once under its operation key: each supplier is paid in its own transaction
-            with one payment (pay#RunSupplier), its bills' holds, status, balances, discounts and bank account read again
-            under lock; a supplier that fails has the reason on its bills and the others keep their payments. Then the bank
-            file is written (generate#RunFile) and the run is executed. A retry with the same key goes on where it stopped
-            and answers the result; another key is refused. Refuses a run that is not approved, a stale lastUpdatedStamp
-            and a selection that changed after approval. Needs PAYMENT_EDIT.</description>
+            with one payment (pay#RunSupplier, the run locked, its bills' holds, status, balances, discounts and bank account
+            read again under lock); a supplier that fails has the reason on its bills and the others keep their payments.
+            Then the bank file is written and its ACH payments applied (generate#RunFile). The run is executed when every
+            payment is applied (complete); otherwise it stays approved with executionMessage and the same key resumes it. A
+            completed key answers its first result (PostingOperation); another key is refused. Refuses a run that is not
+            approved, a pay date in the past, a stale lastUpdatedStamp and a selection that changed after approval. Needs
+            PAYMENT_EDIT.</description>
         <implements service="mantle.account.PaymentRunServices.define#RunParameters"/>
         <in-parameters>
             <parameter name="operationKey" required="true"/>
@@ -154,8 +158,11 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="paidCount" type="Integer"/>
             <parameter name="sentCount" type="Integer"/>
             <parameter name="failedCount" type="Integer"/>
+            <parameter name="waitingCount" type="Integer"/>
             <parameter name="paymentMethodFileId"/>
+            <parameter name="executionMessage"/>
             <parameter name="alreadyExecuted" type="Boolean"/>
+            <parameter name="complete" type="Boolean"/>
         </out-parameters>
         <actions>
             <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
