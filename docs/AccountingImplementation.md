@@ -292,7 +292,8 @@ account, on an invoice whose schedule offers at least that amount on the account
 prompt-payment discount account: the `ItemPromptDiscount` item type account (`get#InvoiceItemGlAccount`), outgoing for
 a customer invoice (521000000 by default), incoming for a bill (864000000). More than the schedule offers is refused
 (`DISCOUNT_NOT_AVAILABLE`). Such a discount is issued by `create#InvoiceCreditMemo` with `linkToOriginal` and
-`promptDiscount`: within the schedule and the original's credit cap, finalized as the organization's own credit with no
+`promptDiscount`: within the schedule on its date and today (the bill locked first), on the side's discount account only
+(another account is `DISCOUNT_ACCOUNT_FIXED`; in a settlement it is a write-off), and within the original's credit cap, finalized as the organization's own credit with no
 approval step, for the side's edit permission or `PAYMENT_EDIT`. Any other discount or write-off is P5's adjustment on an
 explicit account; on a bill its credit is approved, so a user without `INVOICE_APPROVE` is refused at preview
 (`ADJUSTMENT_APPROVAL_REQUIRED`). A payment run takes a bill's discount the same way (below).
@@ -320,7 +321,9 @@ a `PaymentRunExclusion` reason, and at execution its payment and `PaymentRunResu
   amounts, discounts and the supplier's bank account read again; one payment through `create#Payment`
   (`PtInvoicePayment`) is the supplier's instruction identity. The run is executed only when every payment it made is
   applied; otherwise it stays approved with `executionMessage`, and `get#Run` offers the claim's key to resume
-  (`canResume`). Until applied, a run's payment holds its bills out of other runs. An ACH run's bank account needs its
+  (`canResume`). Until applied, a run's payment holds its bills out of other runs: selecting, putting a bill back
+  (`store#RunItem`) and paying it are refused while another run holds it (`RUN_ITEM_IN_OTHER_RUN`); a supplier that
+  failed in an unfinished run releases its bills. An ACH run's bank account needs its
   NACHA fields (`BANK_ACCOUNT_NACHA_MISSING`). A check is numbered (`assign#BankAccountCheckNumber`), delivered and applied; an ACH
   payment is authorized. A supplier that fails has its reason on its bills, and the others keep their payments.
   `generate#RunFile` then writes the bank file once in its own transaction (`write#RunFile`): `generate#NachaFile` for
@@ -336,8 +339,9 @@ a `PaymentRunExclusion` reason, and at execution its payment and `PaymentRunResu
   open run paying the supplier takes its current bank account, and an approved one goes back to proposed with the reason
   (D26).
 - `import#RunReturn` (`PAYMENT_EDIT`): the bank's NACHA return file through `import#NachaReturn`, which skips a payment
-  already declined; a returned payment is declined, its bills, in whichever run of the bank account paid them, show the
-  bank's reason, and those runs' discount credits on them are cancelled.
+  already declined. Whatever imports a return, a delivered run payment that becomes Declined has its bills marked Returned
+  with the bank's reason and the run's discount credits on them cancelled (the `RunPaymentReturned` SECA,
+  `mark#RunPaymentReturned`, once).
 - `get#Run` (`PAYABLE_VIEW`, `PAYMENT_VIEW` or `ACCOUNTING_VIEW`): the run and its bills with display text and masked bank
   accounts, and what the user may do. `cancel#Run` (`PAYABLE_EDIT`) cancels one not executed.
 

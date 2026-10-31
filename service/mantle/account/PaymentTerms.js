@@ -269,13 +269,25 @@ function discountAccount(organizationPartyId, receivable) {
 }
 // A prompt-payment discount credit on an invoice (create#InvoiceCreditMemo with promptDiscount): the side's edit
 // permission or PAYMENT_EDIT, and no more than the due schedule offers on the credit's day.
+// The discount must be open on the credit's day and on today's, so a lapsed discount is never taken by dating it back. The
+// invoice is locked first; the credit goes to the side's discount account, and another account makes it a write-off.
 function checkPromptDiscount(p) {
     if (!lib.has(p.editPermission) && !lib.has("PAYMENT_EDIT"))
         denied("PERMISSION_DENIED", p.editPermission + " or PAYMENT_EDIT authority is required")
-    const invoice = one(I, {invoiceId: p.invoiceId})
-    const offered = schedule(invoice, p.onDate || ec.user.nowTimestamp).discountAvailable
-    if (offered.isZero() || toDecimal(p.amount ?? 0).compare(offered) > 0)
-        denied("DISCOUNT_NOT_AVAILABLE", "The invoice's terms offer no discount of this amount on the date")
+    const invoice = find(I, {invoiceId: p.invoiceId}).forUpdate(true).one()
+    const amount = toDecimal(p.amount ?? 0)
+    for (const onDate of [p.onDate || ec.user.nowTimestamp, ec.user.nowTimestamp]) {
+        const offered = schedule(invoice, onDate).discountAvailable
+        if (offered.isZero() || amount.compare(offered) > 0)
+            denied("DISCOUNT_NOT_AVAILABLE", "The invoice's terms offer no discount of this amount on the date and today")
+    }
+    const account = discountAccount(p.organizationPartyId, p.receivable)
+    if (p.glAccountId && p.glAccountId !== account)
+        denied(
+            "DISCOUNT_ACCOUNT_FIXED",
+            "A prompt-payment discount posts to the discount account; another account is a write-off"
+        )
+    return {discountGlAccountId: account}
 }
 // The read service: an invoice's schedule for a user who may read it.
 function dueSchedule(p) {

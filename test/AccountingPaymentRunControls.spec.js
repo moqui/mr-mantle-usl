@@ -342,3 +342,190 @@ feature("a payable discount within its terms is issued without approval; AP's wr
         issued == true
     }
 })
+
+feature("a bill another run took is not put back nor paid twice, and a failed supplier's bills are free again", {
+    when() {
+        const billX = bill(supplierA, "70"),
+            billW = bill(supplierB, "35")
+        // run A selects X, then AP leaves it out
+        login(users.ap)
+        const runA = runs("create#Run", {
+            organizationPartyId: f.org,
+            paymentMethodId: bankId,
+            paymentInstrumentEnumId: "PiCompanyCheck",
+            dueThroughDate: "2099-12-31",
+            payDate: today
+        }).paymentRunId
+        const itemA = runItem(runA, billX)
+        for (const item of rows("mantle.account.payment.PaymentRunItem", {paymentRunId: runA}))
+            if (item.selectedIndicator === "Y")
+                runs("store#RunItem", {paymentRunId: runA, paymentRunItemSeqId: item.paymentRunItemSeqId, selectedIndicator: "N"})
+        // run B pays X and W; W is held after approval and its supplier fails; B's bank file fails, so X's payment waits
+        const runB = approvedRun("PiAch", [billX, billW])
+        login("john.doe")
+        helper().call("mantle.account.InvoiceServices.hold#Invoice", {invoiceId: billW, holdReasonEnumId: "IhrApReview"})
+        login("john.doe")
+        helper().call("update#mantle.account.method.BankAccount", {
+            paymentMethodId: bankId,
+            nachaEntryDescription: "SUPPLIERS-LONG"
+        })
+        login(users.treasury)
+        const keyB = prefix + "-B-" + runB
+        const stuck = runs("execute#Run", {paymentRunId: runB, operationKey: keyB})
+        const failedW = runItem(runB, billW)
+        // X cannot go back into A
+        login(users.ap)
+        const putBack = refused("store#RunItem", {
+            paymentRunId: runA,
+            paymentRunItemSeqId: itemA.paymentRunItemSeqId,
+            selectedIndicator: "Y"
+        })
+        // forced back (a race): paying it in A is refused while B's payment for it is not applied
+        login("john.doe")
+        helper().call("update#mantle.account.payment.PaymentRunItem", {
+            paymentRunId: runA,
+            paymentRunItemSeqId: itemA.paymentRunItemSeqId,
+            selectedIndicator: "Y",
+            excludeReasonEnumId: null
+        })
+        login(users.runApprover)
+        runs("approve#Run", {paymentRunId: runA, lastUpdatedStamp: stamp(runA)})
+        login(users.treasury)
+        runs("claim#RunExecution", {paymentRunId: runA, operationKey: prefix + "-A-" + runA})
+        const payTwice = refused("pay#RunSupplier", {paymentRunId: runA, supplierPartyId: supplierA})
+        // W, which failed in the unfinished run B, is selected by a new run once its hold is released
+        login("john.doe")
+        const hold = rows("mantle.account.invoice.InvoiceHold", {invoiceId: billW})[0]
+        helper().call("update#mantle.account.invoice.InvoiceHold", {
+            invoiceHoldId: hold.invoiceHoldId,
+            releasedDate: ec.user.nowTimestamp
+        })
+        login(users.ap)
+        const runE = runs("create#Run", {
+            organizationPartyId: f.org,
+            paymentMethodId: bankId,
+            paymentInstrumentEnumId: "PiCompanyCheck",
+            dueThroughDate: "2099-12-31",
+            payDate: today
+        }).paymentRunId
+        const itemW = runItem(runE, billW)
+        runs("cancel#Run", {paymentRunId: runE})
+        // B finishes once its file is written
+        login("john.doe")
+        helper().call("update#mantle.account.method.BankAccount", {paymentMethodId: bankId, nachaEntryDescription: "SUPPLIERS"})
+        login(users.treasury)
+        const resumed = runs("execute#Run", {paymentRunId: runB, operationKey: keyB})
+        login("john.doe")
+        return {stuck, putBack, payTwice, itemW, resumed, failedW}
+    },
+    then({stuck, putBack, payTwice, itemW, resumed, failedW}) {
+        stuck.complete == false
+        failedW.resultEnumId == "PrrFailed"
+        putBack.includes("RUN_ITEM_IN_OTHER_RUN")
+        payTwice.includes("RUN_ITEM_IN_OTHER_RUN")
+        itemW.selectedIndicator == "Y"
+        resumed.complete == true
+    }
+})
+
+feature("a run payment declined by a NACHA return imported outside the run shows Returned", {
+    when() {
+        login("john.doe")
+        const run = rows("mantle.account.payment.PaymentRun", {organizationPartyId: f.org})
+            .filter(row => row.paymentInstrumentEnumId === "PiAch" && row.statusId === "PrunExecuted")
+            .sort((a, b) => b.paymentRunId.localeCompare(a.paymentRunId))[0]
+        const item = rows("mantle.account.payment.PaymentRunItem", {paymentRunId: run.paymentRunId}).find(
+            row => row.paymentId && row.resultEnumId === "PrrPaid"
+        )
+        const payment = one("mantle.account.payment.Payment", {paymentId: item.paymentId})
+        const pad = (text, n) => String(text).padEnd(n, " ").slice(0, n)
+        const cents = String(Math.round(num(payment.amount) * 100)).padStart(10, "0")
+        const text = [
+            "6" +
+                "22" +
+                "01100001" +
+                "5" +
+                pad("4441001", 17) +
+                cents +
+                pad(item.paymentId, 15) +
+                pad("A", 22) +
+                "  1011000010000001",
+            "7" + "99" + "R02" + "011000010000001" + "      " + "01100001" + pad("Account closed", 44) + "011000010000009",
+            "9" + " ".repeat(93)
+        ].join("\n")
+        helper().call("mantle.account.NachaServices.import#NachaReturn", {paymentMethodId: bankId, nachaString: text})
+        return {item: runItem(run.paymentRunId, item.invoiceId)}
+    },
+    then({item}) {
+        item.resultEnumId == "PrrReturned"
+        item.resultMessage.startsWith("R02")
+    }
+})
+
+feature("a lapsed discount is not taken by dating the settlement back, nor on another account without approval", {
+    when() {
+        const h = helper()
+        const back = n => ec.l10n.format(new Date(Number(ec.user.nowTimestamp) - n * 86400000), "yyyy-MM-dd")
+        const oldDay = back(20)
+        const billG = bill(supplierA, "300", {
+            settlementTermId: "Net30Disc2Pct10",
+            invoiceDate: ec.l10n.parseTimestamp(oldDay + " 12:00:00", "yyyy-MM-dd HH:mm:ss"),
+            accountingDate: oldDay
+        })
+        const billH = bill(supplierA, "400", {settlementTermId: "Net30Disc2Pct10"})
+        const scope = {organizationPartyId: f.org, partyId: supplierA, direction: "payable", currencyUomId: "USD"}
+        const review = (adjustments, effectiveDate) => {
+            const keys = adjustments.map(row => h.key("invoice", row.invoiceId))
+            const selected = h.native("find#OpenItems", Object.assign({selectedKeyList: keys}, scope)).selectedRows
+            return h.native(
+                "preview#Settlement",
+                Object.assign({}, scope, {
+                    effectiveDate,
+                    adjustments,
+                    sourceVersions: Object.fromEntries(selected.map(row => [row.sourceKey, row.version]))
+                })
+            )
+        }
+        const refusal = run => {
+            try {
+                run()
+                return ""
+            } catch (error) {
+                ec.message.clearErrors()
+                return String(error.message)
+            }
+        }
+        login(users.ap)
+        const backdated = refusal(() =>
+            review([{invoiceId: billG, itemTypeEnumId: "ItemPromptDiscount", amount: "6", reason: "Early"}], back(15))
+        )
+        const otherAccount = refusal(() =>
+            review(
+                [
+                    {
+                        invoiceId: billH,
+                        itemTypeEnumId: "ItemPromptDiscount",
+                        amount: "8",
+                        glAccountId: "550000000",
+                        reason: "Early"
+                    }
+                ],
+                f.timestamp
+            )
+        )
+        const direct = h.rejected("mantle.account.InvoiceServices.create#InvoiceCreditMemo", {
+            originalInvoiceId: billH,
+            organizationPartyId: f.org,
+            linkToOriginal: true,
+            promptDiscount: true,
+            amount: "8",
+            overrideGlAccountId: "550000000"
+        })
+        return {backdated, otherAccount, direct}
+    },
+    then({backdated, otherAccount, direct}) {
+        backdated.includes("DISCOUNT_NOT_AVAILABLE")
+        otherAccount.includes("ADJUSTMENT_APPROVAL_REQUIRED")
+        direct.includes("DISCOUNT_ACCOUNT_FIXED")
+    }
+})

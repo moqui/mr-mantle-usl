@@ -180,29 +180,7 @@ function select(p) {
     const holdReasons = Object.fromEntries(
         rows("moqui.basic.Enumeration", {enumTypeId: "InvoiceHoldReason"}).map(row => [row.enumId, row.description])
     )
-    const otherRuns = {}
-    if (ids.length)
-        for (const row of Array.from(
-            find(RI, {selectedIndicator: "Y"})
-                .condition("invoiceId", "in", ids)
-                .condition("paymentRunId", "not-equals", run.paymentRunId)
-                .condition("paymentId", "is-null", null)
-                .list()
-        ))
-            if (openRunStatuses.includes(one(R, {paymentRunId: row.paymentRunId})?.statusId))
-                otherRuns[row.invoiceId] = "Run " + row.paymentRunId
-    // a run's payment made for a bill and not yet applied to it (its file or application pending) holds the bill too
-    if (ids.length)
-        for (const row of Array.from(
-            find(RI)
-                .condition("invoiceId", "in", ids)
-                .condition("paymentRunId", "not-equals", run.paymentRunId)
-                .condition("paymentId", "is-not-null", null)
-                .condition("resultEnumId", "not-in", ["PrrPaid", "PrrReturned"])
-                .list()
-        ))
-            if (!["PmntDeclined", "PmntVoid", "PmntCancelled"].includes(one(P, {paymentId: row.paymentId})?.statusId))
-                otherRuns[row.invoiceId] = "Payment " + row.paymentId + " of run " + row.paymentRunId + " is not applied yet"
+    const otherRuns = otherRunHolds(run.paymentRunId, ids)
     const userExcluded = Object.fromEntries(
         items(run.paymentRunId, {excludeReasonEnumId: "PrxUser"}).map(row => [row.invoiceId, row.excludeComment || ""])
     )
@@ -256,6 +234,34 @@ function select(p) {
     })
     return {itemCount: due.length, selectedCount, excludedCount: due.length - selectedCount, selectedTotal, truncated}
 }
+// The bills another run holds, by invoice ID with the reason: selected in another open run and not paid there (a supplier
+// that failed in an unfinished run releases its bills), or paid by another run's payment not yet applied and not
+// declined, voided or cancelled. With paymentsOnly, the payments only.
+function otherRunHolds(paymentRunId, ids, paymentsOnly = false) {
+    const holds = {}
+    if (!ids.length) return holds
+    if (!paymentsOnly)
+        for (const row of Array.from(
+            find(RI, {selectedIndicator: "Y"})
+                .condition("invoiceId", "in", ids)
+                .condition("paymentRunId", "not-equals", paymentRunId)
+                .condition("paymentId", "is-null", null)
+                .list()
+        ))
+            if (row.resultEnumId !== "PrrFailed" && openRunStatuses.includes(one(R, {paymentRunId: row.paymentRunId})?.statusId))
+                holds[row.invoiceId] = "Run " + row.paymentRunId
+    for (const row of Array.from(
+        find(RI)
+            .condition("invoiceId", "in", ids)
+            .condition("paymentRunId", "not-equals", paymentRunId)
+            .condition("paymentId", "is-not-null", null)
+            .condition("resultEnumId", "not-in", ["PrrPaid", "PrrReturned"])
+            .list()
+    ))
+        if (!["PmntDeclined", "PmntVoid", "PmntCancelled"].includes(one(P, {paymentId: row.paymentId})?.statusId))
+            holds[row.invoiceId] = "Payment " + row.paymentId + " of run " + row.paymentRunId + " is not applied yet"
+    return holds
+}
 // Put a bill in the run or leave it out. A held bill, one in another open run or one without the supplier's bank account
 // for ACH is not put in.
 function storeItem(p) {
@@ -268,6 +274,9 @@ function storeItem(p) {
         if (["PrxHeld", "PrxInOtherRun", "PrxNoBankAccount"].includes(item.excludeReasonEnumId))
             denied("RUN_ITEM_EXCLUDED", "This bill cannot be paid in the run: refresh the selection")
         lib.requireNotHeld(item.invoiceId)
+        // another run took the bill since it was left out of this one
+        const held = otherRunHolds(run.paymentRunId, [item.invoiceId])[item.invoiceId]
+        if (held) denied("RUN_ITEM_IN_OTHER_RUN", "Bill " + item.invoiceId + " is held by another run: " + held)
     }
     if ((item.selectedIndicator === "Y") === include) return {changed: false}
     voidApproval(run, "The selection changed")
@@ -512,9 +521,12 @@ function paySupplier(p) {
                 .list()
         ).map(row => [row.invoiceId, row])
     )
+    const elsewhere = otherRunHolds(run.paymentRunId, Object.keys(bills), true)
     for (const item of list) {
         const bill = bills[item.invoiceId]
         lib.requireNotHeld(item.invoiceId)
+        if (elsewhere[item.invoiceId])
+            denied("RUN_ITEM_IN_OTHER_RUN", "Bill " + item.invoiceId + ": " + elsewhere[item.invoiceId])
         if (!bill || bill.statusId !== "InvoiceApproved")
             denied("BILL_STATE_CHANGED", "Bill " + item.invoiceId + " is no longer approved")
         if (!lib.totals(bill).unpaidTotal.eq(item.unpaidAmount))
@@ -708,16 +720,14 @@ function importReturn(p) {
             .list()
     ).map(row => row.paymentRunId)
     const paidItems = () =>
-        Array.from(
-            find(RI)
-                .condition("paymentRunId", "in", runIds)
-                .condition("paymentId", "is-not-null", null)
-                .condition("resultEnumId", "not-in", ["PrrReturned"])
-                .list()
+        Array.from(find(RI).condition("paymentRunId", "in", runIds).condition("paymentId", "is-not-null", null).list())
+    const declined = () =>
+        new Set(
+            paidItems()
+                .map(row => row.paymentId)
+                .filter(paymentId => one(P, {paymentId})?.statusId === "PmntDeclined")
         )
-    const declined = items =>
-        new Set(items.filter(row => one(P, {paymentId: row.paymentId})?.statusId === "PmntDeclined").map(row => row.paymentId))
-    const before = declined(paidItems())
+    const before = declined()
     ec.message.pushErrors()
     let errors = ""
     try {
@@ -733,22 +743,26 @@ function importReturn(p) {
         ec.message.popErrors()
     }
     if (errors) denied("RETURN_FILE_INVALID", errors.split("\n")[0])
-    const returnedPaymentIds = []
-    const after = paidItems()
-    const nowDeclined = declined(after)
-    for (const item of after.filter(row => nowDeclined.has(row.paymentId) && !before.has(row.paymentId))) {
-        if (!returnedPaymentIds.includes(item.paymentId)) returnedPaymentIds.push(item.paymentId)
-        const response = Array.from(
-            find("mantle.account.method.PaymentGatewayResponse", {paymentId: item.paymentId})
-                .orderBy("-transactionDate")
-                .limit(1)
-                .list()
-        )[0]
+    // the RunPaymentReturned SECA marked each declined payment's bills; this answers what the file declined
+    const returnedPaymentIds = [...declined()].filter(paymentId => !before.has(paymentId))
+    return {returnedPaymentIds}
+}
+
+// A run payment the bank declined after delivery (the RunPaymentReturned SECA, whatever imported the return): its bills
+// show Returned with the bank's reason, and the discount credits the run took on them are cancelled. Once only.
+function markReturned(p) {
+    const payment = one(P, {paymentId: p.paymentId})
+    if (payment?.statusId !== "PmntDeclined") return {returnedCount: 0}
+    const response = Array.from(
+        find("mantle.account.method.PaymentGatewayResponse", {paymentId: p.paymentId}).orderBy("-transactionDate").limit(1).list()
+    )[0]
+    let returnedCount = 0
+    for (const item of Array.from(find(RI, {paymentId: p.paymentId}).list()).filter(row => row.resultEnumId !== "PrrReturned")) {
         if (item.discountInvoiceId && one(I, {invoiceId: item.discountInvoiceId})?.statusId !== "InvoiceCancelled")
             call("update#" + I, {
                 invoiceId: item.discountInvoiceId,
                 statusId: "InvoiceCancelled",
-                statusId_changeReason: "Payment " + item.paymentId + " returned by the bank"
+                statusId_changeReason: "Payment " + p.paymentId + " returned by the bank"
             })
         call("update#" + RI, {
             paymentRunId: item.paymentRunId,
@@ -756,8 +770,9 @@ function importReturn(p) {
             resultEnumId: "PrrReturned",
             resultMessage: [response?.reasonCode, response?.reasonMessage].filter(Boolean).join(" ") || "Returned"
         })
+        returnedCount++
     }
-    return {returnedPaymentIds}
+    return {returnedCount}
 }
 
 // ---- Reads
@@ -888,6 +903,7 @@ const operations = {
     writeFile,
     runFile,
     importReturn,
+    markReturned,
     getRun,
     cancel
 }

@@ -256,6 +256,17 @@ along with this software (see the LICENSE.md file). If not, see
             <script>ec.resource.script(runs).execute('importReturn', context)</script>
         </actions>
     </service>
+    <service verb="mark" noun="RunPaymentReturned" allow-remote="false">
+        <description>A run payment the bank declined after delivery (the RunPaymentReturned SECA, whatever imported the
+            return): its bills show Returned with the bank's reason and the run's discount credits on them are cancelled;
+            once only.</description>
+        <in-parameters><parameter name="paymentId" required="true"/></in-parameters>
+        <out-parameters><parameter name="returnedCount" type="Integer"/></out-parameters>
+        <actions>
+            <set field="runs" value="component://mr-mantle/service/mantle/account/PaymentRuns.js"/>
+            <script>ec.resource.script(runs).execute('markReturned', context)</script>
+        </actions>
+    </service>
     <service verb="get" noun="Run" allow-remote="false">
         <description>A run for its screen: its header with display text, totals and counts, masked bank accounts (never a
             full number), its bills with supplier names, due and discount dates, amounts, why each is left out and each

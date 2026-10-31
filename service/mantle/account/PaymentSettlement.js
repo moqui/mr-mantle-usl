@@ -224,14 +224,24 @@ function adjustmentRow(scope, date, byKey, row, index) {
     // A prompt-payment discount the invoice's due schedule offers on the date posts to the discount account and is issued
     // at once (create#InvoiceCreditMemo promptDiscount); any other discount or write-off names its account, and on a bill
     // its credit is approved, which needs INVOICE_APPROVE.
-    const promptDiscount =
-        row.itemTypeEnumId === "ItemPromptDiscount" &&
-        (row.promptDiscount === true || row.promptDiscount === "true" || !glAccountId)
+    // within the terms only on the side's discount account: a discount on another account is a write-off of the bill
+    let discountAccount = null
+    if (row.itemTypeEnumId === "ItemPromptDiscount")
+        try {
+            discountAccount = terms().discountAccount(scope.organizationPartyId, scope.direction === "receivable")
+        } catch (error) {
+            if (!glAccountId) throw error
+        }
+    const promptDiscount = row.itemTypeEnumId === "ItemPromptDiscount" && (!glAccountId || glAccountId === discountAccount)
     if (promptDiscount) {
-        const offered = terms().schedule(one(I, {invoiceId: row.invoiceId}), date.timestamp).discountAvailable
-        if (offered.isZero() || amount.compare(offered) > 0)
-            denied("DISCOUNT_NOT_AVAILABLE", "The invoice's terms offer no discount of this amount on the accounting date")
-        glAccountId = glAccountId || terms().discountAccount(scope.organizationPartyId, scope.direction === "receivable")
+        // open on the accounting date and today: a lapsed discount is not taken by dating the settlement back
+        const invoice = one(I, {invoiceId: row.invoiceId})
+        for (const onDate of [date.timestamp, ec.user.nowTimestamp]) {
+            const offered = terms().schedule(invoice, onDate).discountAvailable
+            if (offered.isZero() || amount.compare(offered) > 0)
+                denied("DISCOUNT_NOT_AVAILABLE", "The invoice's terms offer no discount of this amount on the date and today")
+        }
+        glAccountId = discountAccount
     } else if (scope.direction === "payable" && !lib.has("INVOICE_APPROVE"))
         denied(
             "ADJUSTMENT_APPROVAL_REQUIRED",

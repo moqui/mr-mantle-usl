@@ -2249,12 +2249,12 @@ along with this software (see the LICENSE.md file). If not, see
                         need:promptDiscount ? 'read' : 'write'})"/>
                 <if condition="promptDiscount">
                     <set field="paymentTerms" value="component://mr-mantle/service/mantle/account/PaymentTerms.js"/>
-                    <script>ec.resource.script(paymentTerms).checkPromptDiscount({invoiceId:originalInvoiceId,
-                        editPermission:scope.editPermission, receivable:scope.receivable,
-                        organizationPartyId:scope.organizationPartyId, amount:amount, onDate:invoiceDate})</script>
+                    <set field="checkedDiscount" from="ec.resource.script(paymentTerms).checkPromptDiscount({
+                        invoiceId:originalInvoiceId, editPermission:scope.editPermission, receivable:scope.receivable,
+                        organizationPartyId:scope.organizationPartyId, amount:amount, onDate:invoiceDate,
+                        glAccountId:overrideGlAccountId})"/>
                     <set field="itemTypeEnumId" value="ItemPromptDiscount"/>
-                    <set field="overrideGlAccountId" from="overrideGlAccountId ||
-                        ec.resource.script(paymentTerms).discountAccount(scope.organizationPartyId, scope.receivable)"/>
+                    <set field="overrideGlAccountId" from="checkedDiscount.discountGlAccountId"/>
                 </if>
                 <set field="unissuedStatuses"
                         from="['InvoiceInProcess', 'InvoiceIncoming', 'InvoiceReceived', 'InvoiceCancelled']"/>
