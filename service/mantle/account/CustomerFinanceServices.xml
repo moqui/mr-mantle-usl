@@ -15,15 +15,20 @@ along with this software (see the LICENSE.md file). If not, see
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
     <service verb="define" noun="CustomerScope" type="interface">
-        <description>An organization and one of its customers.</description>
+        <description>An organization and one of its customers, or with side supplier one of its suppliers.</description>
         <in-parameters>
             <parameter name="organizationPartyId" required="true"/>
-            <parameter name="customerPartyId" required="true"/>
+            <parameter name="customerPartyId" required="true"><description>The customer, or the supplier.</description>
+            </parameter>
+            <parameter name="side" default-value="customer"><description>customer, the default, or supplier: a supplier's
+                identifications need PAYABLE_EDIT in place of RECEIVABLE_EDIT.</description></parameter>
         </in-parameters>
     </service>
     <service verb="check" noun="CustomerScope" allow-remote="false">
-        <description>The customer of an organization the user works in: the permission given, a customer no other user keeps
-            private, and an invoice, order or current relationship between the two. Refuses otherwise.</description>
+        <description>The customer of an organization the user works in, or with side supplier its supplier: the permission
+            given, a party no other user keeps private, and a relationship of that side (for a customer an invoice to it, a
+            credit from it, a sales order or a current relationship; for a supplier a bill from it, a purchase order or its
+            supplier profile). Refuses otherwise.</description>
         <implements service="mantle.account.CustomerFinanceServices.define#CustomerScope"/>
         <in-parameters><parameter name="permission"/></in-parameters>
         <out-parameters><parameter name="customer" type="Map"/></out-parameters>
@@ -35,30 +40,53 @@ along with this software (see the LICENSE.md file). If not, see
                 <field-map field-name="partyId" from="customerPartyId"/></entity-find-one>
             <if condition="party == null || (party.privateOwnerUserId &amp;&amp; party.privateOwnerUserId != ec.user.userId)">
                 <return error="true" message="CUSTOMER_UNAVAILABLE: Customer is not available"/></if>
+            <!-- the relationship of the side asked for: for a customer its sales (an invoice to it, a credit from it, a
+                sales order) or a current relationship; for a supplier its purchases (a bill from it, a purchase order) or
+                its supplier profile. The side's permission is checked by the caller with the side, so a side without its
+                relationship opens nothing. -->
+            <set field="supplierSide" from="side == 'supplier'"/>
+            <if condition="!['customer', 'supplier'].includes(side)">
+                <return error="true" message="SIDE_INVALID: Choose the customer or the supplier side"/></if>
             <entity-find-count entity-name="mantle.account.invoice.Invoice" count-field="invoiceCount" disable-authz="true">
                 <econditions combine="or">
-                    <econditions><econdition field-name="fromPartyId" from="organizationPartyId"/>
-                        <econdition field-name="toPartyId" from="customerPartyId"/></econditions>
-                    <econditions><econdition field-name="fromPartyId" from="customerPartyId"/>
-                        <econdition field-name="toPartyId" from="organizationPartyId"/></econditions>
+                    <econditions>
+                        <econdition field-name="fromPartyId" from="supplierSide ? customerPartyId : organizationPartyId"/>
+                        <econdition field-name="toPartyId" from="supplierSide ? organizationPartyId : customerPartyId"/>
+                    </econditions>
+                    <econditions>
+                        <econdition field-name="fromPartyId" from="supplierSide ? organizationPartyId : customerPartyId"/>
+                        <econdition field-name="toPartyId" from="supplierSide ? customerPartyId : organizationPartyId"/>
+                        <econdition field-name="invoiceTypeEnumId" value="InvoiceCreditMemo"/>
+                    </econditions>
                 </econditions>
             </entity-find-count>
             <entity-find-count entity-name="mantle.order.OrderPart" count-field="orderCount" disable-authz="true">
-                <econdition field-name="vendorPartyId" from="organizationPartyId"/>
-                <econdition field-name="customerPartyId"/>
+                <econdition field-name="vendorPartyId" from="supplierSide ? customerPartyId : organizationPartyId"/>
+                <econdition field-name="customerPartyId" from="supplierSide ? organizationPartyId : customerPartyId"/>
             </entity-find-count>
-            <entity-find-count entity-name="mantle.party.PartyRelationship" count-field="relationshipCount" disable-authz="true">
-                <date-filter/>
-                <econditions combine="or">
-                    <econditions><econdition field-name="fromPartyId" from="organizationPartyId"/>
-                        <econdition field-name="toPartyId" from="customerPartyId"/></econditions>
-                    <econditions><econdition field-name="fromPartyId" from="customerPartyId"/>
-                        <econdition field-name="toPartyId" from="organizationPartyId"/></econditions>
-                </econditions>
-            </entity-find-count>
-            <if condition="!invoiceCount &amp;&amp; !orderCount &amp;&amp; !relationshipCount">
-                <return error="true"
-                        message="CUSTOMER_SCOPE_INVALID: Customer has no business relationship with this organization"/></if>
+            <set field="relationshipCount" from="0"/>
+            <set field="profileCount" from="0"/>
+            <if condition="supplierSide"><then>
+                <entity-find-count entity-name="mantle.party.supplier.SupplierProfile" count-field="profileCount"
+                        disable-authz="true">
+                    <econdition field-name="organizationPartyId"/>
+                    <econdition field-name="supplierPartyId" from="customerPartyId"/>
+                </entity-find-count>
+            </then><else>
+                <entity-find-count entity-name="mantle.party.PartyRelationship" count-field="relationshipCount"
+                        disable-authz="true">
+                    <date-filter/>
+                    <econditions combine="or">
+                        <econditions><econdition field-name="fromPartyId" from="organizationPartyId"/>
+                            <econdition field-name="toPartyId" from="customerPartyId"/></econditions>
+                        <econditions><econdition field-name="fromPartyId" from="customerPartyId"/>
+                            <econdition field-name="toPartyId" from="organizationPartyId"/></econditions>
+                    </econditions>
+                </entity-find-count>
+            </else></if>
+            <if condition="!invoiceCount &amp;&amp; !orderCount &amp;&amp; !relationshipCount &amp;&amp; !profileCount">
+                <return error="true" message="${supplierSide ? 'SUPPLIER' : 'CUSTOMER'}_SCOPE_INVALID: The ${side} has no business
+                    relationship of that side with this organization"/></if>
             <set field="customer" from="{partyId:party.partyId, partyTypeEnumId:party.partyTypeEnumId,
                 organizationName:party.organizationName, firstName:party.firstName, middleName:party.middleName,
                 lastName:party.lastName}"/>
@@ -243,7 +271,8 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
     <service verb="store" noun="CustomerIdentification" allow-remote="false">
         <description>Add or change a customer's identification of a PartyIdType; a change needs the lastUpdatedStamp read.
-            Only the fields given are written. Needs RECEIVABLE_EDIT in the organization.</description>
+            Only the fields given are written. Needs RECEIVABLE_EDIT in the organization, PAYABLE_EDIT for a
+            supplier's.</description>
         <implements service="mantle.account.CustomerFinanceServices.define#CustomerScope"/>
         <in-parameters>
             <parameter name="partyIdTypeEnumId" required="true"/>
@@ -260,7 +289,7 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <service-call name="mantle.account.CustomerFinanceServices.check#CustomerScope" disable-authz="true"
                     in-map="{organizationPartyId:organizationPartyId, customerPartyId:customerPartyId,
-                        permission:'RECEIVABLE_EDIT'}"/>
+                        permission:(side == 'supplier' ? 'PAYABLE_EDIT' : 'RECEIVABLE_EDIT'), side:side}"/>
             <entity-find-one entity-name="moqui.basic.Enumeration" value-field="idType" cache="true" disable-authz="true">
                 <field-map field-name="enumId" from="partyIdTypeEnumId"/></entity-find-one>
             <if condition="idType?.enumTypeId != 'PartyIdType'">
@@ -302,7 +331,7 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <service-call name="mantle.account.CustomerFinanceServices.check#CustomerScope" disable-authz="true"
                     in-map="{organizationPartyId:organizationPartyId, customerPartyId:customerPartyId,
-                        permission:'TAX_STATEMENT_EDIT'}"/>
+                        permission:'TAX_STATEMENT_EDIT', side:side}"/>
             <entity-find-one entity-name="mantle.other.tax.TaxAuthority" value-field="taxAuthority" disable-authz="true"/>
             <if condition="taxAuthority == null">
                 <return error="true" message="TAX_AUTHORITY_INVALID: Choose a tax authority"/></if>
@@ -348,7 +377,7 @@ along with this software (see the LICENSE.md file). If not, see
         <actions>
             <service-call name="mantle.account.CustomerFinanceServices.check#CustomerScope" disable-authz="true"
                     in-map="{organizationPartyId:organizationPartyId, customerPartyId:customerPartyId,
-                        permission:'PAYMENT_EDIT'}"/>
+                        permission:'PAYMENT_EDIT', side:side}"/>
             <set field="workflow" value="component://mr-mantle/service/mantle/account/InvoiceWorkflow.js"/>
             <if condition="!ec.resource.script(workflow).execute('permissions', {permissions:['BANK_RECONCILE']}).BANK_RECONCILE">
                 <return error="true" message="PERMISSION_DENIED: BANK_RECONCILE authority is required"/></if>

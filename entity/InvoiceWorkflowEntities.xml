@@ -59,10 +59,17 @@ along with this software (see the LICENSE.md file). If not, see
         <member-entity entity-alias="TOP" entity-name="mantle.party.Party" join-from-alias="INV">
             <key-map field-name="toPartyId" related="partyId"/>
         </member-entity>
+        <member-entity entity-alias="OHLD" entity-name="mantle.account.invoice.InvoiceOpenHoldSummary" join-from-alias="INV"
+                join-optional="true" sub-select="true">
+            <key-map field-name="invoiceId"/>
+        </member-entity>
         <alias-all entity-alias="INV"/>
+        <alias entity-alias="OHLD" name="openHoldCount"/>
+        <alias entity-alias="OHLD" name="heldInvoiceId" field="invoiceId"/>
         <alias entity-alias="SRC" name="sourceFromPartyId" field="fromPartyId"/>
         <alias entity-alias="SRC" name="sourceToPartyId" field="toPartyId"/>
         <alias entity-alias="FROMP" name="fromPrivateOwnerUserId" field="privateOwnerUserId"/>
+        <alias entity-alias="FROMP" name="fromPartyTypeEnumId" field="partyTypeEnumId"/>
         <alias entity-alias="TOP" name="toPrivateOwnerUserId" field="privateOwnerUserId"/>
     </view-entity>
     <extend-entity entity-name="PartyIdentification" package="mantle.party">

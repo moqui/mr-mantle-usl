@@ -148,6 +148,104 @@ its own `PtDisbursement` payment to an outside party, by default the from bank's
 account (`Payment.overrideTypeGlAccountId`), and points at its transfer (`Payment.feeForPaymentId`). One service
 transaction holds them all, so they post together or not at all.
 
+## Payables (P6)
+
+**Supplier profile.** `mantle.party.supplier.SupplierProfile` keeps an organization's profile of a supplier as
+effective-dated rows with audit-logged fields: the default payment term of its bills (`settlementTermId`) and
+self-billing (`selfBillingIndicator`). `mantle.party.SupplierServices.store#SupplierProfile` ends the row in effect and
+starts the next (`SUPPLIER_TERMS_EDIT` for these finance fields; Purchasing adds the buyer fields under
+`SUPPLIER_PROFILE_EDIT`); `get#SupplierFinance` reads a supplier's bills, payments, open, in-review, held and overdue
+amounts, agreements, profile rows and, by permission, its masked bank accounts, identifications and tax
+registrations. The `CustomerFinanceServices` writers take `side`: `check#CustomerScope` counts only that side's
+relationship (a customer's sales or current relationship; a supplier's bills, purchase orders or profile), and a
+supplier's identifications need `PAYABLE_EDIT`.
+
+**Due date.** `checkSet#InvoiceDueDate` (the `InvoiceSetDueDate` EECA): the invoice's term, else the newest agreement
+term, else for a bill the supplier's term in effect on the invoice date, else for a receivable the organization's.
+
+**Intake and approval.** `mantle.account.InvoiceServices` (logic in `account/Payables.js`):
+- `find#Payables`: a page of an organization's bills by queue (incoming, review, held, approved, due, credits, a
+  person's expenses, all), each with its open holds (`PAYABLE_VIEW` or `ACCOUNTING_VIEW`).
+- `import#Bill` (`PAYABLE_IMPORT`): a draft bill keyed by organization, supplier and the supplier's reference, one line
+  for an amount given and the file as its content; a repeat is refused (`BILL_DUPLICATE`) naming the first. For a
+  receipt (`shipmentId`) billed as a draft without a reference (self-billed), the file is attached to that draft, which
+  takes the reference; a later upload for the receipt, or one whose bill is no longer a draft, is refused naming it.
+- `create#InvoiceFromSource` (`PAYABLE_EDIT` for a purchase, `RECEIVABLE_EDIT` for a sale): the ordered basis
+  (`create#EntireOrderPartInvoice`) or, for a purchase, the received basis (`create#PurchaseShipmentInvoices` with
+  `acceptedOnly`), each delivered receipt once; the order's payments are marked for the invoice and apply when it is
+  approved; a source already invoiced is refused (`SOURCE_ALREADY_INVOICED`); a retried operation key answers first.
+- `request#PayableApproval` (`PAYABLE_EDIT`): an incoming bill is received and `BillApproval` sent to the
+  organization's users who hold `INVOICE_APPROVE`.
+- `approve#Payable` (`INVOICE_APPROVE`): a bill's posting day when given, then `change#InvoiceState`'s approval; the
+  bill's `BillApproval` notifications are marked read.
+
+**Holds.** `mantle.account.invoice.InvoiceHold`, reasons of enumeration type `InvoiceHoldReason` (match exception, AP
+review, supplier dispute, bank detail change). `hold#Invoice` (`INVOICE_HOLD`; a payable only, one open hold per
+reason), `request#HoldRelease` (`PAYABLE_EDIT`; records the request and sends `BillHoldRelease` to the organization's users who
+hold `INVOICE_HOLD_RELEASE`), `release#InvoiceHold` (`INVOICE_HOLD_RELEASE`; never by the placer, `HOLD_RELEASE_SELF`,
+with a reason; marks the hold's notifications read and, for the last hold of an approved bill, applies its waiting
+payments) and `get#InvoiceHolds`. The hold
+guard, `InvoiceWorkflowLib.requireNotHeld` (`INVOICE_HELD`), runs in `change#InvoiceState`'s approval of a bill, in the
+rules every application checks (`PaymentSettlement.checkApplication`, so `apply#InvoicePayment`,
+`apply#InvoiceToInvoice` and `apply#Settlement`), in `create#InvoicePayment`, and in the open items
+(`find#OpenItems` gives a held bill the reason `INVOICE_HELD`; `InvoiceFinance.heldInvoiceId` is a sub-select of the
+open holds). `apply#PaymentForInvoice` and `apply#InvoiceForPayments`,
+which the `PaymentApplyForInvoice` and `InvoiceApplyForPayments` SECAs call, leave a held bill's payments unapplied
+with a `PAYMENT_HELD` warning. There is no flag: no flow spec holds a bill.
+
+**Receipt billing (D2).** `create#PurchaseShipmentInvoices` and `create#SalesShipmentInvoices` take `acceptedOnly`: a
+receipt's accepted quantity only, no leftover line and no charge or service line. With
+`PartyAcctgPreference.receiptInvoiceSelfBilledOnly` Y (off by default; a preference `store#Preferences` sets),
+`ShipmentIncomingDeliveredCreateInvoices`
+bills a delivered receipt only for a supplier whose profile in effect is self-billing, and then with `acceptedOnly`;
+otherwise the bill comes from the supplier or the order. A receipt with nothing accepted leaves no empty bill. OrderProcureToPayBasicFlow asserts the SECA's bill with its
+freight line, so the rule is a flag; BOSS's demo organization turns it on.
+
+**Cost centers (AC-22).** `OrderItem.costCenterId` and `InvoiceItem.costCenterId`: a bill or invoice line made from an
+order line takes its cost center, and the invoice postings (`post#Invoice`, `post#InvoiceAdjustment`) carry the line's.
+
+## Banking (P9)
+
+`ReconciliationServices` holds the bank side, on the existing bank lines (`PaymentMethodTrans`): a statement session
+links them, it does not copy them. Each new service checks the bank account's organization and the user's authority
+through `check#BankAccess`: reading bank lines needs `BANK_RECONCILE`, `ACCOUNTING_VIEW` or administration, changing
+them `BANK_RECONCILE`, and a deposit `PAYMENT_EDIT` with `PAYMENT_VIEW`. Callers of the older services
+(`create#`/`update#`/`reconcile#`/`unreconcile#`/`noReconcile#PaymentMethodTrans`, `match#PaymentMethodTransUnmatched`)
+check `check#BankAccess` first; those services keep running for the statement message consumers.
+
+- **Line identity.** A bank line's key (`fitId`) is the bank's FIT id in OFX, and a source-row key in BAI2 and CSV
+  (a hash of the row and its occurrence in the file), so a file imported again adds nothing (F33).
+  `account/BankReconciliation.js` reads the three formats; `import#BaiVersion2` and `import#OfxVersion1` use it and
+  skip known lines.
+- **Statement import.** `preview#CsvStatement` shows a CSV with its column mapping. `review#StatementImport` keeps a
+  `StatementImport` with each row new, a duplicate or rejected with its error, and refuses a file of another account;
+  `get#StatementImport` reads it and `commit#StatementImport` creates the new lines, each in its own transaction, and
+  updates the statement balance. A second commit answers the first.
+- **Matching.** `find#BankLines` pages a bank's lines (or the organization's open ones) with their state, the session
+  that cleared each and, on request, a suggestion. `find#BankLineCandidates` lists the payments, deposits and ledger
+  entries of the same bank, direction and amount near the line's date, and `reconcile#BankLine` reconciles one of them
+  through `reconcile#PaymentMethodTrans`. `match#PaymentMethodTransUnmatched` now reconciles only a line with one
+  possible match. `reconcile#`, `unreconcile#` and `noReconcile#PaymentMethodTrans` refuse a line a finished session
+  cleared (`check#BankLineOpen`); `noReconcile#` records its reason (`noReconcileReason`).
+- **Rules.** `BankMatchRule` matches a line's text, direction and amount and suggests a party's payments.
+  `store#Rule` adds, changes or ends one (audit-logged fields); `test#Rule` previews a stored or draft rule on the open
+  lines; `apply#Rules` reconciles only a line one auto-apply rule matches alone with exactly one payment.
+- **Sessions.** `create#Reconciliation` starts a `BankReconciliation` for a period that overlaps no other session of
+  the bank, opening at the last finished closing balance. `store#Reconciliation` changes its reference and closing
+  balance and clears or unclears lines (`BankReconciliationLine`, keyed by the line, so one session clears a line);
+  a cleared line is in the period and matched, or excluded with a reason. `finish#Reconciliation` needs every line
+  of the period cleared and a zero difference; `get#Reconciliation` gives the figures.
+- **Controls.** `reconcile#BankLine` takes, under the line's lock, only a candidate of an open line; a payment on a
+  finished statement's line stays there. A payment two lines match goes to neither (`apply#Rules`,
+  `match#PaymentMethodTransUnmatched`). Statements follow one another, each starting the day after the previous one
+  once it is finished; no line is added, imported or moved into a finished period (`check#BankLineDay`).
+- **Stored value.** `FinancialAccountServices.record#FinancialAccountMovement` is a finance user's own deposit,
+  withdrawal or adjustment, refused when its transaction does not post; the movement services orders and payments call
+  keep their automatic posting.
+- **Deposits.** `PaymentServices.find#DepositReceipts` and `create#DepositSlip` group delivered receipts into this bank
+  account into one `PaymentDeposit` (`Payment.paymentDepositId`, under an operation key). The deposit's one bank line
+  reconciles them all (`PaymentMethodTrans.paymentDepositId`), and a second line for it is refused.
+
 ## Tax (P14)
 
 `mantle.other.TaxServices` with `other/SalesTax.js` (the calculation) and `other/TaxStatements.js` (statements). The
@@ -196,9 +294,10 @@ first release has local sales tax and the US 1099 data.
 - `ledger/AccountingPolicy.js`: permissions, organization scope and record checks; a refusal has a reason code.
 - `ledger/PostingGuard.js`: the posting choke point. It decides an automatic posting from the transaction's source
   fields, and asks `ACCOUNTING_GL_POST` of a manual or reversal posting unless its caller passes `reviewed`.
-- `account/InvoiceWorkflowLib.js`: an invoice's scope for a read or a write. `InvoiceWorkflow.js`,
-  `InvoiceAttachments.js`, `PaymentWorkflow.js`, `PaymentLifecycle.js`, `PaymentSettlement.js` and `PaymentOutput.js`
-  hold the logic too involved for XML Actions; the other services are inline XML Actions.
+- `account/InvoiceWorkflowLib.js`: an invoice's scope for a read or a write, and the hold guard. `Payables.js`,
+  `InvoiceWorkflow.js`,
+  `InvoiceAttachments.js`, `PaymentWorkflow.js`, `PaymentLifecycle.js`, `PaymentSettlement.js` and `PaymentOutput.js` and
+  `BankReconciliation.js` hold the logic too involved for XML Actions; the other services are inline XML Actions.
 
 ## The posting guard flag
 
@@ -220,6 +319,8 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingSettlement,AccountingSettlementConcurrency,AccountingApplicationRules
 ./moq test mr-mantle --spec AccountingPaymentLifecycle,AccountingPaymentCorrections,AccountingPaymentOutput,AccountingPaymentNotifications
 ./moq test mr-mantle --spec AccountingPaymentGateway,AccountingPaymentRefunds,AccountingInternalTransfers
+./moq test mr-mantle --spec AccountingPayables
+./moq test mr-mantle --spec AccountingBankReconciliation,BankFileServices
 ./moq test mr-mantle --spec AccountingTax,TaxStatementServices
 ```
 

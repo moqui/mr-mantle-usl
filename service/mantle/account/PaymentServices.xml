@@ -595,6 +595,9 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="paymentApplicationId"/>
         </out-parameters>
         <actions>
+            <!-- the hold guard: no payment is made for a bill on hold -->
+            <script>ec.resource.script('component://mr-mantle/service/mantle/account/InvoiceWorkflowLib.js')
+                .requireNotHeld(invoiceId)</script>
             <service-call name="mantle.account.PaymentServices.check#InvoiceStatusForPayment" in-map="{invoiceId:invoiceId}"/>
 
             <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
@@ -953,9 +956,23 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
     <service verb="apply" noun="PaymentForInvoice">
+        <description>Apply a delivered payment to the invoice it is for (forInvoiceId). A payment for a bill on hold stays
+            unapplied, with a warning naming the bill (PAYMENT_HELD).</description>
         <in-parameters><parameter name="paymentId" required="true"/></in-parameters>
         <actions>
             <entity-find-one entity-name="mantle.account.payment.Payment" value-field="payment"/>
+            <if condition="payment.forInvoiceId">
+                <entity-find-count entity-name="mantle.account.invoice.InvoiceHold" count-field="openHoldCount">
+                    <econdition field-name="invoiceId" from="payment.forInvoiceId"/>
+                    <econdition field-name="releasedDate" from="null"/>
+                </entity-find-count>
+                <if condition="openHoldCount">
+                    <log level="warn"
+                            message="PAYMENT_HELD: payment ${paymentId} left unapplied, bill ${payment.forInvoiceId} is on hold"/>
+                    <message type="warning">PAYMENT_HELD: Payment ${paymentId} waits: bill ${payment.forInvoiceId} is held</message>
+                    <return/>
+                </if>
+            </if>
             <if condition="payment.forInvoiceId &amp;&amp; ['PmntDelivered', 'PmntConfirmed'].includes(payment.statusId) &amp;&amp;
                     (payment.unappliedTotal == null || toDecimal(payment.unappliedTotal).compare(0) &gt; 0)">
                 <service-call name="mantle.account.PaymentServices.apply#InvoicePayment" out-map="context"
@@ -964,10 +981,19 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
     <service verb="apply" noun="InvoiceForPayments">
+        <description>Apply the delivered payments for an invoice (forInvoiceId) to it. For a bill on hold they stay
+            unapplied, with a warning naming the bill (PAYMENT_HELD).</description>
         <in-parameters><parameter name="invoiceId" required="true"/></in-parameters>
         <actions>
             <entity-find-one entity-name="mantle.account.invoice.Invoice" value-field="invoice"/>
             <if condition="invoice == null"><return message="Invoice ${invoiceId} not found, not applying payments"/></if>
+            <entity-find-count entity-name="mantle.account.invoice.InvoiceHold" count-field="openHoldCount">
+                <econdition field-name="invoiceId"/><econdition field-name="releasedDate" from="null"/></entity-find-count>
+            <if condition="openHoldCount">
+                <log level="warn" message="PAYMENT_HELD: payments for bill ${invoiceId} left unapplied, it is on hold"/>
+                <message type="warning">PAYMENT_HELD: Payments for bill ${invoiceId} are not applied while it is on hold</message>
+                <return/>
+            </if>
             <entity-find entity-name="mantle.account.payment.Payment" list="paymentList">
                 <econdition field-name="forInvoiceId" from="invoiceId"/></entity-find>
             <iterate list="paymentList" entry="payment">
@@ -4906,6 +4932,165 @@ along with this software (see the LICENSE.md file). If not, see
             <if condition="!ec.resource.script(workflow).execute('readAuthority', {}).canReadLedger">
                 <set field="acctgTransIds" from="null"/>
             </if>
+        </actions>
+    </service>
+
+    <!-- ========== Deposit slips (AC-20) ========== -->
+
+    <service verb="define" noun="DepositReceiptConditions" type="interface">
+        <description>The receipts a deposit slip may group, read by find#DepositReceipts and create#DepositSlip.</description>
+        <in-parameters>
+            <parameter name="paymentMethodId" required="true"><description>The bank account of the deposit</description>
+            </parameter>
+        </in-parameters>
+    </service>
+    <service verb="find" noun="DepositReceipts" allow-remote="false">
+        <description>The receipts that can go on a deposit slip of the bank account, a page at a time: delivered or
+            confirmed payments to its organization into this bank account in its currency, from another party, not
+            reconciled and not on a deposit already. Needs payment edit and payment view authority in the
+            organization.</description>
+        <implements service="mantle.account.PaymentServices.define#DepositReceiptConditions"/>
+        <in-parameters>
+            <parameter name="text"/>
+            <parameter name="selectedIdList" type="List"/>
+            <parameter name="pageIndex" type="Integer" default="0"/>
+            <parameter name="pageSize" type="Integer" default="20"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="receiptRows" type="List"/>
+            <parameter name="recordCount" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <service-call name="mantle.account.ReconciliationServices.check#BankAccess" out-map="access"
+                    in-map="{paymentMethodId:paymentMethodId, need:'deposit'}"/>
+            <entity-find-one entity-name="mantle.account.method.PaymentMethod" value-field="method" disable-authz="true"/>
+            <set field="searchLike" from="'%' + String(text || '').trim().slice(0, 200) + '%'"/>
+            <set field="selectedIdList" from="[...new Set(Array.from(selectedIdList || []).map(String))].slice(0, 200)"/>
+            <entity-find entity-name="mantle.account.payment.Payment" list="receiptList" disable-authz="true"
+                    offset="pageIndex * pageSize" limit="pageSize">
+                <econdition field-name="toPartyId" from="access.organizationPartyId"/>
+                <econdition field-name="fromPartyId" operator="not-equals" from="access.organizationPartyId"/>
+                <econdition field-name="toPaymentMethodId" from="paymentMethodId"/>
+                <econdition field-name="statusId" operator="in" from="['PmntDelivered', 'PmntConfirmed']"/>
+                <econdition field-name="amountUomId" from="method.currencyUomId" ignore-if-empty="true"/>
+                <econdition field-name="paymentDepositId" from="null"/>
+                <econdition field-name="reconcileStatusId" operator="not-equals" value="PmtrRec" or-null="true"/>
+                <econditions combine="or">
+                    <econdition field-name="paymentId" operator="like" from="searchLike" ignore-case="true"/>
+                    <econdition field-name="paymentRefNum" operator="like" from="searchLike" ignore-case="true"/>
+                    <econdition field-name="paymentId" operator="in" from="selectedIdList" ignore-if-empty="true"/>
+                </econditions>
+                <order-by field-name="effectiveDate,paymentId"/>
+            </entity-find>
+            <entity-find-count entity-name="mantle.account.payment.Payment" count-field="recordCount" disable-authz="true">
+                <econdition field-name="toPartyId" from="access.organizationPartyId"/>
+                <econdition field-name="fromPartyId" operator="not-equals" from="access.organizationPartyId"/>
+                <econdition field-name="toPaymentMethodId" from="paymentMethodId"/>
+                <econdition field-name="statusId" operator="in" from="['PmntDelivered', 'PmntConfirmed']"/>
+                <econdition field-name="amountUomId" from="method.currencyUomId" ignore-if-empty="true"/>
+                <econdition field-name="paymentDepositId" from="null"/>
+                <econdition field-name="reconcileStatusId" operator="not-equals" value="PmtrRec" or-null="true"/>
+                <econditions combine="or">
+                    <econdition field-name="paymentId" operator="like" from="searchLike" ignore-case="true"/>
+                    <econdition field-name="paymentRefNum" operator="like" from="searchLike" ignore-case="true"/>
+                </econditions>
+            </entity-find-count>
+            <set field="names" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/EntityLib.js')
+                    .partyNames(Array.from(receiptList).map((row) =&gt; row.fromPartyId))"/>
+            <set field="receiptRows" from="Array.from(receiptList).map((row) =&gt; ({paymentId:row.paymentId,
+                    partyId:row.fromPartyId, partyName:names[row.fromPartyId] || '', amount:String(row.amount),
+                    currencyUomId:row.amountUomId, referenceNumber:row.paymentRefNum || '',
+                    effectiveDateText:ec.l10n.format(row.effectiveDate, 'yyyy-MM-dd'),
+                    label:[row.paymentId, names[row.fromPartyId], ec.l10n.formatCurrency(row.amount, row.amountUomId),
+                        row.paymentRefNum].filter(Boolean).join(' · ')}))"/>
+        </actions>
+    </service>
+    <service verb="create" noun="DepositSlip" allow-remote="false">
+        <description>Group receipts into one deposit slip of a bank account (PaymentDeposit), so the bank's one line for
+            the deposit reconciles them all: each receipt points at the deposit (Payment.paymentDepositId, through
+            update#Payment), and the deposit holds their total. Every receipt is one find#DepositReceipts offers, read under
+            lock: a receipt of another party, bank account or currency, not delivered, reconciled or on another deposit is
+            refused, naming it, and nothing is grouped. A retry with the same operation key answers the first deposit; the
+            key for another request is refused. Needs payment edit and payment view authority in the organization.</description>
+        <implements service="mantle.account.PaymentServices.define#DepositReceiptConditions"/>
+        <in-parameters>
+            <parameter name="paymentIdList" type="List" required="true"/>
+            <parameter name="depositDate" type="Timestamp" default="ec.user.nowTimestamp"/>
+            <parameter name="referenceNumber"/>
+            <parameter name="operationKey" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="paymentDepositId"/>
+            <parameter name="totalAmount" type="BigDecimal"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="paymentCount" type="Integer"/>
+            <parameter name="alreadyCreated" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <service-call name="mantle.account.ReconciliationServices.check#BankAccess" out-map="access"
+                    in-map="{paymentMethodId:paymentMethodId, need:'deposit'}"/>
+            <!-- one bank's deposits are made one at a time -->
+            <entity-find-one entity-name="mantle.account.method.PaymentMethod" value-field="method" for-update="true"
+                    disable-authz="true"/>
+            <set field="paymentIdList" from="[...new Set((typeof paymentIdList === 'string' ? paymentIdList.split(',')
+                    : Array.from(paymentIdList || [])).map(String).filter(Boolean))].sort()"/>
+            <if condition="!paymentIdList.length">
+                <return error="true" message="RECEIPTS_REQUIRED: Choose the receipts of the deposit"/></if>
+            <if condition="paymentIdList.length &gt; 200">
+                <return error="true" message="RECEIPTS_TOO_MANY: A deposit may group at most two hundred receipts"/></if>
+            <if condition="String(operationKey).length &gt; 40">
+                <return error="true" message="OPERATION_KEY_REQUIRED: Use an operation key of at most 40 characters"/>
+            </if>
+            <set field="requestHash" from="ec.user.singleUseCodeHash(JSON.stringify([paymentMethodId, paymentIdList,
+                    referenceNumber || '']))"/>
+            <entity-find entity-name="mantle.account.payment.PaymentDeposit" list="earlierList" disable-authz="true">
+                <econdition field-name="operationKey"/>
+            </entity-find>
+            <if condition="earlierList.length">
+                <if condition="earlierList[0].requestHash != requestHash || earlierList[0].createdByUserId != ec.user.userId">
+                    <return error="true" message="OPERATION_KEY_CONFLICT: Operation key was used for another request"/></if>
+                <set field="paymentDepositId" from="earlierList[0].paymentDepositId"/>
+                <set field="totalAmount" from="earlierList[0].totalAmount"/>
+                <set field="currencyUomId" from="earlierList[0].currencyUomId"/>
+                <set field="paymentCount" from="earlierList[0].paymentCount"/>
+                <set field="alreadyCreated" from="true"/>
+                <return/>
+            </if>
+            <entity-find entity-name="mantle.account.payment.Payment" list="receiptList" for-update="true" disable-authz="true">
+                <econdition field-name="paymentId" operator="in" from="paymentIdList"/>
+            </entity-find>
+            <set field="totalAmount" from="toDecimal(0)"/>
+            <iterate list="paymentIdList" entry="receiptId">
+                <set field="receipt" from="receiptList.find((row) =&gt; row.paymentId === receiptId)"/>
+                <if condition="receipt == null || receipt.toPartyId != access.organizationPartyId
+                        || receipt.fromPartyId == access.organizationPartyId || receipt.toPaymentMethodId != paymentMethodId">
+                    <return error="true"
+                            message="RECEIPT_INVALID: Payment ${receiptId} is not a receipt into ${paymentMethodId}"/>
+                </if>
+                <if condition="!['PmntDelivered', 'PmntConfirmed'].includes(receipt.statusId)">
+                    <return error="true" message="RECEIPT_INVALID: Payment ${receiptId} is not received"/></if>
+                <if condition="method.currencyUomId &amp;&amp; receipt.amountUomId != method.currencyUomId">
+                    <return error="true" message="RECEIPT_INVALID: Payment ${receiptId} is in another currency"/></if>
+                <if condition="receipt.paymentDepositId">
+                    <return error="true"
+                            message="RECEIPT_DEPOSITED: Payment ${receiptId} is on deposit ${receipt.paymentDepositId}"/></if>
+                <if condition="receipt.reconcileStatusId == 'PmtrRec'">
+                    <return error="true" message="RECEIPT_RECONCILED: Payment ${receiptId} is reconciled"/></if>
+                <set field="totalAmount" from="totalAmount.add(toDecimal(receipt.amount ?? 0))"/>
+            </iterate>
+            <set field="currencyUomId" from="method.currencyUomId || receiptList[0].amountUomId"/>
+            <set field="paymentCount" from="paymentIdList.length"/>
+            <service-call name="create#mantle.account.payment.PaymentDeposit" out-map="created" disable-authz="true"
+                    in-map="{organizationPartyId:access.organizationPartyId, paymentMethodId:paymentMethodId,
+                        depositDate:depositDate, referenceNumber:referenceNumber, totalAmount:totalAmount,
+                        currencyUomId:currencyUomId, paymentCount:paymentCount, operationKey:operationKey,
+                        requestHash:requestHash, createdByUserId:ec.user.userId, createdDate:ec.user.nowTimestamp}"/>
+            <set field="paymentDepositId" from="created.paymentDepositId"/>
+            <iterate list="paymentIdList" entry="receiptId">
+                <service-call name="mantle.account.PaymentServices.update#Payment" disable-authz="true"
+                        in-map="{paymentId:receiptId, paymentDepositId:paymentDepositId}"/>
+            </iterate>
+            <set field="alreadyCreated" from="false"/>
         </actions>
     </service>
 </services>

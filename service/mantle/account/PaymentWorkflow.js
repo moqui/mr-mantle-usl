@@ -177,6 +177,7 @@ function project(scope, kind, records, asOfDate = null) {
     if (!records.length) return []
     const invoice = ["invoice", "credit"].includes(kind),
         applied = applications(records)
+    const held = invoice ? lib.openHolds(records.map(row => row.invoiceId)) : {}
     const invoiceTotals = invoice ? lib.totalsMany(records) : {},
         names = lib.partyNames([scope.partyId])
     return records.map(record => {
@@ -206,6 +207,7 @@ function project(scope, kind, records, asOfDate = null) {
         )
             reasons.push("SETTLEMENT_STATE_INVALID")
         if (remaining.compare(0) <= 0) reasons.push("NO_REMAINING_BALANCE")
+        if (held[id]) reasons.push("INVOICE_HELD")
         if (!date) reasons.push("SOURCE_DATE_REQUIRED")
         if (asOfDate && accountingDateText > ec.l10n.format(asOfDate, "yyyy-MM-dd")) reasons.push("OUTSIDE_SELECTION_DATE")
         const version = lib.hash({
