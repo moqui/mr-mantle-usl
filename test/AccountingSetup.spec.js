@@ -288,6 +288,7 @@ feature("readiness names the untied open items and blocks activation, which post
         r.preview.receivableCount == 2
         r.preview.receivableTotal.eq(700)
         r.preview.payableTotal.eq(300)
+        r.preview.lastImport.failedRows[0].reasonCode == "OPEN_ITEM_CONFLICT"
         r.ready.ready == true
         r.readyRow("OPEN_ITEM_TIE").status == "ok"
         r.stale.includes("STALE_REVISION")

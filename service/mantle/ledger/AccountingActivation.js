@@ -198,7 +198,10 @@ function preview(p) {
     const tie = tieOut(run)
     const names = accountNames([run.migrationGlAccountId, ...tie.lines.map(row => row.glAccountId)])
     const status = one("moqui.basic.StatusItem", {statusId: run.statusId})
-    out.setupRun = Object.assign(display(run), {
+    out.lastImport = entityLib.json(run.lastImportJson, null)
+    const shown = display(run)
+    delete shown.lastImportJson
+    out.setupRun = Object.assign(shown, {
         statusDescription: status?.description || run.statusId,
         migrationAccountName: names[run.migrationGlAccountId] || run.migrationGlAccountId,
         sourceName: run.sourcePartyId ? entityLib.partyNames([run.sourcePartyId])[run.sourcePartyId] || run.sourcePartyId : "",
@@ -614,7 +617,7 @@ function importItems(p) {
         rowResults.push(result)
     })
     const count = kind => rowResults.filter(row => row.result === kind).length
-    return {
+    const result = {
         rowResults,
         createdCount: count("created"),
         existingCount: count("existing"),
@@ -622,6 +625,23 @@ function importItems(p) {
         failedCount: count("failed"),
         complete: count("failed") === 0
     }
+    // the counts and the refused rows (the first 500, with how many there were) kept on the run for review
+    const run = find(RUN, {organizationPartyId: scope.organizationPartyId}).forUpdate(true).one()
+    if (run) {
+        const failedRows = rowResults.filter(row => row.result === "failed")
+        call("update#" + RUN, {
+            setupRunId: run.setupRunId,
+            lastImportJson: JSON.stringify(
+                Object.assign(policy.pick(result, ["createdCount", "existingCount", "validCount", "failedCount"]), {
+                    verifyOnly: p.verifyOnly === true,
+                    importedDate: ec.l10n.format(ec.user.nowTimestamp, "yyyy-MM-dd HH:mm"),
+                    failedRows: failedRows.slice(0, 500),
+                    failedRowsShown: Math.min(500, failedRows.length)
+                })
+            )
+        })
+    }
+    return result
 }
 // The opening entry activation posts, after the run's tie-out: refused when the lines do not balance or the open items do
 // not tie, so the migration account nets to zero.

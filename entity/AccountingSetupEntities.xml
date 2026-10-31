@@ -37,6 +37,10 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="activatedAcctgTransId" type="id" enable-audit-log="true"/>
         <field name="activatedDate" type="date-time" enable-audit-log="true"/>
         <field name="activatedByUserId" type="id" enable-audit-log="true"/>
+        <field name="lastImportJson" type="text-very-long">
+            <description>The last open item import's counts and refused rows, each with its row number, document, reason
+                code and message, for review.</description>
+        </field>
         <relationship type="one" title="Organization" related="mantle.party.Party">
             <key-map field-name="organizationPartyId" related="partyId"/>
         </relationship>

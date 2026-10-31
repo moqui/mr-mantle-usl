@@ -530,12 +530,14 @@ along with this software (see the LICENSE.md file). If not, see
     <service verb="get" noun="Readiness" allow-remote="false">
         <description>Check the organization's accounting setup (preferences, fiscal periods, chart of accounts) for any
             finance reader without showing administration settings; each failed check is named in findings and the others
-            go on.</description>
+            go on. setupStatus says where its setup stands: unconfigured, inSetup (a setup run not yet activated), active
+            or configured (set up without a setup run).</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
         </in-parameters>
         <out-parameters>
             <parameter name="findings" type="List"/>
+            <parameter name="setupStatus"/>
         </out-parameters>
         <actions>
             <script>ec.context.putAll(ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingSetup.js')
@@ -771,6 +773,7 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="basis" type="Map"/>
             <parameter name="currencyUomId"/>
             <parameter name="setupRun" type="Map"/>
+            <parameter name="lastImport" type="Map"/>
             <parameter name="templateOptions" type="List"/>
             <parameter name="defaultMigrationGlAccountId"/>
             <parameter name="balanceRows" type="List"/>
@@ -803,7 +806,8 @@ along with this software (see the LICENSE.md file). If not, see
             headers direction (receivable or payable), partyId, documentNumber, documentDate, dueDate and openAmount, and
             optionally currencyUomId and description. Each row goes through create#OpenItem in its own transaction: a
             refused row is named with its reason and the others are kept; a row imported before answers its invoice, so
-            importing again makes nothing twice. With verifyOnly the rows are checked and nothing is made. Refuses a user
+            importing again makes nothing twice. The counts and refused rows are kept on the run
+            (preview#OpeningBalances lastImport). With verifyOnly the rows are checked and nothing is made. Refuses a user
             without finance administration, a file without the headers and more than 5,000 rows.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
