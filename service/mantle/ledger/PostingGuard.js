@@ -120,6 +120,17 @@ function automatic(tx) {
         ) && !tx.reverseOfAcctgTransId
     )
 }
+// The one payment a public Billing page has checked and is completing (Portal.js sets PORTAL_PAYMENT in the execution
+// context's shared map around its gateway calls): a customer's card payment to the organization, which no user of the
+// organization makes. Its own posting, or its application's, skips the user's organization check; nothing else does.
+const PORTAL_PAYMENT = "mantle.portalPaymentId"
+function portalPayment(tx) {
+    const marked = ec.context.sharedMap[PORTAL_PAYMENT]
+    if (!marked || tx.reverseOfAcctgTransId) return false
+    const paymentId = tx.paymentId || (tx.paymentApplicationId && one(A, {paymentApplicationId: tx.paymentApplicationId})?.paymentId)
+    if (paymentId !== marked) return false
+    return one("mantle.account.payment.Payment", {paymentId})?.toPartyId === tx.organizationPartyId
+}
 // The source document fields of a posting; a posting with none, or a reversal, is a manual one.
 const sourceFields = [
     "invoiceId",
@@ -278,7 +289,7 @@ function validate(p, lock = false) {
             fail("CURRENCY_MISMATCH", "Posting requires the organization's base currency until currency conversion is enabled")
         const domain = ec.resource.script("component://mr-mantle/service/mantle/product/ProductAccess.js")
         const orgs =
-            domain.systemAdmin() || domain.has("ACCOUNTING_ADMIN")
+            domain.systemAdmin() || domain.has("ACCOUNTING_ADMIN") || portalPayment(tx)
                 ? null
                 : lib.call("mantle.party.PartyServices.get#PartyOrganizationInfo").userOrgIds || []
         if (orgs && !orgs.includes(tx.organizationPartyId)) fail("ORGANIZATION", "Posting organization is not available")
@@ -519,5 +530,6 @@ function completed(acctgTransId) {
     applicationDay,
     controlProof,
     cashTypes,
-    applicationTypes
+    applicationTypes,
+    PORTAL_PAYMENT
 })

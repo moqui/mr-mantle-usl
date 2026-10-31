@@ -63,6 +63,7 @@ function preview(p) {
     const results = calculate(kind, s, period, day, sourceIdList)
     const failed = results.filter(r => r.failureCode)
     const total = results.filter(r => !r.failureCode).reduce((sum, r) => sum.add(toDecimal(r.amount ?? 0)), toDecimal(0))
+    const selection = sourceIdList.length ? JSON.stringify(sourceIdList) : null
     const run = call("create#" + RUN, {
         runKindEnumId: kind.enumId,
         organizationPartyId: s.organizationPartyId,
@@ -71,7 +72,7 @@ function preview(p) {
         currencyUomId: lib.preference(s.organizationPartyId).baseCurrencyUomId,
         statusId: failed.length && failed.length === results.length ? "PrnFailed" : "PrnPreview",
         calculationVersion: versionOf(results),
-        sourceSelectionJson: sourceIdList.length ? JSON.stringify(sourceIdList) : null,
+        sourceSelectionJson: selection,
         totalAmount: total,
         resultCount: results.length,
         failedCount: failed.length,
@@ -93,14 +94,14 @@ function preview(p) {
             failureMessage: r.failureMessage || null
         })
     )
-    // a recalculation supersedes the earlier previews of the same kind, organization and period
+    // a recalculation supersedes the earlier previews of the same kind, organization, period and selection of sources
     for (const old of rows(RUN, {
         runKindEnumId: kind.enumId,
         organizationPartyId: s.organizationPartyId,
         timePeriodId: period.timePeriodId,
         statusId: "PrnPreview"
     }))
-        if (old.periodRunId !== run.periodRunId)
+        if (old.periodRunId !== run.periodRunId && (old.sourceSelectionJson || null) === selection)
             call("update#" + RUN, {periodRunId: old.periodRunId, statusId: "PrnSuperseded", supersededByRunId: run.periodRunId})
     const created = one(RUN, {periodRunId: run.periodRunId})
     return {
@@ -161,13 +162,15 @@ function post(p) {
     const out = call(kind.optionValue, {periodRunId: run.periodRunId})
     const postedCount = Number(out.postedCount || 0),
         failedCount = Number(out.failedCount || 0)
-    const statusId = !postedCount ? "PrnFailed" : failedCount ? "PrnPartial" : "PrnPosted"
+    // the sources that failed at posting and those that failed at calculation: a run with either is partly posted
+    const totalFailed = failedCount + Number(run.failedCount || 0)
+    const statusId = !postedCount ? "PrnFailed" : totalFailed ? "PrnPartial" : "PrnPosted"
     call("update#" + RUN, {
         periodRunId: run.periodRunId,
         statusId,
         postedByUserId: ec.user.userId,
         postedDate: ec.user.nowTimestamp,
-        failedCount: failedCount + Number(run.failedCount || 0)
+        failedCount: totalFailed
     })
     const answer = {periodRunId: run.periodRunId, statusId, postedCount, failedCount}
     lib.lib.complete(op, RUN, run.periodRunId, answer)

@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<!-- Accounting's customer and supplier pages: the operations of the PASS Billing and Supplier apps (mr-pass Schema.js and
+    Routes.js), called locally through pass.Facade.call#Operation or remotely through Mantle's PassApi. Each takes the
+    PASS input map (siteId, a token or the signed-in contact, the record) and answers a result map; each checks the site's
+    app target and check#AccessCapability first (Portal.js). The record's internal fields never leave here. -->
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="issue" noun="InvoiceAccess" authenticate="anonymous-all" allow-remote="false">
+        <description>A pay link for an invoice: the Billing app's InvoicePay page taking a new token (InvoicePay scope, 120 days).
+            From a page (siteId) for a signed-in contact of the invoice's customer; from send#Invoice for a user with
+            RECEIVABLE_EDIT in the invoice's organization, on its first published Billing site (issued false without
+            one).</description>
+        <in-parameters><parameter name="input" type="Map"/></in-parameters>
+        <out-parameters><parameter name="result" type="Map"/></out-parameters>
+        <actions>
+            <set field="result" from="ec.resource.script('component://mr-mantle/service/mantle/account/Portal.js')
+                .execute('issueInvoiceAccess', input)"/>
+        </actions>
+    </service>
+    <service verb="find" noun="Invoices" authenticate="anonymous-all" allow-remote="false">
+        <description>The issued invoices from the organization the site's Billing app serves to the parties the signed-in user
+            is a contact of, newest first, at most 50.</description>
+        <in-parameters><parameter name="input" type="Map"/></in-parameters>
+        <out-parameters><parameter name="result" type="Map"/></out-parameters>
+        <actions>
+            <set field="result" from="ec.resource.script('component://mr-mantle/service/mantle/account/Portal.js')
+                .execute('findInvoices', input)"/>
+        </actions>
+    </service>
+    <service verb="get" noun="Invoice" authenticate="anonymous-all" allow-remote="false">
+        <description>An issued invoice for its pay link's token or a signed-in contact: number, dates, lines, total, paid and
+            due, an attempt still pending, and whether it can be paid here. An expired, revoked or foreign token, or an
+            invoice of another organization, is NotFound.</description>
+        <in-parameters><parameter name="input" type="Map"/></in-parameters>
+        <out-parameters><parameter name="result" type="Map"/></out-parameters>
+        <actions>
+            <set field="result" from="ec.resource.script('component://mr-mantle/service/mantle/account/Portal.js')
+                .execute('getInvoice', input)"/>
+        </actions>
+    </service>
+    <service verb="start" noun="InvoicePayment" authenticate="anonymous-all" allow-remote="false">
+        <description>Pay what is due through the organization's invoice payment gateway
+            (PartyAcctgPreference.invoicePayGatewayConfigId): a card payment for the invoice (forInvoiceId) authorized
+            through authorize#SinglePayment with the app's return address, captured when authorized. Needs confirm and an
+            operationId; a retry answers the first result, and an attempt still pending is resumed, not paid twice.</description>
+        <in-parameters><parameter name="input" type="Map"/></in-parameters>
+        <out-parameters><parameter name="result" type="Map"/></out-parameters>
+        <actions>
+            <set field="result" from="ec.resource.script('component://mr-mantle/service/mantle/account/Portal.js')
+                .execute('startInvoicePayment', input)"/>
+        </actions>
+    </service>
+    <service verb="get" noun="PaymentResult" authenticate="anonymous-all" allow-remote="false">
+        <description>An attempt's outcome, looked up at the gateway while pending (get#SinglePaymentGatewayDetails) and captured
+            when authorized; what the payer's browser brings back from the gateway is never read. The link's token, the
+            contact, or the reference the gateway's return carries (returnKey) reads it. A paid attempt is applied
+            to the invoice by Mantle's PaymentApplyForInvoice SECA.</description>
+        <in-parameters><parameter name="input" type="Map"/></in-parameters>
+        <out-parameters><parameter name="result" type="Map"/></out-parameters>
+        <actions>
+            <set field="result" from="ec.resource.script('component://mr-mantle/service/mantle/account/Portal.js')
+                .execute('getPaymentResult', input)"/>
+        </actions>
+    </service>
+    <service verb="submit" noun="SupplierBill" authenticate="anonymous-all" allow-remote="false">
+        <description>A supplier's bill for a purchase order, for the order's BillUpload token or a signed-in contact of its
+            supplier: the file is staged and scanned (pass_media_root, pass_scanner_service), then the incoming draft is made
+            through import#Bill's core (or the receipt's self-billed draft takes it), recorded as a SupplierBillSubmission.
+            A repeat of the operationId or of the bill number answers the first submission. It never approves a
+            bill.</description>
+        <in-parameters><parameter name="input" type="Map"/></in-parameters>
+        <out-parameters><parameter name="result" type="Map"/></out-parameters>
+        <actions>
+            <set field="result" from="ec.resource.script('component://mr-mantle/service/mantle/account/Portal.js')
+                .execute('submitSupplierBill', input)"/>
+        </actions>
+    </service>
+    <service verb="get" noun="Submission" authenticate="anonymous-all" allow-remote="false">
+        <description>A purchase order's summary and this supplier's submissions for it, or one of them (submissionId), each
+            with its received time, bill reference and processing state.</description>
+        <in-parameters><parameter name="input" type="Map"/></in-parameters>
+        <out-parameters><parameter name="result" type="Map"/></out-parameters>
+        <actions>
+            <set field="result" from="ec.resource.script('component://mr-mantle/service/mantle/account/Portal.js')
+                .execute('getSubmission', input)"/>
+        </actions>
+    </service>
+    <service verb="check" noun="AppReadiness" authenticate="anonymous-all" allow-remote="false">
+        <description>The Billing or Supplier app's readiness checks for a site (PublicApps.js): its target is an internal
+            organization, the organization has an invoice payment gateway (Billing), bill files can be scanned (Supplier),
+            and the site has a canonical host.</description>
+        <in-parameters><parameter name="input" type="Map"/></in-parameters>
+        <out-parameters><parameter name="result" type="Map"/></out-parameters>
+        <actions>
+            <set field="result" from="ec.resource.script('component://mr-mantle/service/mantle/account/Portal.js')
+                .execute('appReadiness', input)"/>
+        </actions>
+    </service>
+    <service verb="begin" noun="InvoicePayment" authenticate="anonymous-all" allow-remote="false">
+        <description>Internal to start#InvoicePayment, after its checks, in a transaction of its own: under the invoice's
+            lock, a retried request's attempt, the attempt still pending, or a new promised payment and its
+            PortalPaymentAttempt with the gateway return's reference (returnKey, answered once).</description>
+        <in-parameters><parameter name="input" type="Map"/></in-parameters>
+        <out-parameters><parameter name="result" type="Map"/></out-parameters>
+        <actions>
+            <set field="result" from="ec.resource.script('component://mr-mantle/service/mantle/account/Portal.js')
+                .execute('beginPayment', input)"/>
+        </actions>
+    </service>
+    <service verb="refresh" noun="PortalPayment" authenticate="anonymous-all" allow-remote="false">
+        <description>Internal to resolve#PortalPayments: one portal payment asked of its gateway, in its own transaction.
+        </description>
+        <in-parameters><parameter name="input" type="Map"/></in-parameters>
+        <out-parameters><parameter name="result" type="Map"/></out-parameters>
+        <actions>
+            <set field="result" from="ec.resource.script('component://mr-mantle/service/mantle/account/Portal.js')
+                .execute('refreshPayment', input)"/>
+        </actions>
+    </service>
+    <service verb="resolve" noun="PortalPayments" authenticate="anonymous-all" allow-remote="false">
+        <description>The resolve_PortalPayments job: each portal payment still promised or authorized is asked of its
+            gateway in its own transaction (and captured when authorized, cancelled when there is nothing to ask);
+            one that fails is named and the rest go on.</description>
+        <in-parameters><parameter name="limit" type="Integer" default="200"/></in-parameters>
+        <out-parameters>
+            <parameter name="checked" type="Integer"/>
+            <parameter name="resolved" type="Integer"/>
+            <parameter name="failed" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <set field="out" from="ec.resource.script('component://mr-mantle/service/mantle/account/Portal.js')
+                .execute('resolvePending', {limit:limit})"/>
+            <set field="checked" from="out.checked"/>
+            <set field="resolved" from="out.resolved"/>
+            <set field="failed" from="out.failed"/>
+        </actions>
+    </service>
+</services>

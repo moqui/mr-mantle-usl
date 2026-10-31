@@ -118,6 +118,16 @@ along with this software (see the LICENSE.md file). If not, see
                     <if condition="invoiceItem.itemTypeEnumId == 'ItemAsset' &amp;&amp; assetTypeGlAccount &amp;&amp; asset.acquireCost != null &amp;&amp;
                             !toDecimal(asset.acquireCost).isZero() &amp;&amp; (assetTypeEnum.enumId == 'AstTpFixed' || assetTypeEnum.parentEnumId == 'AstTpFixed')">
                         <!-- handle special entries for fixed asset sale: -->
+                        <!-- the sale ends the asset's book life on the posting's day, so it is not depreciated again
+                            (impl-accounting F262) -->
+                        <if condition="!asset.actualEndOfLife">
+                            <set field="policy"
+                                    from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')"/>
+                            <set field="saleDay"
+                                    from="policy.bookDay(fromAcctgTrans.accountingDate, fromAcctgTrans.transactionDate)"/>
+                            <service-call name="update#mantle.product.asset.Asset"
+                                    in-map="{assetId:asset.assetId, actualEndOfLife:saleDay}"/>
+                        </if>
 
                         <!-- credit Unissued Asset (acquireCost) -->
                         <set field="issuanceGlAccountTypeEnumId" value="GatUnissuedFixedAsset"/>
