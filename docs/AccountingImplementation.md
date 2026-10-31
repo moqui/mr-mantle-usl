@@ -497,7 +497,9 @@ through `store#Preferences`, since Mantle's ReturnToResponse and OrderToCash flo
   answers whose return it is (the vendor of a customer return, the customer of a supplier return) and the flag.
 - `salesInvoiceFinalizedAtShip` (D3): `ShipmentOutgoingPackedCreateInvoices` leaves the sales invoice in process with no
   payment applied, and `ShipmentShippedFinalizeInvoices` (shipped, or delivered unshipped) calls
-  `InvoiceServices.finalize#ShipmentInvoices`, which finalizes it and applies the order part's payments, as the pack did.
+  `InvoiceServices.finalize#ShipmentInvoices`, which dates it the ship day (invoice date, book day, due date), finalizes
+  it and applies the order part's payments, as the pack did. A return shipment received through Mantle's own services
+  under `returnSettlementRequired` sets each item's received quantity from its receipts (`sync#ReturnShipmentReceipts`).
 
 **Receipt.** `WarehouseTaskServices.receive#ReturnItems` (`STOCK_RECEIVE`, Warehouse's contract): per return item on a
 customer return shipment, the accepted units as stock (`receive#Asset` on the item's source) and the rejected units as a
@@ -520,12 +522,19 @@ when every item is handled, the shipment ShipDelivered when every source is. It 
   another version (`RECEIPT_CHANGED`), more than eligible (`CREDIT_CAP_EXCEEDED`), a refund beyond the original's
   refundable amount (`CREDIT_CAP_EXCEEDED`) or while one is pending (`REFUND_PENDING`), and a closed period or lock
   (`CLOSED_PERIOD`).
-- A customer return responds through `process#ReturnItemResponses` with its `settlement` parameter: the quantities given,
+- A customer return responds through the internal `respond#ReturnItems` with its `settlement` parameter (Mantle's
+  `process#ReturnItemResponses` refuses a return under the flag, `RETURN_SETTLEMENT_REQUIRED`): the quantities given,
   each billing link with its receipt, original invoice line, receiptless flag, reason, approver, settler and operation key;
-  the credit memo is the organization's receivable credit, finalized (F350); a credit is the customer credit account; a
-  refund is `create#RefundPayment` against the chosen original payment for the credit memo, then `refund#SinglePayment`
-  through its gateway (a pending result answers `REFUND_PENDING`) or delivered; a replacement is Mantle's replacement order.
-- A supplier return makes one credit per item through `create#InvoiceCreditMemo` linked to its bill (a payable draft),
+  the credit memo is the organization's receivable credit (F350), issued through `change#InvoiceState` (approved by the
+  settler when invoice approval is required; a receiptless one stamped self-approved by its approver); a credit is the
+  customer credit account; a refund is spread over the order's captured payments, largest first, each a
+  `create#RefundPayment` for the credit memo, then, last, `refund#SinglePayment` through its gateway under the
+  settlement's key (a decline refuses the settlement, `REFUND_DECLINED`; a pending one answers `REFUND_PENDING`) or
+  delivered; a replacement is Mantle's replacement order for the quantity given, recorded on `replacedQuantity`.
+- Adjustments are credited by their total times the share of the item credited so far, less what they credited before;
+  a credit's unit is at most the billed unit price; a line asked twice is refused (`DUPLICATE_LINE`).
+- A supplier return makes one credit per item, its adjustments netted in, through `create#InvoiceCreditMemo` linked to
+  its bill (a payable draft),
   links the billing to the bill line and the PO receipt, and queues the bill's match re-evaluation.
 - An item settled for all it authorizes is completed with its children (`complete#ReturnItem`); a receiptless one first
   has its remainder closed (ReturnReceived).
