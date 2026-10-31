@@ -106,12 +106,17 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
 
     <service verb="create" noun="Budget">
+        <description>Create a draft budget on a period of its organization; the creator is recorded, and another user
+            approves it (change#BudgetState).</description>
         <in-parameters>
             <auto-parameters entity-name="mantle.other.budget.Budget" include="nonpk"/>
             <parameter name="timePeriodId" required="true"/>
         </in-parameters>
         <out-parameters><parameter name="budgetId"/></out-parameters>
         <actions>
+            <!-- a budget starts as a draft; approval is change#BudgetState's -->
+            <set field="statusId" value="BudgetDraft"/>
+            <set field="createdByUserId" from="ec.user.userId"/>
             <if condition="!currencyUomId">
                 <entity-find-one entity-name="mantle.party.time.TimePeriod" value-field="timePeriod"/>
                 <service-call name="mantle.ledger.LedgerServices.find#PartyAcctgPreference" out-map="context"
@@ -132,6 +137,9 @@ along with this software (see the LICENSE.md file). If not, see
         </in-parameters>
         <out-parameters><parameter name="budgetItemSeqId"/></out-parameters>
         <actions>
+            <entity-find-one entity-name="mantle.other.budget.Budget" value-field="draftBudget"/>
+            <if condition="draftBudget?.statusId &amp;&amp; draftBudget.statusId != 'BudgetDraft'">
+                <return error="true" message="BUDGET_NOT_DRAFT: An approved budget changes only by revise#Budget"/></if>
             <if condition="amount != null"><then>
                 <service-call name="store#mantle.other.budget.BudgetItem" in-map="context" out-map="context"/>
             </then><else-if condition="budgetItemSeqId">
@@ -218,6 +226,8 @@ along with this software (see the LICENSE.md file). If not, see
             <entity-find-one entity-name="mantle.other.budget.Budget" value-field="budget"/>
             <if condition="!budget.timePeriodId || !budget.subTimePeriodTypeId">
                 <return error="true" message="Budget must have a Time Period and a Sub-Period Type"/></if>
+            <if condition="budget.statusId &amp;&amp; budget.statusId != 'BudgetDraft'">
+                <return error="true" message="BUDGET_NOT_DRAFT: An approved budget changes only by revise#Budget"/></if>
 
             <entity-find entity-name="mantle.other.budget.BudgetItem" list="budgetItemList">
                 <econdition field-name="budgetId"/><econdition field-name="glAccountId"/></entity-find>
@@ -294,6 +304,9 @@ along with this software (see the LICENSE.md file). If not, see
         </in-parameters>
         <out-parameters><parameter name="budgetItemDetailId"/></out-parameters>
         <actions>
+            <entity-find-one entity-name="mantle.other.budget.Budget" value-field="draftBudget"/>
+            <if condition="draftBudget?.statusId &amp;&amp; draftBudget.statusId != 'BudgetDraft'">
+                <return error="true" message="BUDGET_NOT_DRAFT: An approved budget changes only by revise#Budget"/></if>
             <if condition="amount != null"><then>
                 <service-call name="store#mantle.other.budget.BudgetItemDetail" in-map="context" out-map="context"/>
             </then><else-if condition="budgetItemDetailId">
@@ -319,6 +332,8 @@ along with this software (see the LICENSE.md file). If not, see
             <entity-find-one entity-name="mantle.other.budget.Budget" value-field="budget"/>
             <if condition="!budget.timePeriodId || !budget.subTimePeriodTypeId">
                 <return error="true" message="Budget must have a Time Period and a Sub-Period Type"/></if>
+            <if condition="budget.statusId &amp;&amp; budget.statusId != 'BudgetDraft'">
+                <return error="true" message="BUDGET_NOT_DRAFT: An approved budget changes only by revise#Budget"/></if>
 
             <entity-find entity-name="mantle.other.budget.BudgetItem" list="budgetItemList">
                 <econdition field-name="budgetId"/><econdition field-name="glAccountId"/></entity-find>
@@ -397,6 +412,277 @@ along with this software (see the LICENSE.md file). If not, see
                 <set field="budgetItemDetailId" from="null"/>
                 <service-call name="create#mantle.other.budget.BudgetItemDetail" in-map="context"/>
             </else-if></if>
+        </actions>
+    </service>
+
+    <!-- ========== Approval, revision and parties (AC-14) ========== -->
+    <service verb="get" noun="BudgetAmounts" allow-remote="false">
+        <description>A budget's items with their amounts as of a revision: the one named (revisionSeqId), else the last
+            one on or before asOfDate, else the last; a draft reads its current amounts. With the budget, its revisions and
+            sub periods. Needs ACCOUNTING_VIEW or ACCOUNTING_ADMIN in the budget's organization (its period's
+            party).</description>
+        <in-parameters>
+            <parameter name="budgetId" required="true"/>
+            <parameter name="revisionSeqId"/>
+            <parameter name="asOfDate" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="budget" type="Map"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="revisionSeqId"/>
+            <parameter name="revisionDate" type="Timestamp"/>
+            <parameter name="revisionList" type="List"/>
+            <parameter name="itemList" type="List"/>
+            <parameter name="subTimePeriodList" type="List"/>
+        </out-parameters>
+        <actions>
+            <set field="read" from="ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js')
+                .execute('amounts', context)"/>
+            <script>ec.context.putAll(read)</script>
+        </actions>
+    </service>
+    <service verb="change" noun="BudgetState" allow-remote="false">
+        <description>Approve, close or cancel a budget. approve (BUDGET_APPROVE): a draft with an amount for at least one
+            account, each account's sub periods adding up to its total, approved by another user than its creator unless
+            the organization allows self-approval; it records the review, revision 0 with each item's amount, and the
+            approved budget's PDF as its content. close (an approved budget) and cancel (a draft) need BUDGET_EDIT and a
+            change reason. Refuses any other transition and a user outside the budget's organization.</description>
+        <in-parameters>
+            <parameter name="budgetId" required="true"/>
+            <parameter name="action" required="true"><description>approve, close or cancel.</description></parameter>
+            <parameter name="changeReason"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="statusId"/>
+            <parameter name="revisionSeqId"/>
+            <parameter name="budgetContentId"/>
+        </out-parameters>
+        <actions>
+            <set field="changed" from="ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js')
+                .execute('changeState', context)"/>
+            <set field="statusId" from="changed.statusId"/>
+            <set field="revisionSeqId" from="changed.revisionSeqId"/>
+            <set field="budgetContentId" from="changed.budgetContentId"/>
+        </actions>
+    </service>
+    <service verb="revise" noun="Budget" allow-remote="false">
+        <description>Revise an approved budget: each line sets an item's amount (by budgetItemSeqId, or by glAccountId
+            and an optional sub period of the budget, which adds the item when the budget lacks it). The revision is its
+            time: a BudgetRevision with the reason and a BudgetRevisionImpact per changed item, the item amounts changed
+            with the reason in their audit log, and the revised budget's PDF stored; earlier revisions keep their numbers.
+            Refuses a budget that is not approved, a revision since lastRevisionSeqId (STALE_REVISION), a negative amount,
+            an account not of the organization, a period not of the budget, sub periods that no longer add up to their
+            total, no change and no reason. Needs BUDGET_EDIT in the budget's organization.</description>
+        <in-parameters>
+            <parameter name="budgetId" required="true"/>
+            <parameter name="lines" type="List"><description>Maps of budgetItemSeqId or glAccountId and subTimePeriodId,
+                and amount.</description></parameter>
+            <parameter name="glAccountId"><description>With amountMain and amountPer1 to amountPer12, an account's total
+                and its sub period amounts by position, as store#BudgetItemsSubPeriods takes them; an empty amount is
+                left as it is.</description></parameter>
+            <parameter name="amountMain" type="BigDecimal"/>
+            <parameter name="amountPer1" type="BigDecimal"/><parameter name="amountPer2" type="BigDecimal"/>
+            <parameter name="amountPer3" type="BigDecimal"/><parameter name="amountPer4" type="BigDecimal"/>
+            <parameter name="amountPer5" type="BigDecimal"/><parameter name="amountPer6" type="BigDecimal"/>
+            <parameter name="amountPer7" type="BigDecimal"/><parameter name="amountPer8" type="BigDecimal"/>
+            <parameter name="amountPer9" type="BigDecimal"/><parameter name="amountPer10" type="BigDecimal"/>
+            <parameter name="amountPer11" type="BigDecimal"/><parameter name="amountPer12" type="BigDecimal"/>
+            <parameter name="changeReason"/>
+            <parameter name="lastRevisionSeqId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="revisionSeqId"/>
+            <parameter name="changedCount" type="Integer"/>
+            <parameter name="budgetContentId"/>
+        </out-parameters>
+        <actions>
+            <set field="revised" from="ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js')
+                .execute('revise', context)"/>
+            <set field="revisionSeqId" from="revised.revisionSeqId"/>
+            <set field="changedCount" from="revised.changedCount"/>
+            <set field="budgetContentId" from="revised.budgetContentId"/>
+        </actions>
+    </service>
+    <service verb="store" noun="BudgetParty" allow-remote="false">
+        <description>Add a party to a budget in a role (BudgetParty), or remove it (remove). Refuses a closed or cancelled
+            budget, an unknown or private party and an unknown role. Needs BUDGET_EDIT in the budget's
+            organization.</description>
+        <in-parameters>
+            <parameter name="budgetId" required="true"/>
+            <parameter name="partyId" required="true"/>
+            <parameter name="roleTypeId" required="true"/>
+            <parameter name="remove" type="Boolean" default="false"/>
+        </in-parameters>
+        <out-parameters><parameter name="changed" type="Boolean"/></out-parameters>
+        <actions>
+            <set field="changed" from="ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js')
+                .execute('party', context).changed"/>
+        </actions>
+    </service>
+
+    <!-- ========== Control policy and commitments (AC-14) ========== -->
+    <service verb="store" noun="Policy" allow-remote="false">
+        <description>Start a budget control policy row of the organization (BudgetControlPolicy): for every budget or one,
+            every account or one, every stage or one; Ignore, Warn or Stop when spending would pass the threshold percent
+            of the budget. Given the row it replaces (budgetControlPolicyId), the new version starts at fromDate and the
+            old one ends there; given that row and no action, it ends the row (thruDate, else now). The key fields are
+            audit-logged with the change reason. Refuses a missing action or reason, a threshold outside 1 to 1000, a budget
+            or account not of the organization, dates that do not increase, a version not after the one it replaces and
+            another row of the same scope over the same dates. Needs ACCOUNTING_ADMIN in the organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="budgetControlPolicyId"/>
+            <parameter name="budgetId"/>
+            <parameter name="glAccountId"/>
+            <parameter name="stageEnumId"/>
+            <parameter name="actionEnumId"/>
+            <parameter name="thresholdPercent" type="BigDecimal"/>
+            <parameter name="fromDate" type="Timestamp"/>
+            <parameter name="thruDate" type="Timestamp"/>
+            <parameter name="description"/>
+            <parameter name="changeReason"/>
+        </in-parameters>
+        <out-parameters><parameter name="budgetControlPolicyId"/></out-parameters>
+        <actions>
+            <set field="budgetControlPolicyId" from="ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js')
+                .execute('storePolicy', context).budgetControlPolicyId"/>
+        </actions>
+    </service>
+    <service verb="check" noun="Budget" allow-remote="false">
+        <description>Preview the budget decision of spending, writing nothing: for each line (glAccountId and amount, or
+            lines) the approved budget line it counts against on the day, the budget, actual (posted debits less credits)
+            and committed amounts, what is available under the policy's threshold, and the decision (within, not
+            controlled, warned, or blocked by a Stop, with whether the user may override it). Needs a finance read or a
+            spending permission in the organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="stageEnumId"/>
+            <parameter name="commitmentDate"/>
+            <parameter name="glAccountId"/>
+            <parameter name="amount" type="BigDecimal"/>
+            <parameter name="lines" type="List"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="checkList" type="List"/>
+            <parameter name="blocked" type="Boolean"/>
+            <parameter name="warned" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="checked" from="ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js')
+                .execute('check', context)"/>
+            <set field="checkList" from="checked.checkList"/>
+            <set field="blocked" from="checked.blocked"/>
+            <set field="warned" from="checked.warned"/>
+        </actions>
+    </service>
+    <service verb="define" noun="CommitmentSource" type="interface">
+        <description>The source line a commitment holds spending for, with its revision: a commitment is idempotent per
+            source revision, so a retry answers the first.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="sourceEntityName"/>
+            <parameter name="sourceId"/>
+            <parameter name="sourceItemId"/>
+            <parameter name="sourceRevision"/>
+            <parameter name="stageEnumId"/>
+            <parameter name="glAccountId"/>
+            <parameter name="amount" type="BigDecimal"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="commitmentDate"/>
+            <parameter name="overrideReason"><description>Passes a Stop for a user holding BUDGET_OVERRIDE.</description>
+            </parameter>
+        </in-parameters>
+    </service>
+    <service verb="reserve" noun="Commitment" allow-remote="false">
+        <description>Reserve spending of a request or purchase order line against the approved budget of its account and
+            day, after the control policy's decision under the budget's lock: a Stop over budget is refused
+            (BUDGET_EXCEEDED) and kept as a blocked commitment, whose BudgetOverride notice goes to the organization's
+            users holding BUDGET_OVERRIDE, unless such a user gives an override reason; a Warn reserves with a warning. The
+            same source revision answers the first commitment (a different amount or account is refused); a new revision
+            releases the open commitment of the earlier one. Needs INVOICE_APPROVE, PAYABLE_EDIT, BUDGET_EDIT or
+            ACCOUNTING_ADMIN in the organization.</description>
+        <implements service="mantle.other.BudgetServices.define#CommitmentSource"/>
+        <out-parameters>
+            <parameter name="budgetCommitmentId"/>
+            <parameter name="statusId"/>
+            <parameter name="decisionEnumId"/>
+            <parameter name="message"/>
+            <parameter name="availableAmount" type="BigDecimal"/>
+            <parameter name="existing" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="reserved" from="ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js')
+                .execute('reserve', context)"/>
+            <script>ec.context.putAll(reserved)</script>
+        </actions>
+    </service>
+    <service verb="convert" noun="Commitment" allow-remote="false">
+        <description>Pass a reserved commitment on to its next stage: a request's to its purchase order (reserved), an
+            order line's to its expense (actual), naming the commitment (fromCommitmentId) or its source line; the parent is
+            converted once later stages hold all of it, so nothing counts twice. With invoiceId, every posted line of the
+            approved bill becomes an actual commitment, converting its purchase order lines' open commitments (through
+            their billing links) first; an account's lines are decided together, keyed by the bill's approved version
+            (approve#Payable calls this). The control policy decides the part not already held, as reserve#Commitment
+            does. Needs INVOICE_APPROVE, PAYABLE_EDIT, BUDGET_EDIT or ACCOUNTING_ADMIN in the organization.</description>
+        <implements service="mantle.other.BudgetServices.define#CommitmentSource"/>
+        <in-parameters>
+            <parameter name="fromCommitmentId"/>
+            <parameter name="fromSourceEntityName"/>
+            <parameter name="fromSourceId"/>
+            <parameter name="fromSourceItemId"/>
+            <parameter name="invoiceId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="budgetCommitmentId"/>
+            <parameter name="budgetCommitmentIds" type="List"/>
+            <parameter name="statusId"/>
+            <parameter name="decisionEnumId"/>
+            <parameter name="message"/>
+            <parameter name="existing" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="converted" from="ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js')
+                .execute('convert', context)"/>
+            <script>ec.context.putAll(converted)</script>
+        </actions>
+    </service>
+    <service verb="release" noun="Commitment" allow-remote="false">
+        <description>Release what is left of a source's open commitments (a closed order, a cancelled request): optionally
+            one line, stage or revision. Releasing again releases nothing. Needs INVOICE_APPROVE, PAYABLE_EDIT, BUDGET_EDIT
+            or ACCOUNTING_ADMIN in the organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="sourceEntityName" required="true"/>
+            <parameter name="sourceId" required="true"/>
+            <parameter name="sourceItemId"/>
+            <parameter name="sourceRevision"/>
+            <parameter name="stageEnumId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="releasedCount" type="Integer"/>
+            <parameter name="budgetCommitmentIds" type="List"/>
+        </out-parameters>
+        <actions>
+            <set field="released" from="ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js')
+                .execute('release', context)"/>
+            <set field="releasedCount" from="released.releasedCount"/>
+            <set field="budgetCommitmentIds" from="released.budgetCommitmentIds"/>
+        </actions>
+    </service>
+    <service verb="record" noun="BlockedCommitment" allow-remote="false">
+        <description>Internal to the commitment services, run in its own transaction while the refusing caller rolls
+            back: keep a refused Stop as a blocked commitment (once per source key) and send its BudgetOverride
+            notice.</description>
+        <in-parameters><parameter name="fields" type="Map" required="true"/></in-parameters>
+        <out-parameters>
+            <parameter name="budgetCommitmentId"/>
+            <parameter name="notified" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="recorded" from="ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js')
+                .execute('recordBlocked', context)"/>
+            <set field="budgetCommitmentId" from="recorded.budgetCommitmentId"/>
+            <set field="notified" from="recorded.notified"/>
         </actions>
     </service>
 </services>

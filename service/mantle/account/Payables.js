@@ -465,25 +465,26 @@ function organizationUsers(permission, organizationPartyId) {
     )
     return accounts.filter(row => members.has(row.partyId)).map(row => row.userId)
 }
-// Send an approval notification about a bill to the organization's users who may decide it.
+// Send an approval notification about a bill (or another record: recordEntityName, recordId) to the organization's users
+// who may decide it.
 function notify(p) {
     const notification = ec
         .makeNotificationMessage()
         .topic(p.topic)
         .message(p.message)
-        .record(I, p.invoiceId)
+        .record(p.recordEntityName || I, p.recordId || p.invoiceId)
         .actorUserId(ec.user.userId)
         .userIds(organizationUsers(p.permission, p.organizationPartyId))
     notification.send()
     return {notificationMessageId: notification.getNotificationMessageId()}
 }
 // A decision clears its notifications: each recipient's copy of the topic's messages about the bill (about the hold, when
-// one is named) is marked read, so the Approvals lists empty.
+// one is named; or about another record: recordEntityName, recordId) is marked read, so the Approvals lists empty.
 function clearNotices(p) {
     const messages = rows("moqui.security.user.NotificationMessage", {
         topic: p.topic,
-        recordEntityName: I,
-        recordId: p.invoiceId
+        recordEntityName: p.recordEntityName || I,
+        recordId: p.recordId || p.invoiceId
     }).filter(row => {
         if (!p.invoiceHoldId) return true
         try {

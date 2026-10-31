@@ -3,6 +3,7 @@
 <entity-facade-xml type="seed">
     <moqui.security.UserPermission userPermissionId="ACCOUNTING_ADMIN" description="Accounting Admin"/>
     <moqui.security.UserPermission userPermissionId="BANK_RECONCILE" description="Bank Reconcile"/>
+    <moqui.security.UserPermission userPermissionId="BUDGET_APPROVE" description="Budget Approve"/>
     <moqui.security.UserPermission userPermissionId="BUDGET_EDIT" description="Budget Edit"/>
     <moqui.security.UserPermission userPermissionId="BUDGET_OVERRIDE" description="Budget Override"/>
     <moqui.security.UserPermission userPermissionId="CREDIT_HOLD_RELEASE" description="Credit Hold Release"/>

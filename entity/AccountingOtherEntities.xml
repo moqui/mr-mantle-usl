@@ -24,6 +24,10 @@ along with this software (see the LICENSE.md file). If not, see
     <!-- ========================================================= -->
 
     <entity entity-name="Budget" package="mantle.other.budget">
+        <description>A budget of an organization: its period's party is the organization, and its other parties are
+            BudgetParty rows. A draft's amounts are edited freely; an approved budget changes only by revise#Budget, each
+            change a BudgetRevision (approval is revision 0) whose BudgetRevisionImpact rows hold the amounts it set, so the
+            budget reads as of any revision.</description>
         <field name="budgetId" type="id" is-pk="true"/>
         <field name="budgetTypeEnumId" type="id"/>
         <field name="timePeriodId" type="id"/>
@@ -32,6 +36,8 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="currencyUomId" type="id"/>
         <field name="description" type="text-medium"/>
         <field name="comments" type="text-long"/>
+        <field name="createdByUserId" type="id"><description>Who drafted the budget; another user approves it unless the
+            organization allows self-approval.</description></field>
         <relationship type="one" title="BudgetType" related="moqui.basic.Enumeration" short-alias="type">
             <key-map field-name="budgetTypeEnumId"/></relationship>
         <relationship type="one" related="mantle.party.time.TimePeriod" short-alias="timePeriod"/>
@@ -46,6 +52,16 @@ along with this software (see the LICENSE.md file). If not, see
 
             <!-- Budget Status -->
             <moqui.basic.StatusType description="Budget" statusTypeId="Budget"/>
+            <moqui.basic.StatusItem statusId="BudgetDraft" statusTypeId="Budget" description="Draft" sequenceNum="1"/>
+            <moqui.basic.StatusItem statusId="BudgetApproved" statusTypeId="Budget" description="Approved" sequenceNum="2"/>
+            <moqui.basic.StatusItem statusId="BudgetClosed" statusTypeId="Budget" description="Closed" sequenceNum="3"/>
+            <moqui.basic.StatusItem statusId="BudgetCancelled" statusTypeId="Budget" description="Cancelled" sequenceNum="4"/>
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="BudgetDraft" toStatusId="BudgetApproved"
+                    transitionName="Approve"/>
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="BudgetDraft" toStatusId="BudgetCancelled"
+                    transitionName="Cancel"/>
+            <moqui.basic.StatusFlowTransition statusFlowId="Default" statusId="BudgetApproved" toStatusId="BudgetClosed"
+                    transitionName="Close"/>
         </seed-data>
     </entity>
     <entity entity-name="BudgetItem" package="mantle.other.budget">
@@ -54,7 +70,7 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="budgetItemTypeEnumId" type="id"/>
         <field name="itemTypeEnumId" type="id"/>
         <field name="glAccountId" type="id"/>
-        <field name="amount" type="currency-amount"/>
+        <field name="amount" type="currency-amount" enable-audit-log="true"/>
         <field name="productId" type="id"/>
         <field name="quantity" type="number-decimal"/>
         <field name="quantityUomId" type="id"/>
@@ -112,6 +128,7 @@ along with this software (see the LICENSE.md file). If not, see
         <seed-data>
             <!-- Budget Review Result -->
             <moqui.basic.EnumerationType description="Budget Review Result" enumTypeId="BudgetReviewResult"/>
+            <moqui.basic.Enumeration description="Approved" enumId="BrrApproved" enumTypeId="BudgetReviewResult"/>
         </seed-data>
     </entity>
     <entity entity-name="BudgetRevision" package="mantle.other.budget">
@@ -119,6 +136,7 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="revisionSeqId" type="id" is-pk="true"/>
         <field name="dateRevised" type="date-time"/>
         <field name="description" type="text-medium"/>
+        <field name="revisedByUserId" type="id"/>
         <relationship type="one" related="mantle.other.budget.Budget"/>
     </entity>
     <entity entity-name="BudgetRevisionImpact" package="mantle.other.budget">

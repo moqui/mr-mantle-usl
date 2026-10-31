@@ -47,6 +47,9 @@ function capabilities() {
         holdRelease: has("INVOICE_HOLD_RELEASE"),
         payableImport: has("PAYABLE_IMPORT"),
         supplierTermsEdit: has("SUPPLIER_TERMS_EDIT"),
+        budgetEdit: has("BUDGET_EDIT"),
+        budgetApprove: has("BUDGET_APPROVE"),
+        budgetOverride: has("BUDGET_OVERRIDE"),
         fiscalClose: has("FISCAL_CLOSE"),
         fiscalReopen: has("FISCAL_REOPEN")
     }
