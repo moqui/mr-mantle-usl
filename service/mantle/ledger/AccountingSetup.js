@@ -24,7 +24,6 @@ const preferenceFields = [
     "requiredLedgerDimensionsEnabled",
     "forwardIssuanceRepostEnabled",
     "allowAccountingSelfApproval",
-    "singleCurrencyDocumentsOnly",
     "invoiceApprovalRequired",
     "inventoryRevaluationEnabled",
     "receiptInvoiceSelfBilledOnly",
@@ -37,7 +36,8 @@ const preferenceFields = [
     "paymentDocumentTemplate",
     "documentLocale",
     "documentFooter",
-    "invoiceEmailTemplateId"
+    "invoiceEmailTemplateId",
+    "rateProviderServiceName"
 ]
 const mappingEntity = descriptor => (descriptor[0].includes(".") ? descriptor[0] : C + descriptor[0])
 const mappings = {

@@ -280,13 +280,15 @@ function validate(p, lock = false) {
         )
             fail("ORGANIZATION", "Posting organization must be internal")
         const currency = tx.amountUomId && one("moqui.basic.Uom", {uomId: tx.amountUomId})
-        if (
-            !currency ||
-            currency.uomTypeEnumId !== "UT_CURRENCY_MEASURE" ||
-            !pref.baseCurrencyUomId ||
-            tx.amountUomId !== pref.baseCurrencyUomId
-        )
-            fail("CURRENCY_MISMATCH", "Posting requires the organization's base currency until currency conversion is enabled")
+        if (!currency || currency.uomTypeEnumId !== "UT_CURRENCY_MEASURE" || !pref.baseCurrencyUomId)
+            fail("CURRENCY_MISMATCH", "Posting requires a currency and the organization's base currency")
+        else if (tx.amountUomId !== pref.baseCurrencyUomId) {
+            // post#AcctgTrans converts a transaction with a rate before this check; one still in another currency has none
+            const rated = ec.resource
+                .script("component://mr-mantle/service/mantle/ledger/Currencies.js")
+                .execute("convertible", {acctgTransId: tx.acctgTransId})
+            if (rated.missing) fail("RATE_MISSING", rated.message)
+        }
         const domain = ec.resource.script("component://mr-mantle/service/mantle/product/ProductAccess.js")
         const orgs =
             domain.systemAdmin() || domain.has("ACCOUNTING_ADMIN") || portalPayment(tx)

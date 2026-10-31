@@ -103,8 +103,8 @@ along with this software (see the LICENSE.md file). If not, see
                     from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingSetup.js').preferenceFields"/>
             <set field="preferenceValues" from="policy.pick(settings || {}, preferenceFields)"/>
             <set field="invalidFlag" from="['postingGuardEnabled', 'requiredLedgerDimensionsEnabled',
-                    'forwardIssuanceRepostEnabled', 'allowAccountingSelfApproval', 'singleCurrencyDocumentsOnly',
-                    'invoiceApprovalRequired', 'inventoryRevaluationEnabled', 'receiptInvoiceSelfBilledOnly',
+                    'forwardIssuanceRepostEnabled', 'allowAccountingSelfApproval', 'invoiceApprovalRequired',
+                    'inventoryRevaluationEnabled', 'receiptInvoiceSelfBilledOnly',
                     'returnSettlementRequired', 'salesInvoiceFinalizedAtShip', 'projectCostPostingEnabled',
                     'realTimeGlSummary']
                     .find(field => preferenceValues[field] != null &amp;&amp; !['Y', 'N'].includes(preferenceValues[field]))"/>
@@ -174,6 +174,16 @@ along with this software (see the LICENSE.md file). If not, see
                 </entity-find>
                 <if condition="!payBindingList.length">
                     <return error="true" message="Choose one of the organization's payment gateways for invoice payment"/>
+                </if>
+            </if>
+            <!-- a rate provider is one of the ExchangeRateProvider enumerations, never any service a name could reach -->
+            <if condition="preferenceValues.rateProviderServiceName">
+                <entity-find entity-name="moqui.basic.Enumeration" list="rateProviderList" limit="1" disable-authz="true">
+                    <econdition field-name="enumTypeId" value="ExchangeRateProvider"/>
+                    <econdition field-name="enumCode" from="preferenceValues.rateProviderServiceName"/>
+                </entity-find>
+                <if condition="!rateProviderList.length">
+                    <return error="true" message="Choose an exchange rate provider"/>
                 </if>
             </if>
             <iterate list="['invoiceDocumentTemplate', 'paymentDocumentTemplate']" entry="templateField">
@@ -546,17 +556,18 @@ along with this software (see the LICENSE.md file). If not, see
     </service>
     <!-- ========== Setup and activation (AC-01) ========== -->
     <service verb="store" noun="SetupRun" allow-remote="false">
-        <description>Start or change the organization's accounting setup run. An organization with no accounting preference,
-            its own or one inherited through its rollup, is set up from a chart template (init#PartyAccountingConfiguration with
-            sourcePartyId, the base currency, fiscal year start and costing basis, and the posting guard and single-currency
-            documents on); for one with its own preference a changed basis goes through store#Preferences, and one that inherits
-            keeps its parent's basis (a change is refused, BASIS_INHERITED). The fiscal periods of the opening day are made when
-            missing. The opening balances are replaced (balances, or balancesCsvText with the headers account, debit and credit)
-            or one line is saved (balanceLine; empty amounts remove it). Each change raises runVersion. Refuses a user without
-            finance administration, a source that is not a chart template, a stale runVersion, an activated run, a new opening day
-            or migration account once open items are imported, a migration or line account that is not an active posting account
-            of the organization, a line of the migration account, a line with both a debit and a credit, and an account on two
-            lines.</description>
+        <description>Start or change the organization's accounting setup run. An organization with no accounting
+            preference, its own or one inherited through its rollup, is set up from a chart template
+            (init#PartyAccountingConfiguration with sourcePartyId, the base currency, fiscal year start and costing
+            basis, and the posting guard on); for one with its own preference a changed basis goes through
+            store#Preferences, and one that inherits keeps its parent's basis (a change is refused, BASIS_INHERITED).
+            The fiscal periods of the opening day are made when missing. The opening balances are replaced (balances,
+            or balancesCsvText with the headers account, debit and credit) or one line is saved (balanceLine; empty
+            amounts remove it). Each change raises runVersion. Refuses a user without finance administration, a source
+            that is not a chart template, a stale runVersion, an activated run, a new opening day or migration account
+            once open items are imported, a migration or line account that is not an active posting account of the
+            organization, a line of the migration account, a line with both a debit and a credit, and an account on
+            two lines.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
             <parameter name="sourcePartyId"><description>The chart template, for an organization not set up
@@ -635,7 +646,7 @@ along with this software (see the LICENSE.md file). If not, see
                             in-map="{sourcePartyId:sourcePartyId, organizationPartyId:organizationPartyId,
                                 baseCurrencyUomId:baseCurrencyUomId, fiscalYearStartMonth:startMonth,
                                 fiscalYearStartDay:startDay, cogsMethodEnumId:cogsMethodEnumId || null,
-                                postingGuardEnabled:'Y', singleCurrencyDocumentsOnly:'Y'}"/>
+                                postingGuardEnabled:'Y'}"/>
                     <set field="initialized" from="true"/>
                 </then>
                 <else-if condition="!ownPreference">
@@ -856,8 +867,8 @@ along with this software (see the LICENSE.md file). If not, see
             organization, side, party and document number answers the invoice made before. Raises the run's version. With
             verifyOnly only checks. Refuses a user without finance administration (and, for a bill, INVOICE_APPROVE), no setup run
             or an activated one, the posting guard off, a side that is not receivable or payable, an unknown, private or internal
-            party, no document number, a date that is not yyyy-MM-dd, a document after the opening day, a currency other than the
-            base currency (single currency until base-currency posting), an amount that is not positive or finer than the
+            party, no document number, a date that is not yyyy-MM-dd, a document after the opening day, a currency with no rate to
+            the base currency on the opening day (its posting is refused), an amount that is not positive or finer than the
             currency, and a document imported before with another amount or due date.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
@@ -942,11 +953,7 @@ along with this software (see the LICENSE.md file). If not, see
             </if>
             <set field="baseCurrencyUomId" from="activation.baseCurrency(organizationPartyId)"/>
             <set field="currencyUomId" from="String(currencyUomId || '').trim() || baseCurrencyUomId"/>
-            <if condition="currencyUomId !== baseCurrencyUomId">
-                <set field="refusal" from="'CURRENCY_NOT_BASE: Single currency until base-currency posting: the open item '
-                        + 'must be in ' + baseCurrencyUomId"/>
-                <return error="true" message="${refusal}"/>
-            </if>
+            <script>policy.currency(currencyUomId)</script>
             <set field="amount" from="policy.lib.amount(String(openAmount ?? '').trim(), currencyUomId)"/>
             <!-- the document imported before (the same organization, side, party and number) answers its invoice -->
             <entity-find entity-name="mantle.account.invoice.Invoice" list="importedList" disable-authz="true">
@@ -1013,14 +1020,15 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
     <service verb="check" noun="Readiness" allow-remote="false">
-        <description>Whether the organization's accounting can be activated, as rows each with its state (ready, check or
-            blocks activation), message and the items it names: preferences, chart, the open periods of the opening day, the
-            posting guard, the migration clearing, receivable and payable accounts, mappings to summary accounts and mapped
-            accounts not in the chart, the inventory WIP and transfer accounts and costing basis, single currency until base-
-            currency posting (open documents and active prices), the sales tax method, bank accounts, the paused past due email
-            job, the production cost accounts (a warning until Manufacturing), entries posted before the opening balances,
-            balanced opening balances and the open items' tie-out. One check that fails is named and the others go on. Refuses a
-            user without finance administration.</description>
+        <description>Whether the organization's accounting can be activated, as rows each with its state (ready, check
+            or blocks activation), message and the items it names: preferences, chart, the open periods of the opening
+            day, the posting guard, the migration clearing, receivable and payable accounts, mappings to summary
+            accounts and mapped accounts not in the chart, the inventory WIP and transfer accounts and costing basis,
+            the exchange rates of open documents in other currencies and the exchange gain and loss accounts, the
+            sales tax method, bank accounts, the paused past due email job, the production cost accounts (a warning
+            until Manufacturing), entries posted before the opening balances, balanced opening balances and the open
+            items' tie-out. One check that fails is named and the others go on. Refuses a user without finance
+            administration.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
         </in-parameters>

@@ -1663,6 +1663,13 @@ along with this software (see the LICENSE.md file). If not, see
     <mantle.ledger.account.GlAccountOrganization glAccountId="913000000" organizationPartyId="DefaultSettings"/>
     <mantle.ledger.config.GlAccountTypeDefault glAccountId="913000000" glAccountTypeEnumId="GatMigrationClearing"
             organizationPartyId="DefaultSettings"/>
+    <!-- the realized exchange gain and loss of base-currency posting (post#PaymentApplication) -->
+    <mantle.ledger.account.GlAccountOrganization glAccountId="797000000" organizationPartyId="DefaultSettings"/>
+    <mantle.ledger.account.GlAccountOrganization glAccountId="817000000" organizationPartyId="DefaultSettings"/>
+    <mantle.ledger.config.GlAccountTypeDefault glAccountId="817000000" glAccountTypeEnumId="GatForExGain"
+            organizationPartyId="DefaultSettings"/>
+    <mantle.ledger.config.GlAccountTypeDefault glAccountId="797000000" glAccountTypeEnumId="GatForExLoss"
+            organizationPartyId="DefaultSettings"/>
 
     <mantle.ledger.config.GlAccountTypeDefault glAccountId="121000000" glAccountTypeEnumId="GatAccountsReceivable" organizationPartyId="DefaultSettings"/>
     <mantle.ledger.config.GlAccountTypeDefault glAccountId="121500000" glAccountTypeEnumId="GatInterestIncomeRec" organizationPartyId="DefaultSettings"/>

@@ -268,7 +268,7 @@ const labels = {
     MAPPINGS_NOT_POSTABLE: "Mappings to summary accounts",
     MAPPINGS_UNASSIGNED: "Mapped accounts not in the chart",
     WIP_TRANSFER: "Inventory WIP and transfer accounts",
-    SINGLE_CURRENCY: "Single currency",
+    EXCHANGE_RATES: "Exchange rates",
     TAX_METHOD: "Sales tax",
     BANK_METHODS: "Bank accounts",
     REMINDER_JOB: "Past due email job",
@@ -436,40 +436,43 @@ function readiness(p) {
             }
         ],
         [
-            "SINGLE_CURRENCY",
+            "EXCHANGE_RATES",
             () => {
                 const base = preference.baseCurrencyUomId
                 if (!base) return ["blocker", "Choose a base currency"]
+                // documents in another currency post at the rate of their day; each currency open on the opening day
+                // needs a rate to the base currency then, and a settled difference needs the exchange accounts
                 const open = ["InvoiceInProcess", "InvoiceIncoming", "InvoiceReceived", "InvoiceFinalized", "InvoiceSent", "InvoiceApproved"]
                 const cf = ec.entity.conditionFactory
                 const sides = cf.makeCondition([cf.makeCondition("fromPartyId", "equals", org), cf.makeCondition("toPartyId", "equals", org)], "or")
-                const invoices = find(INVOICE)
+                const used = new Set()
+                for (const row of find(INVOICE)
                     .condition(sides)
                     .condition("statusId", "in", open)
                     .condition("currencyUomId", "not-equals", base)
-                    .count()
-                const payments = find("mantle.account.payment.Payment")
+                    .selectField("currencyUomId")
+                    .distinct(true)
+                    .list())
+                    used.add(row.currencyUomId)
+                for (const row of find("mantle.account.payment.Payment")
                     .condition(sides)
                     .condition("statusId", "in", ["PmntProposed", "PmntPromised", "PmntAuthorized"])
                     .condition("amountUomId", "not-equals", base)
-                    .count()
-                const stores = rows("mantle.product.store.ProductStore", {organizationPartyId: org}).map(row => row.productStoreId)
-                const priceOwners = [cf.makeCondition("vendorPartyId", "equals", org), cf.makeCondition("customerPartyId", "equals", org)]
-                if (stores.length) priceOwners.push(cf.makeCondition("productStoreId", "in", stores))
-                const now = ec.user.nowTimestamp
-                const prices = find("mantle.product.ProductPrice")
-                    .condition(cf.makeCondition(priceOwners, "or"))
-                    .condition("priceUomId", "not-equals", base)
-                    .condition(cf.makeCondition([cf.makeCondition("thruDate", "is-null", null), cf.makeCondition("thruDate", "greater", now)], "or"))
-                    .count()
-                const items = []
-                if (invoices) items.push(invoices + " open invoices or bills")
-                if (payments) items.push(payments + " pending payments")
-                if (prices) items.push(prices + " active prices")
-                if (items.length) return ["blocker", "Single currency until base-currency posting: these are not in " + base, items]
-                if (preference.singleCurrencyDocumentsOnly !== "Y")
-                    return ["warning", "Turn on single-currency documents so another currency is refused"]
-                return ["ok", "Single currency until base-currency posting: open documents and active prices are in " + base]
+                    .selectField("amountUomId")
+                    .distinct(true)
+                    .list())
+                    used.add(row.amountUomId)
+                const currencies = ec.resource.script("component://mr-mantle/service/mantle/ledger/Currencies.js")
+                const missing = [...used].sort().filter(uomId => !currencies.rateOn(uomId, base, openingDay))
+                if (missing.length)
+                    return ["blocker", "Add the exchange rates to " + base + " of " + openingDay + " for the open documents", missing]
+                const unmapped = ["GatForExGain", "GatForExLoss"].filter(
+                    type => !call("mantle.ledger.LedgerServices.get#DefaultGlAccountByType", {glAccountTypeEnumId: type, organizationPartyId: org}).glAccountId
+                )
+                if (unmapped.length) return ["warning", "Map the exchange gain and loss accounts; a settled exchange difference needs them", unmapped]
+                return used.size
+                    ? ["ok", "Documents in " + [...used].sort().join(", ") + " post at their rates in " + base]
+                    : ["ok", "Postings convert to " + base + " at the rate of their day"]
             }
         ],
         [
