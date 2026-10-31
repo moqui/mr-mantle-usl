@@ -204,4 +204,165 @@ along with this software (see the LICENSE.md file). If not, see
             }
         ]]></script></actions>
     </service>
+
+    <!-- Accounting's inventory valuation (impl-accounting P13; logic in product/InventoryValuation.js) -->
+    <service verb="run" noun="InventoryValuation" allow-remote="false">
+        <description>An organization's inventory valued at each asset's current cost (AssetValuationSummary) through a day,
+            by product beside the posted balance of its inventory accounts, with the totals of stock, the inventory and WIP
+            accounts and their difference; the movements that explain a difference (receipts and issues that posted
+            nothing, zero-cost receipts, count variances that did not post, stock postings in the error journal) and the
+            open WIP of each run. Refuses a user without Accounting report read in the organization, a facility of
+            another organization and a future day.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="facilityId"/>
+            <parameter name="productId"/>
+            <parameter name="asOfDate" type="Date"/>
+            <parameter name="pageIndex" type="Integer"/>
+            <parameter name="pageSize" type="Integer"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="asOfDay"/>
+            <parameter name="summary" type="Map"/>
+            <parameter name="accountRows" type="List"/>
+            <parameter name="valuationRows" type="List"/>
+            <parameter name="valuationRowsCount" type="Integer"/>
+            <parameter name="valuationRowsPageIndex" type="Integer"/>
+            <parameter name="valuationRowsPageSize" type="Integer"/>
+            <parameter name="valuationRowsPageMaxIndex" type="Integer"/>
+            <parameter name="valuationRowsPageRangeLow" type="Integer"/>
+            <parameter name="valuationRowsPageRangeHigh" type="Integer"/>
+            <parameter name="complete" type="Boolean"/>
+            <parameter name="exceptionRows" type="List"/>
+            <parameter name="wipRows" type="List"/>
+            <parameter name="canRepair" type="Boolean"/>
+            <parameter name="canRevalue" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="out" from="ec.resource.script('component://mr-mantle/service/mantle/product/InventoryValuation.js')
+                    .execute('valuation', context)"/>
+            <set field="organizationPartyId" from="out.organizationPartyId"/>
+            <set field="asOfDay" from="out.asOfDay"/>
+            <set field="summary" from="out.summary"/>
+            <set field="accountRows" from="out.accountRows"/>
+            <set field="valuationRows" from="out.valuationRows"/>
+            <set field="valuationRowsCount" from="out.valuationRowsCount"/>
+            <set field="valuationRowsPageIndex" from="out.valuationRowsPageIndex"/>
+            <set field="valuationRowsPageSize" from="out.valuationRowsPageSize"/>
+            <set field="valuationRowsPageMaxIndex" from="out.valuationRowsPageMaxIndex"/>
+            <set field="valuationRowsPageRangeLow" from="out.valuationRowsPageRangeLow"/>
+            <set field="valuationRowsPageRangeHigh" from="out.valuationRowsPageRangeHigh"/>
+            <set field="complete" from="out.complete"/>
+            <set field="exceptionRows" from="out.exceptionRows"/>
+            <set field="wipRows" from="out.wipRows"/>
+            <set field="canRepair" from="out.canRepair"/>
+            <set field="canRevalue" from="out.canRevalue"/>
+        </actions>
+    </service>
+    <service verb="run" noun="StockTransactions" allow-remote="false">
+        <description>An organization's stock movements of a fiscal period or a date range: receipts, issues and count
+            variances of its inventory, each with its facility, product, asset, lot and source, quantity, cost, value and
+            posting result, with the totals of each kind. A kind with more than listLimit movements is reported
+            incomplete. Refuses a user without Accounting report read in the organization, a period of another
+            organization and a facility of another organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="timePeriodId"/>
+            <parameter name="fromDate" type="Date"/>
+            <parameter name="thruDate" type="Date"/>
+            <parameter name="facilityId"/>
+            <parameter name="productId"/>
+            <parameter name="movementKind"><description>receipt, issue or variance; all when empty</description></parameter>
+            <parameter name="postedOnly"/>
+            <parameter name="listLimit" type="Integer" default="500"/>
+            <parameter name="pageIndex" type="Integer"/>
+            <parameter name="pageSize" type="Integer"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="fromDay"/>
+            <parameter name="thruDay"/>
+            <parameter name="period" type="Map"/>
+            <parameter name="totalRows" type="List"/>
+            <parameter name="movementRows" type="List"/>
+            <parameter name="movementRowsCount" type="Integer"/>
+            <parameter name="movementRowsPageIndex" type="Integer"/>
+            <parameter name="movementRowsPageSize" type="Integer"/>
+            <parameter name="movementRowsPageMaxIndex" type="Integer"/>
+            <parameter name="movementRowsPageRangeLow" type="Integer"/>
+            <parameter name="movementRowsPageRangeHigh" type="Integer"/>
+            <parameter name="complete" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="out" from="ec.resource.script('component://mr-mantle/service/mantle/product/InventoryValuation.js')
+                    .execute('stockTransactions', context)"/>
+            <set field="organizationPartyId" from="out.organizationPartyId"/>
+            <set field="fromDay" from="out.fromDay"/>
+            <set field="thruDay" from="out.thruDay"/>
+            <set field="period" from="out.period"/>
+            <set field="totalRows" from="out.totalRows"/>
+            <set field="movementRows" from="out.movementRows"/>
+            <set field="movementRowsCount" from="out.movementRowsCount"/>
+            <set field="movementRowsPageIndex" from="out.movementRowsPageIndex"/>
+            <set field="movementRowsPageSize" from="out.movementRowsPageSize"/>
+            <set field="movementRowsPageMaxIndex" from="out.movementRowsPageMaxIndex"/>
+            <set field="movementRowsPageRangeLow" from="out.movementRowsPageRangeLow"/>
+            <set field="movementRowsPageRangeHigh" from="out.movementRowsPageRangeHigh"/>
+            <set field="complete" from="out.complete"/>
+        </actions>
+    </service>
+    <service verb="get" noun="ProductAccounting" allow-remote="false">
+        <description>A product as Accounting sees it in an organization: its stock quantity and value beside its inventory
+            balance, its approved standard costs and book events (revaluations, landed costs, cost repairs), its recent
+            movements, its current prices when the user holds PRICE_VIEW, and its GL mappings (ProductGlAccount, and
+            ProductCategoryGlAccount of its categories) for the organization and those it rolls up to. A product the
+            organization neither owns nor holds is productFound false. Refuses a user without Accounting report read in
+            the organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="productId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="productFound" type="Boolean"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="product" type="Map"/>
+            <parameter name="summary" type="Map"/>
+            <parameter name="costRows" type="List"/>
+            <parameter name="movementRows" type="List"/>
+            <parameter name="pricesPermitted" type="Boolean"/>
+            <parameter name="priceRows" type="List"/>
+            <parameter name="glRows" type="List"/>
+            <parameter name="categoryIds" type="List"/>
+            <parameter name="canEditGl" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="out" from="ec.resource.script('component://mr-mantle/service/mantle/product/InventoryValuation.js')
+                    .execute('productAccounting', context)"/>
+            <set field="productFound" from="out.productFound"/>
+            <set field="organizationPartyId" from="out.organizationPartyId"/>
+            <set field="product" from="out.product"/>
+            <set field="summary" from="out.summary"/>
+            <set field="costRows" from="out.costRows"/>
+            <set field="movementRows" from="out.movementRows"/>
+            <set field="pricesPermitted" from="out.pricesPermitted"/>
+            <set field="priceRows" from="out.priceRows"/>
+            <set field="glRows" from="out.glRows"/>
+            <set field="categoryIds" from="out.categoryIds"/>
+            <set field="canEditGl" from="out.canEditGl"/>
+        </actions>
+    </service>
+    <service verb="check" noun="ValuationClose" allow-remote="false">
+        <description>The valuation rows of the period close checklist (CloseServices.define#CloseCheck): the period's
+            receipts without a cost basis (no acquire cost, or posted at zero), and for each organization of the close
+            the difference between its stock value and its inventory accounts at the period's end. Refuses a user who may
+            not read the organization's periods.</description>
+        <implements service="mantle.ledger.CloseServices.define#CloseCheck"/>
+        <actions>
+            <set field="checked" from="ec.resource.script('component://mr-mantle/service/mantle/product/InventoryValuation.js')
+                    .execute('closeCheck', context)"/>
+            <set field="count" from="checked.count"/>
+            <set field="items" from="checked.items"/>
+        </actions>
+    </service>
 </services>

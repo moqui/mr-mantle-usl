@@ -356,18 +356,19 @@ const checks = {
     },
     // Receipts and issues of the period's stock that posted nothing (no cost, no accounting preference, a failed
     // posting) for the organizations' assets (impl-accounting F10).
+    // A receipt without a cost (AtrNoAcquireCost) is the valuation row PccReceiptCostBasis's (InventoryReportServices).
     PccStockPostings(c) {
         const failed = ["AtrNoAcquireCost", "AtrNoAcctgPreference", "AtrPostingFailed"]
         const found = []
         let count = 0
-        for (const [entity, idField, dateField, label] of [
-            ["mantle.product.receipt.AssetReceiptAndOwner", "assetReceiptId", "receivedDate", "Receipt"],
-            ["mantle.product.issuance.AssetIssuanceAndOwner", "assetIssuanceId", "issuedDate", "Issue"]
+        for (const [entity, idField, dateField, label, results] of [
+            ["mantle.product.receipt.AssetReceiptAndOwner", "assetReceiptId", "receivedDate", "Receipt", failed.slice(1)],
+            ["mantle.product.issuance.AssetIssuanceAndOwner", "assetIssuanceId", "issuedDate", "Issue", failed]
         ]) {
             const query = () =>
                 find(entity)
                     .condition("ownerPartyId", "in", c.organizations)
-                    .condition("acctgTransResultEnumId", "in", failed)
+                    .condition("acctgTransResultEnumId", "in", results)
                     .condition(stampInPeriod(c, dateField))
             count += query().count()
             for (const movement of query().orderBy(idField).limit(ITEM_LIMIT).list())
@@ -823,5 +824,7 @@ const operations = {checklist, standardCheck, close, reopen}
         if (!operations[op]) throw new Error("Unknown period close operation " + op)
         return operations[op](parameters)
     },
-    checks
+    checks,
+    periodScope,
+    stampInPeriod
 })

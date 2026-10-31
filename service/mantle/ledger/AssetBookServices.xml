@@ -136,4 +136,143 @@
             <script>ec.context.putAll(ec.resource.script('component://mr-mantle/service/mantle/ledger/AssetBooks.js').execute('context',context))</script>
         </actions>
     </service>
+    <!-- Landed costs and cost data repair (impl-accounting P13; logic in ledger/AssetCosts.js) -->
+    <service verb="get" noun="LandedCostSources" allow-remote="false">
+        <description>A bill's lines with their totals, the account each line's posting debited and whether it was allocated
+            (a freight, fee or charge line without a product, of a posted bill, not yet allocated, is a charge); the
+            organization's posted inventory receipts a charge may go to (the newest 50, matching receiptText, and those
+            chosen); and the bill's allocations. Refuses a bill the user may not read.</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="receiptText"/>
+            <parameter name="assetReceiptIds"><description>The chosen receipts, separated by commas</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="bill" type="Map"/>
+            <parameter name="chargeRows" type="List"/>
+            <parameter name="receiptRows" type="List"/>
+            <parameter name="allocationRows" type="List"/>
+            <parameter name="canPost" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="out" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AssetCosts.js')
+                    .execute('sources', context)"/>
+            <set field="organizationPartyId" from="out.organizationPartyId"/>
+            <set field="bill" from="out.bill"/>
+            <set field="chargeRows" from="out.chargeRows"/>
+            <set field="receiptRows" from="out.receiptRows"/>
+            <set field="allocationRows" from="out.allocationRows"/>
+            <set field="canPost" from="out.canPost"/>
+        </actions>
+    </service>
+    <service verb="define" noun="LandedCostParameters" type="interface">
+        <description>The allocation of one charge line of a bill over receipt lines.</description>
+        <in-parameters>
+            <parameter name="invoiceId" required="true"/>
+            <parameter name="invoiceItemSeqId" required="true"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="assetReceiptIds"><description>Receipts separated by commas, or a list</description></parameter>
+            <parameter name="basisEnumId" default-value="LcbQuantity"><description>LandedCostBasis: LcbQuantity, LcbValue,
+                LcbWeight (the product's Weight, else ShippingWeight dimension) or LcbVolume</description></parameter>
+            <parameter name="accountingDate" type="Date"/>
+        </in-parameters>
+    </service>
+    <service verb="preview" noun="LandedCost" allow-remote="false">
+        <description>Each receipt line's share of a charge line by the basis, split by the receipt's stock still on hand
+            (raising its asset's cost, also an asset a revaluation split it into) and already issued (to cost of goods sold,
+            or production variance for stock issued to work), with the accounts, the new unit costs, the findings that keep
+            it from posting and the inputFingerprint post#LandedCost takes. Refuses a bill the user may not read, a line
+            that is not the bill's and no receipts.</description>
+        <implements service="mantle.ledger.AssetBookServices.define#LandedCostParameters"/>
+        <out-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="invoiceId"/>
+            <parameter name="invoiceItemSeqId"/>
+            <parameter name="basisEnumId"/>
+            <parameter name="accountingDate"/>
+            <parameter name="assetReceiptIds"/>
+            <parameter name="allocationRows" type="List"/>
+            <parameter name="findings" type="List"/>
+            <parameter name="complete" type="Boolean"/>
+            <parameter name="totalAmount" type="BigDecimal"/>
+            <parameter name="amountUomId"/>
+            <parameter name="chargeGlAccountId"/>
+            <parameter name="inputFingerprint"/>
+        </out-parameters>
+        <actions>
+            <set field="out" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AssetCosts.js')
+                    .execute('preview', context)"/>
+            <set field="organizationPartyId" from="out.organizationPartyId"/>
+            <set field="invoiceId" from="out.invoiceId"/>
+            <set field="invoiceItemSeqId" from="out.invoiceItemSeqId"/>
+            <set field="basisEnumId" from="out.basisEnumId"/>
+            <set field="accountingDate" from="out.accountingDate"/>
+            <set field="assetReceiptIds" from="out.assetReceiptIds"/>
+            <set field="allocationRows" from="out.allocationRows"/>
+            <set field="findings" from="out.findings"/>
+            <set field="complete" from="out.complete"/>
+            <set field="totalAmount" from="out.totalAmount"/>
+            <set field="amountUomId" from="out.amountUomId"/>
+            <set field="chargeGlAccountId" from="out.chargeGlAccountId"/>
+            <set field="inputFingerprint" from="out.inputFingerprint"/>
+        </actions>
+    </service>
+    <service verb="post" noun="LandedCost" allow-remote="false">
+        <description>Post a previewed landed cost (ACCOUNTING_GL_POST): one transaction debiting the inventory account of
+            each asset holding the receipts' stock with its on-hand share and cost of goods sold or production variance
+            with the issued share, crediting the charge line's account; the assets' cost rises from the accounting date,
+            each with an AssetBookEvent, and a LandedCostAllocation row is kept for each receipt. A retry with the same
+            operation key answers the first result. Refuses a user without GL posting, no reason, a stale preview, a line
+            already allocated, findings, a closed period and a posting the ledger refuses.</description>
+        <implements service="mantle.ledger.AssetBookServices.define#LandedCostParameters"/>
+        <in-parameters>
+            <parameter name="inputFingerprint" required="true"/>
+            <parameter name="operationKey" required="true"/>
+            <parameter name="changeReason" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="acctgTransId"/>
+            <parameter name="landedCostAllocationIds" type="List"/>
+            <parameter name="totalAmount"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="out" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AssetCosts.js')
+                    .execute('post', context)"/>
+            <set field="acctgTransId" from="out.acctgTransId"/>
+            <set field="landedCostAllocationIds" from="out.landedCostAllocationIds"/>
+            <set field="totalAmount" from="out.totalAmount"/>
+            <set field="alreadyApplied" from="!!out.alreadyApplied"/>
+        </actions>
+    </service>
+    <service verb="repair" noun="ProductAcquireCost" allow-remote="false" transaction-timeout="600">
+        <description>Cost data repair (finance administration, ACCOUNTING_ADMIN): set the acquire cost of the organization's
+            inventory assets of a product (and facility) and repost their receipts, issues and count variances
+            (AssetServices.update#AssetAcquireCost), each asset's change kept as an AssetBookEvent with the reason. A retry
+            with the same operation key answers the first result. Refuses a user without finance administration, no
+            reason, a negative cost, no inventory of the product, and any posted transaction of those assets in a closed
+            period.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="productId" required="true"/>
+            <parameter name="facilityId"/>
+            <parameter name="acquireCost" type="BigDecimal" required="true"/>
+            <parameter name="changeReason" required="true"/>
+            <parameter name="operationKey" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="repairedCount" type="Integer"/>
+            <parameter name="assetIds" type="List"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="out" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/AssetCosts.js')
+                    .execute('repair', context)"/>
+            <set field="repairedCount" from="out.repairedCount"/>
+            <set field="assetIds" from="out.assetIds"/>
+            <set field="alreadyApplied" from="!!out.alreadyApplied"/>
+        </actions>
+    </service>
 </services>

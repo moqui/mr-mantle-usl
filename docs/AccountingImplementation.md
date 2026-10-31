@@ -395,6 +395,52 @@ first release has local sales tax and the US 1099 data.
   its format version and records the export; a sales tax statement whose invoices changed since is refused, and an
   exported statement is not deleted (`delete#TaxStatement`). `simulate#SalesTax` explains a sample sale.
 
+## Valuation and landed costs (P13)
+
+`InventoryReportServices` (logic in `product/InventoryValuation.js`) values stock for Accounting, and
+`AssetBookServices` (logic in `ledger/AssetCosts.js`, beside Products P9's revaluation in `ledger/AssetBooks.js`) posts
+landed costs and repairs cost data. Every read checks Accounting's report read in the organization.
+
+- **Valuation.** `run#InventoryValuation`: the organization's inventory through a day at each asset's current cost
+  (`AssetValuationSummary`), by product, beside the posted net of its inventory accounts (the `GatInventory` default and
+  every inventory `AssetTypeGlAccount` of the organization chain) for that product, with the totals of stock, inventory
+  and WIP accounts and their difference; entries without a product are a row of their own. The exceptions are receipts,
+  issues and count variances whose posting result is `AtrNoAcquireCost`, `AtrNoAcctgPreference` or `AtrPostingFailed`,
+  zero-cost receipts, and stock postings unposted in the error journal; open WIP by run is the stock issued to a work
+  effort less what its receipts took out, at current cost. A revaluation or landed cost moves the stock and the inventory
+  account by the same amount, so they still agree after one.
+- **Stock transactions.** `run#StockTransactions`: a fiscal period's (the organization's own) or dates' receipts, issues
+  and count variances with their source, cost, value and posting result, and each kind's totals; up to `listLimit` of
+  each kind, else reported incomplete.
+- **Product360.** `get#ProductAccounting`: a product the organization owns or holds, its stock and value beside its
+  inventory balance, its approved standard costs and book events, recent movements, current prices only with
+  `PRICE_VIEW`, and its `ProductGlAccount` and `ProductCategoryGlAccount` rows; the mappings are written by
+  `SetupServices.store#PostingDefault` (finance administration).
+- **Landed costs.** `get#LandedCostSources`, `preview#LandedCost` and `post#LandedCost` (`ACCOUNTING_GL_POST`). A charge
+  is a posted bill's line of the `EngItemsLandedCost` group (`ItemShipping`, `ItemFee`, `ItemMiscCharge`) without a
+  product, credited to the account the bill's posting debited for it. It is spread over posted inventory receipts of
+  the organization by quantity, value (at the receipt date's cost), weight (`Weight`, else `ShippingWeight`) or volume;
+  each share splits by the receipt's stock still on hand (also in an asset a revaluation split it into), which raises
+  that asset's cost from the accounting date (an `AbeLandedCost` book event), and what already left, which goes to the
+  asset type's issuance account (cost of goods sold), or `GatProductionVariance` for stock issued to work. The preview's
+  `inputFingerprint` covers the line, receipts, stock and accounts; the post locks the organization, the bill and the
+  assets, refuses a stale preview, findings, a line already allocated (`ALREADY_ALLOCATED`, checked after the operation
+  key's earlier answer) and an account not active for the organization, posts one `AttLandedCost` transaction and keeps
+  a `LandedCostAllocation` row per receipt.
+- **Cost data repair.** `repair#ProductAcquireCost` (`ACCOUNTING_ADMIN`; reason; operation key): the organization's
+  inventory assets of a product (and facility) get the cost through `AssetServices.update#AssetAcquireCost`, which
+  reposts their history, only when every posted transaction of those assets is in an open period; each change is an
+  `AbeCostDataRepair` event. Mantle's `update#ProductAcquireCost` is not organization-scoped and is not called.
+- **Scrap by reason.** `post#PhysicalInventoryVariance` posts a count variance to the organization's
+  `VarianceReasonGlAccount` for its reason, then, for a scrap reason (`enumCode` scrap: `InVrScrap`, `InVrExpired`), to
+  the asset type's `scrapGlAccountId`, and otherwise to found or shrinkage by sign as before.
+- **Close.** `check#ValuationClose` adds two non-blocking `PeriodCloseCheck` rows: receipts of the period without a cost
+  basis (`PccReceiptCostBasis`; no acquire cost or posted at zero; `PccStockPostings` no longer lists those receipts),
+  and the difference between stock and the inventory accounts at the period's end for each organization of the close
+  (`PccValuationTieOut`).
+- **Manufacturing's cost close** has its GL account types seeded: `GatLaborApplied`, `GatOverheadApplied`,
+  `GatOutsideProcessAccrued` and `GatProductionVariance` (no DefaultSettings default: each organization maps them).
+
 ## Libraries
 
 - `ledger/EntityLib.js`: the helpers the finance modules share: entity reads without artifact authorization (each
@@ -433,6 +479,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingBankReconciliation,BankFileServices
 ./moq test mr-mantle --spec AccountingPeriodClose,AccountingProjectCost
 ./moq test mr-mantle --spec AccountingTax,TaxStatementServices
+./moq test mr-mantle --spec AccountingValuation,ProductStandardCosts
 ```
 
 The PDF specs need a Chromium for PDF (`pdf_chromium_path`; see [Run-Deploy](../../../../docs/Run-Deploy.md) and
