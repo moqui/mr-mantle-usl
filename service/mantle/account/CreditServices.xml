@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<!-- Customer credit (AC-11; design-accounting §18 AC-11, crosscut CX-CREDIT): the organization's policy per customer, the
+    check of an order when it is approved, by approve#Order and by autoApprove#Order through the OrderPreApproveCredit SECA
+    (a Hold result puts the order on a Credit hold, keeping its reservations), the release of a credit hold with its
+    recorded decision, and the customer's credit status. Logic in Credit.js. -->
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="define" noun="PolicyParameters" type="interface">
+        <description>A credit policy: the limit on exposure in its currency, the most days overdue, and whether going over
+            warns or holds.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="currencyUomId"><description>The organization's base currency by default.</description></parameter>
+            <parameter name="creditLimit" type="BigDecimal"/>
+            <parameter name="overdueDaysLimit" type="Integer"/>
+            <parameter name="actionEnumId" default-value="CpaHold"><description>CpaWarn or CpaHold.</description></parameter>
+            <parameter name="changeReason" required="true"/>
+            <parameter name="ended" default-value="N"><description>Y ends the policy in effect.</description></parameter>
+        </in-parameters>
+    </service>
+    <service verb="store" noun="Policy" allow-remote="false">
+        <description>Set a customer's credit policy with the organization: the row in effect ends and a new one starts, its
+            fields audit-logged with the reason; nothing changes when the values are the same (changed false). Refuses an
+            unknown or private customer, a negative limit, a policy with neither a limit nor overdue days and a change
+            without a reason. Needs ACCOUNTING_ADMIN or CREDIT_HOLD_RELEASE (a credit manager) in the
+            organization.</description>
+        <implements service="mantle.account.CreditServices.define#PolicyParameters"/>
+        <in-parameters><parameter name="customerPartyId" required="true"/></in-parameters>
+        <out-parameters>
+            <parameter name="customerCreditPolicyId"/>
+            <parameter name="changed" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Credit.js"/>
+            <set field="stored" from="ec.resource.script(module).execute('store', context)"/>
+            <set field="customerCreditPolicyId" from="stored.customerCreditPolicyId"/>
+            <set field="changed" from="stored.changed"/>
+        </actions>
+    </service>
+    <service verb="store" noun="Defaults" allow-remote="false">
+        <description>Set the organization's default credit policy, for customers without their own, as store#Policy does
+            for a customer. A new default applies to orders approved from then on; it changes no order or document already
+            approved. Needs ACCOUNTING_ADMIN in the organization.</description>
+        <implements service="mantle.account.CreditServices.define#PolicyParameters"/>
+        <out-parameters>
+            <parameter name="customerCreditPolicyId"/>
+            <parameter name="changed" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Credit.js"/>
+            <set field="stored" from="ec.resource.script(module).execute('store',
+                Object.assign({}, context, {isDefault:true}))"/>
+            <set field="customerCreditPolicyId" from="stored.customerCreditPolicyId"/>
+            <set field="changed" from="stored.changed"/>
+        </actions>
+    </service>
+    <service verb="evaluate" noun="OrderCredit" allow-remote="false">
+        <description>The credit check of an order's sales parts (an internal organization selling to an outside customer),
+            or the part given, each against its customer's policy in effect, else the organization's default. A part released
+            by a credit decision that has not expired passes. An organization with no policy at all is answered by one count.
+            The check: the exposure (unpaid invoices and open
+            orders not yet invoiced, less unapplied payments and the payments authorized on the open orders) against the
+            limit, and the oldest overdue invoice against the overdue days. Answers pass, warn or hold with each reason and
+            a warning text. With placeHold a hold result puts the part on a Credit hold (the order when it has one part;
+            hold#Order; reservations
+            stay; heldPartSeqIds names the parts held)
+            and notifies the organization's users who may release it (CreditHoldRelease). No policy, a purchase order or an
+            order between internal organizations always passes. approve#Order and the OrderPreApproveCredit SECA on
+            check#OrderPreApprove call it; it checks no permission.</description>
+        <in-parameters>
+            <parameter name="orderId" required="true"/>
+            <parameter name="orderPartSeqId"/>
+            <parameter name="placeHold" type="Boolean" default="false"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="resultEnumId"><description>pass, warn or hold</description></parameter>
+            <parameter name="reasons" type="List"/>
+            <parameter name="warning"/>
+            <parameter name="held" type="Boolean"/>
+            <parameter name="heldPartSeqIds" type="List"/>
+            <parameter name="orderHoldReasonId"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="customerPartyId"/>
+            <parameter name="customerCreditPolicyId"/>
+            <parameter name="exposure" type="BigDecimal"/>
+            <parameter name="creditLimit" type="BigDecimal"/>
+            <parameter name="overdueDays" type="Integer"/>
+            <parameter name="overdueDaysLimit" type="Integer"/>
+            <parameter name="currencyUomId"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Credit.js"/>
+            <set field="checked" from="ec.resource.script(module).execute('evaluate', context)"/>
+            <script>ec.context.putAll(checked)</script>
+        </actions>
+    </service>
+    <service verb="release" noun="CreditHold" allow-remote="false">
+        <description>Release an order's credit hold (the part's, given orderPartSeqId) with a reason: a
+            CreditHoldDecision records the decision, who made it, until when it stands (expireDate; the credit check passes
+            the order while it does, and for good without one) and the exposure and limit it was made on; the Credit hold
+            reason is released (release#OrderHold), which returns the order to the status it had when no other reason is
+            open, and its CreditHoldRelease notifications are marked read. An order back in Placed then goes through
+            autoApprove#Order. Refuses an expireDate already past (EXPIRE_DATE_PAST). Refuses an order without an open credit
+            hold and a release without a reason.
+            Needs CREDIT_HOLD_RELEASE in the order's organization.</description>
+        <in-parameters>
+            <parameter name="orderId" required="true"/>
+            <parameter name="orderPartSeqId"><description>The part whose hold is released, for an order held by
+                part.</description></parameter>
+            <parameter name="reason" required="true"/>
+            <parameter name="expireDate" type="Timestamp"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="creditHoldDecisionId"/>
+            <parameter name="statusId"/>
+            <parameter name="stillHeld" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Credit.js"/>
+            <set field="released" from="ec.resource.script(module).execute('release', context)"/>
+            <set field="creditHoldDecisionId" from="released.creditHoldDecisionId"/>
+            <set field="statusId" from="released.statusId"/>
+            <set field="stillHeld" from="released.stillHeld"/>
+        </actions>
+    </service>
+    <service verb="get" noun="CustomerCreditStatus" allow-remote="false">
+        <description>A customer's credit with the organization, the hold and its reason Customer Service reads: the policy
+            in effect (and whether it is the customer's or the organization's default) with its history, the exposure in
+            its currency (the base currency without a policy) by part, what is left of the limit, the oldest overdue days,
+            the open credit holds and the recent decisions, and whether the user may change the policy or release a hold.
+            Refuses an unknown or private customer. Needs CUSTOMER_CREDIT_VIEW in the organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="customerPartyId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="policy" type="Map"/>
+            <parameter name="policyHistory" type="List"/>
+            <parameter name="exposure" type="Map"/>
+            <parameter name="available" type="BigDecimal"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="holds" type="List"/>
+            <parameter name="decisions" type="List"/>
+            <parameter name="canEditPolicy" type="Boolean"/>
+            <parameter name="canRelease" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Credit.js"/>
+            <set field="found" from="ec.resource.script(module).execute('status', context)"/>
+            <script>ec.context.putAll(found)</script>
+        </actions>
+    </service>
+</services>

@@ -1074,4 +1074,40 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="asOf" from="report.asOf"/>
         </actions>
     </service>
+    <service verb="run" noun="Aging" allow-remote="false">
+        <description>The aging of an organization's receivables (or payables) as of a day, today by default: each invoice
+            open on that day (issued by then, less what was applied by then), each portion of its due schedule in the bucket
+            of its days past due on that day (current, four periods of periodDays, and over), by party and currency, with
+            the totals of each currency and, for one party, its invoices. Days are calendar days, so a past day buckets the
+            same on every database. More than 5,000 open invoices are named (complete false, incompleteReason), never cut
+            silently. Refuses a day after today, and a user without report read, or the side's view permission, in the
+            organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="asOfDate" type="Date"/>
+            <parameter name="invoiceType" default-value="receivable"><description>receivable or payable</description></parameter>
+            <parameter name="periodDays" type="Integer" default="30"/>
+            <parameter name="partyId"/>
+            <parameter name="currencyUomId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="asOfDate"/>
+            <parameter name="asOfDateText"/>
+            <parameter name="invoiceType"/>
+            <parameter name="periodDays" type="Integer"/>
+            <parameter name="bucketLabels" type="List"/>
+            <parameter name="agingRows" type="List"/>
+            <parameter name="totals" type="List"/>
+            <parameter name="detailRows" type="List"/>
+            <parameter name="invoiceCount" type="Integer"/>
+            <parameter name="complete" type="Boolean"/>
+            <parameter name="incompleteReason"/>
+        </out-parameters>
+        <actions>
+            <set field="report" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/Aging.js')
+                    .execute('aging', context)"/>
+            <script>ec.context.putAll(report)</script>
+        </actions>
+    </service>
 </services>

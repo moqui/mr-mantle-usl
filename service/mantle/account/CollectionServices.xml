@@ -215,4 +215,211 @@ along with this software (see the LICENSE.md file). If not, see
                 result:{results, successCount, failureCount}})</script>
         </actions>
     </service>
+    <!-- ========== Collections (AC-10; logic in Collections.js) ========== -->
+    <service verb="record" noun="Activity" allow-remote="false">
+        <description>Record a contact with a customer, done now: a call, email or to-do with its outcome
+            (CollectionOutcome) and note, a WorkEffort on the customer's record (so it shows on the customer and in
+            Chatter) with a CollectionActivity row of the organization. With nextActionDate a next action is scheduled for
+            that day, assigned to assignToPartyId (default the user), and reaches their Today. The outcome Disputed marks
+            the invoices named as disputed, which leaves them out of dunning; Dispute resolved clears them. Refuses an
+            unknown or private customer, an invoice that is not the organization's to the customer and a dispute without
+            invoices. Needs RECEIVABLE_EDIT in the organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="activityType" default-value="call"><description>call, email or todo</description></parameter>
+            <parameter name="outcomeEnumId" required="true"/>
+            <parameter name="note"/>
+            <parameter name="invoiceIdList" type="List"/>
+            <parameter name="nextActionDate" type="Timestamp"/>
+            <parameter name="nextActionName"/>
+            <parameter name="nextActionType"/>
+            <parameter name="assignToPartyId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="workEffortId"/>
+            <parameter name="nextWorkEffortId"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Collections.js"/>
+            <set field="recorded" from="ec.resource.script(module).execute('recordActivity', context)"/>
+            <set field="workEffortId" from="recorded.workEffortId"/>
+            <set field="nextWorkEffortId" from="recorded.nextWorkEffortId"/>
+        </actions>
+    </service>
+    <service verb="store" noun="Promise" allow-remote="false">
+        <description>Record a customer's promise to pay an amount by a day, with the invoices it covers; or, with
+            collectionPromiseId and cancel Y, cancel one. A promise is kept by the customer's payments received through its
+            day and never marks an invoice paid (get#CustomerCollections gives its state). Refuses a promised day already
+            past, an amount not positive or finer than the currency, invoices of another customer or currency, and a change
+            of a recorded promise. Needs RECEIVABLE_EDIT in the organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="customerPartyId" required="true"/>
+            <parameter name="collectionPromiseId"/>
+            <parameter name="cancel" default-value="N"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="amount" type="BigDecimal"/>
+            <parameter name="promisedDate" type="Date"/>
+            <parameter name="invoiceIdList" type="List"/>
+            <parameter name="note"/>
+            <parameter name="workEffortId"/>
+        </in-parameters>
+        <out-parameters><parameter name="collectionPromiseId"/></out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Collections.js"/>
+            <set field="stored" from="ec.resource.script(module).execute('storePromise', context)"/>
+            <set field="collectionPromiseId" from="stored.collectionPromiseId"/>
+        </actions>
+    </service>
+    <service verb="get" noun="CustomerCollections" allow-remote="false">
+        <description>A customer's collection history with the organization: its activities, newest first, with their
+            outcome, assignee and day, the open next actions, its promises with their state (open, kept, broken, cancelled)
+            and its disputed invoices. Needs RECEIVABLE_VIEW, ACCOUNTING_VIEW or ACCOUNTING_ADMIN in the
+            organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="customerPartyId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="customerName"/>
+            <parameter name="activities" type="List"/>
+            <parameter name="nextActions" type="List"/>
+            <parameter name="promises" type="List"/>
+            <parameter name="disputedInvoices" type="List"/>
+            <parameter name="canEdit" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Collections.js"/>
+            <set field="found" from="ec.resource.script(module).execute('customerCollections', context)"/>
+            <script>ec.context.putAll(found)</script>
+        </actions>
+    </service>
+
+    <!-- ========== Dunning ========== -->
+    <service verb="store" noun="Level" allow-remote="false">
+        <description>Add a dunning level, change one (its row ends and a new one starts, the fields audit-logged) or end
+            it (ended Y): its wording, the days overdue it starts at, the days before the same customer is reminded at the
+            level again, its email template and whether disputed invoices are left out. Refuses a level under one day
+            overdue, a cadence under one day, an unknown template and two levels starting at the same days. Needs
+            ACCOUNTING_ADMIN in the organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="dunningLevelId"/>
+            <parameter name="description"/>
+            <parameter name="daysOverdueFrom" type="Integer"/>
+            <parameter name="cadenceDays" type="Integer" default="7"/>
+            <parameter name="emailTemplateId"/>
+            <parameter name="excludeDisputed" default-value="Y"/>
+            <parameter name="changeReason"/>
+            <parameter name="ended" default-value="N"/>
+        </in-parameters>
+        <out-parameters><parameter name="dunningLevelId"/></out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Collections.js"/>
+            <set field="stored" from="ec.resource.script(module).execute('storeLevel', context)"/>
+            <set field="dunningLevelId" from="stored.dunningLevelId"/>
+        </actions>
+    </service>
+    <service verb="preview" noun="Dunning" allow-remote="false">
+        <description>Preview a reminder run of the organization as of a day (today by default) and store it with its
+            notices: for each customer and currency with overdue invoices, a notice at the level of its most overdue
+            invoice that is not disputed, naming its overdue invoices and their amount; and, left out with the reason,
+            disputed invoices (unless the level includes them), customers whose unapplied payments cover what is overdue,
+            customers with an open promise, and a notice of the same level sent within its cadence. More overdue invoices
+            than one run takes (2,000) are named by incomplete. Changes no invoice. Refuses an organization without dunning
+            levels. Needs RECEIVABLE_EDIT in the organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="asOfDate" type="Date"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="dunningRunId"/>
+            <parameter name="noticeCount" type="Integer"/>
+            <parameter name="excludedCount" type="Integer"/>
+            <parameter name="incomplete" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Collections.js"/>
+            <set field="previewed" from="ec.resource.script(module).execute('previewDunning', context)"/>
+            <script>ec.context.putAll(previewed)</script>
+        </actions>
+    </service>
+    <service verb="send" noun="Dunning" allow-remote="false">
+        <description>Send a previewed reminder run: each notice not yet sent marked sending, then prepared in its own
+            transaction (prepare#DunningNotice), then sent through its level's email template to the customer's billing
+            addresses. A notice that fails before the email (no or an invalid address, an error preparing it) or whose
+            email is not sent is recorded failed with its reason and the others are sent; sending the run again sends
+            only the notices not yet sent, so one failed recipient never resends the rest. A notice with an exception
+            during or after its email call stays sending (SEND_UNKNOWN) and is not sent again: resolve#DunningNotice
+            settles it. The same operation key answers the first result. Needs RECEIVABLE_EDIT in the run's
+            organization. The weekly send_SalesInvoicePastDueEmails job stays paused: dunning runs are the only
+            scheduled reminders.</description>
+        <in-parameters>
+            <parameter name="dunningRunId" required="true"/>
+            <parameter name="operationKey" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="results" type="List"/>
+            <parameter name="sentCount" type="Integer"/>
+            <parameter name="failedCount" type="Integer"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Collections.js"/>
+            <set field="sent" from="ec.resource.script(module).execute('sendDunning', context)"/>
+            <set field="results" from="sent.results"/>
+            <set field="sentCount" from="sent.sentCount"/>
+            <set field="failedCount" from="sent.failedCount"/>
+            <set field="alreadyApplied" from="!!sent.alreadyApplied"/>
+        </actions>
+    </service>
+    <service verb="prepare" noun="DunningNotice" allow-remote="false">
+        <description>One sending notice of a run made ready (send#Dunning calls it, each in its own transaction): its
+            invoices read again (a paid one is left out; none left leaves the notice out), its recipients checked (none
+            or an invalid one leaves it failed) and its email rendered. Sends nothing: prepared has ready, and when
+            ready the email's parameters, overdueAmount and invoiceIds. Checks no permission: send#Dunning has.</description>
+        <in-parameters>
+            <parameter name="dunningRunId" required="true"/>
+            <parameter name="noticeSeqId" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="prepared" type="Map"/></out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Collections.js"/>
+            <set field="prepared" from="ec.resource.script(module).execute('prepareNotice', context)"/>
+        </actions>
+    </service>
+    <service verb="resolve" noun="DunningNotice" allow-remote="false">
+        <description>Settle a notice left sending (its email's outcome unknown, SEND_UNKNOWN) as sent (DntSent) or
+            failed (DntFailed, sent again by the run's next send), with a note of how the outcome was found; the run's
+            state follows. Needs RECEIVABLE_EDIT in the run's organization.</description>
+        <in-parameters>
+            <parameter name="dunningRunId" required="true"/>
+            <parameter name="noticeSeqId" required="true"/>
+            <parameter name="statusId" required="true"/>
+            <parameter name="note" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="statusId"/></out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Collections.js"/>
+            <set field="resolved" from="ec.resource.script(module).execute('resolveNotice', context)"/>
+            <set field="statusId" from="resolved.statusId"/>
+        </actions>
+    </service>
+    <service verb="get" noun="DunningRun" allow-remote="false">
+        <description>A reminder run with its notices: each customer's name, level, invoices, amount, recipients and state,
+            and the invoices left out with the reason. Needs RECEIVABLE_VIEW, ACCOUNTING_VIEW or ACCOUNTING_ADMIN in the
+            run's organization.</description>
+        <in-parameters><parameter name="dunningRunId" required="true"/></in-parameters>
+        <out-parameters>
+            <parameter name="run" type="Map"/>
+            <parameter name="notices" type="List"/>
+            <parameter name="canSend" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Collections.js"/>
+            <set field="found" from="ec.resource.script(module).execute('getRun', context)"/>
+            <script>ec.context.putAll(found)</script>
+        </actions>
+    </service>
 </services>

@@ -53,7 +53,9 @@ function capabilities() {
         budgetOverride: has("BUDGET_OVERRIDE"),
         returnCreditApprove: has("RETURN_CREDIT_APPROVE"),
         fiscalClose: has("FISCAL_CLOSE"),
-        fiscalReopen: has("FISCAL_REOPEN")
+        fiscalReopen: has("FISCAL_REOPEN"),
+        creditView: has("CUSTOMER_CREDIT_VIEW"),
+        creditRelease: has("CREDIT_HOLD_RELEASE")
     }
     // An edit permission alone opens no reads: other apps' groups hold some (Projects' RECEIVABLE_EDIT for billing).
     out.read = [
