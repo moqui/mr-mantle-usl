@@ -175,12 +175,12 @@ along with this software (see the LICENSE.md file). If not, see
     <entity entity-name="TaxAuthority" package="mantle.other.tax">
         <description>For tax and other government authorities in any domain (sales/VAT, income, labor, etc)</description>
         <field name="taxAuthorityId" type="id" is-pk="true"/>
-        <field name="taxAuthorityTypeEnumId" type="id"/>
-        <field name="description" type="text-medium"/>
-        <field name="taxAuthGeoId" type="id"/>
-        <field name="taxAuthPartyId" type="id"/>
-        <field name="requireTaxIdForExemption" type="text-indicator"/>
-        <field name="taxIdFormatPattern" type="text-medium"/>
+        <field name="taxAuthorityTypeEnumId" type="id" enable-audit-log="update"/>
+        <field name="description" type="text-medium" enable-audit-log="update"/>
+        <field name="taxAuthGeoId" type="id" enable-audit-log="update"/>
+        <field name="taxAuthPartyId" type="id" enable-audit-log="update"/>
+        <field name="requireTaxIdForExemption" type="text-indicator" enable-audit-log="update"/>
+        <field name="taxIdFormatPattern" type="text-medium" enable-audit-log="update"/>
         <field name="includeTaxInPrice" type="text-indicator"><description>This is mainly for VAT tax authorities</description></field>
         <relationship type="one" title="TaxAuthorityType" related="moqui.basic.Enumeration">
             <key-map field-name="taxAuthorityTypeEnumId"/></relationship>
@@ -225,10 +225,10 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="partyId" type="id" is-pk="true"/>
         <field name="taxAuthorityId" type="id" is-pk="true"/>
         <field name="fromDate" type="date-time" is-pk="true"/>
-        <field name="thruDate" type="date-time"/>
-        <field name="partyTaxId" type="text-short"/>
-        <field name="isExempt" type="text-indicator"/>
-        <field name="isNexus" type="text-indicator">
+        <field name="thruDate" type="date-time" enable-audit-log="update"/>
+        <field name="partyTaxId" type="text-short" enable-audit-log="update"/>
+        <field name="isExempt" type="text-indicator" enable-audit-log="update"/>
+        <field name="isNexus" type="text-indicator" enable-audit-log="update">
             <description>If Party has a sufficient presence in the area to have to charge tax set to Y.</description>
         </field>
         <relationship type="one" related="mantle.party.Party"/>

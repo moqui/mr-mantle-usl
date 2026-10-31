@@ -3,12 +3,15 @@
 // TAX_STATEMENT_EDIT and the organization, which is the statement period's party.
 const lib = ec.resource.script("component://mr-mantle/service/mantle/ledger/EntityLib.js")
 const policy = ec.resource.script("component://mr-mantle/service/mantle/ledger/AccountingPolicy.js")
-const {find, one, rows, call, denied, probe} = lib
+const {find, one, rows, call, denied} = lib
 const STATEMENT = "mantle.other.tax.TaxStatement"
 const salesTaxForm = "LocalSalesTaxReturn"
 const vendorForm = "UsaIrs1099Misc"
 // A sales invoice's tax counts once it is issued: not a draft, not cancelled.
 const issuedStatuses = ["InvoiceFinalized", "InvoiceSent", "InvoiceAcked", "InvoicePmtRecvd", "InvoiceWriteOff"]
+// Card and third-party network payments are reported by the network (1099-K), not on the payer's 1099-MISC.
+const networkInstruments = ["PiCreditCard", "PiDebitCard", "PiPayPalAccount", "PiAmazonPay", "PiGiftCard", "PiBitcoinWallet"]
+const lockParty = partyId => find("mantle.party.Party", {partyId}).forUpdate(true).one()
 
 // The period of a statement, which must be one of the organization's (its party).
 function period(timePeriodId, organizationPartyId) {
@@ -26,7 +29,9 @@ function authority(taxAuthorityId) {
 // A statement and its organization, which the user must work in with the permission named.
 function statementScope(p, need) {
     const statement = one(STATEMENT, {taxStatementId: p.taxStatementId})
-    const timePeriod = statement?.timePeriodId ? one("mantle.party.time.TimePeriod", {timePeriodId: statement.timePeriodId}) : null
+    const timePeriod = statement?.timePeriodId
+        ? one("mantle.party.time.TimePeriod", {timePeriodId: statement.timePeriodId})
+        : null
     if (!statement || !timePeriod) denied("STATEMENT_UNAVAILABLE", "Tax statement is not available")
     const scope = policy.organization({organizationPartyId: timePeriod.partyId}, need)
     return {statement, timePeriod, organizationPartyId: scope.organizationPartyId}
@@ -87,6 +92,17 @@ function createSalesTax(p) {
     const organizationPartyId = policy.organization(p, "taxEdit").organizationPartyId
     const taxAuthority = authority(p.taxAuthorityId)
     const dates = period(p.timePeriodId, organizationPartyId)
+    // a retry under the same operation key answers the first statement
+    let operation = null
+    if (p.operationKey) {
+        lockParty(organizationPartyId)
+        operation = lib.operation(p, "SalesTaxStatement", organizationPartyId, {
+            organizationPartyId,
+            taxAuthorityId: taxAuthority.taxAuthorityId,
+            timePeriodId: dates.timePeriod.timePeriodId
+        })
+        if (operation?.old) return lib.previous(operation)
+    }
     const lines = lineRows(organizationPartyId, taxAuthority.taxAuthorityId, dates.fromTimestamp, dates.thruTimestamp)
     const sums = totals(lines)
     const currency = policy.preference(organizationPartyId).baseCurrencyUomId
@@ -112,7 +128,9 @@ function createSalesTax(p) {
         createdDate: ec.user.nowTimestamp,
         createdByUserId: ec.user.userId
     })
-    return {taxStatementId: made.taxStatementId, lineCount: lines.length, taxAmount: sums.taxAmount}
+    const result = {taxStatementId: made.taxStatementId, lineCount: lines.length, taxAmount: sums.taxAmount}
+    if (operation) lib.complete(operation, STATEMENT, made.taxStatementId, result)
+    return result
 }
 
 // The invoice item totals a vendor was paid in a period: each payment application to the vendor's invoices, by the
@@ -121,6 +139,15 @@ function paidItemTypeTotals(organizationPartyId, vendorPartyId, fromTimestamp, t
     const payments = Array.from(
         find("mantle.account.payment.Payment", {fromPartyId: organizationPartyId, toPartyId: vendorPartyId})
             .condition("statusId", "in", ["PmntDelivered", "PmntConfirmed"])
+            .condition(
+                ec.entity.conditionFactory.makeCondition(
+                    [
+                        ec.entity.conditionFactory.makeCondition("paymentInstrumentEnumId", "is-null", null),
+                        ec.entity.conditionFactory.makeCondition("paymentInstrumentEnumId", "not-in", networkInstruments)
+                    ],
+                    "or"
+                )
+            )
             .condition("effectiveDate", "greater-equals", fromTimestamp)
             .condition("effectiveDate", "less-equals", thruTimestamp)
             .list()
@@ -147,7 +174,9 @@ function paidItemTypeTotals(organizationPartyId, vendorPartyId, fromTimestamp, t
         const invoiceTotal = items.reduce((sum, item) => sum.add(item.total), toDecimal(0))
         if (invoiceTotal.isZero()) continue
         for (const item of items) {
-            const share = toDecimal(application.amountApplied ?? 0).multiply(item.total).divide(invoiceTotal)
+            const share = toDecimal(application.amountApplied ?? 0)
+                .multiply(item.total)
+                .divide(invoiceTotal)
             byType[item.itemTypeEnumId] = (byType[item.itemTypeEnumId] || toDecimal(0)).add(share)
         }
     }
@@ -179,7 +208,9 @@ function run1099(p) {
     const vendorIds = [...new Set(paid.map(row => row.toPartyId).filter(id => id && id !== organizationPartyId))]
     const registered = new Set(
         (vendorIds.length
-            ? Array.from(find("mantle.other.tax.TaxAuthorityParty", {taxAuthorityId}).condition("partyId", "in", vendorIds).list())
+            ? Array.from(
+                  find("mantle.other.tax.TaxAuthorityParty", {taxAuthorityId}).condition("partyId", "in", vendorIds).list()
+              )
             : []
         )
             .filter(row => row.isExempt !== "Y" && lib.active(row, dates.thruTimestamp))
@@ -208,19 +239,26 @@ function run1099(p) {
                 skipped.push({partyId, name, total, reason: "Paid less than the threshold"})
                 continue
             }
+            // a vendor done by an earlier run is skipped; the lock keeps two runs from both making it
+            lockParty(partyId)
             const existing = find(STATEMENT, {partyId, timePeriodId: dates.timePeriod.timePeriodId, formId: vendorForm}).count()
-            if (existing) denied("STATEMENT_EXISTS", "a statement for this period exists; delete it to generate it again")
+            if (existing) {
+                skipped.push({partyId, name, total, reason: "Already has a statement for the period"})
+                continue
+            }
             const recipient = call("mantle.other.TaxServices.get#RecipientTaxInfo", {partyId})
             if (!recipient.ssn && !recipient.ein) denied("TIN_MISSING", "no taxpayer identification number")
             if (!recipient.homeStreetString) denied("ADDRESS_MISSING", "no payment address")
-            const made = probe("mantle.other.TaxServices.create#Vendor1099MiscStatement", {
+            // the checks above name a vendor's failure before anything is written; the statement is in the run's transaction,
+            // which holds the vendor's lock
+            const made = call("mantle.other.TaxServices.create#Vendor1099MiscStatement", {
                 timePeriodId: dates.timePeriod.timePeriodId,
                 partyId,
                 taxAuthorityId,
                 formId: vendorForm,
                 itemTypeTotals
             })
-            probe("update#" + STATEMENT, {
+            call("update#" + STATEMENT, {
                 taxStatementId: made.taxStatementId,
                 reportedAmount: total,
                 lineCount: itemTypeTotals.length,

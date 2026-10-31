@@ -686,6 +686,9 @@ along with this software (see the LICENSE.md file). If not, see
         <field name="taxPercentage" type="number-decimal"><description>For a calculated tax line, its rate.</description></field>
         <field name="taxRoundingAmount" type="currency-precise"><description>For a calculated tax line, its amount less the
             unrounded tax.</description></field>
+        <field name="taxCalculated" type="text-indicator"><description>Y for a tax line a tax gateway calculated
+            (calculate#InvoiceSalesTax), which a new calculation replaces; manual tax lines are left as they
+            are.</description></field>
 
         <relationship type="one" related="mantle.account.invoice.Invoice" short-alias="invoice"/>
         <relationship type="one-nofk" title="Parent" related="mantle.account.invoice.InvoiceItem" short-alias="parent">

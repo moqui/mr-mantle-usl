@@ -431,7 +431,8 @@ along with this software (see the LICENSE.md file). If not, see
                             in-map="{acctgTransTypeEnumId:fromAcctgTrans.acctgTransTypeEnumId,
                                 organizationPartyId:fromAcctgTrans.organizationPartyId,
                                 otherPartyId:fromAcctgTrans.otherPartyId, itemTypeEnumId:invoiceItem.itemTypeEnumId,
-                                productId:invoiceItem.productId, assetId:invoiceItem.assetId, direction:'O'}"
+                                productId:invoiceItem.productId, assetId:invoiceItem.assetId,
+                                taxAuthorityId:invoiceItem.taxAuthorityId, direction:'O'}"
                             out-map="invoiceItemGlAccountOut" out-map-add-to-existing="false"/>
                     <set field="itemGlAccountId" from="invoiceItemGlAccountOut?.glAccountId"/>
                     <set field="itemGlAccountTypeEnumId" from="invoiceItemGlAccountOut?.glAccountTypeEnumId"/>

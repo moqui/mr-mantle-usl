@@ -27,14 +27,14 @@ function customer(id, stateProvinceGeoId) {
     return id
 }
 // A draft sales invoice of two product lines, 2 × 100.00 and 1 × 33.33, by the AR user.
-function productInvoice(customerPartyId) {
+function productInvoice(customerPartyId, lines = null) {
     login(f.users.ar)
     const made = helper().call("mantle.account.InvoiceServices.create#Receivable", {
         organizationPartyId: f.org,
         customerPartyId,
         currencyUomId: "USD"
     })
-    for (const [quantity, amount] of [
+    for (const [quantity, amount] of lines || [
         ["2", "100"],
         ["1", "33.33"]
     ])
@@ -133,6 +133,35 @@ feature("a finance administrator adds an authority with its account and nexus; o
     }
 })
 
+feature("an authority's shared fields are a system administrator's; a registration change starts a new dated row", {
+    when() {
+        login(f.users.financeadmin)
+        const renamed = helper().rejected("mantle.other.TaxServices.store#Authority", {
+            organizationPartyId: f.org,
+            taxAuthorityId: authorityId,
+            description: "Renamed by one organization",
+            changeReason: "Spec rename"
+        })
+        tax("store#Authority", {
+            organizationPartyId: f.org,
+            taxAuthorityId: authorityId,
+            description: "Spec Utah sales tax",
+            glAccountId: accountId,
+            partyTaxId: "",
+            changeReason: "Spec registration cleared"
+        })
+        const registrations = rows("mantle.other.tax.TaxAuthorityParty", {taxAuthorityId: authorityId, partyId: f.org})
+        return {renamed, registrations}
+    },
+    then({renamed, registrations}) {
+        renamed.includes("AUTHORITY_SHARED")
+        registrations.length == 2
+        registrations.filter(row => row.thruDate == null).length == 1
+        registrations.find(row => row.thruDate == null).partyTaxId == null
+        registrations.find(row => row.thruDate == null).isNexus == "Y"
+    }
+})
+
 feature("rates are dated versions: a new version ends the one it replaces, and an overlap is refused", {
     when() {
         const start = Date.now() - 48 * hour
@@ -142,7 +171,10 @@ feature("rates are dated versions: a new version ends the one it replaces, and a
         login(f.users.financeadmin)
         firstRateId = tax("store#Rate", fields).taxAuthorityRateId
         const overlap = helper().rejected("mantle.other.TaxServices.store#Rate", fields)
-        const badRate = helper().rejected("mantle.other.TaxServices.store#Rate", Object.assign({}, fields, {taxPercentage: "120"}))
+        const badRate = helper().rejected(
+            "mantle.other.TaxServices.store#Rate",
+            Object.assign({}, fields, {taxPercentage: "120"})
+        )
         return {arUser, overlap, badRate, first: one("mantle.other.tax.TaxAuthorityRate", {taxAuthorityRateId: firstRateId})}
     },
     then({arUser, overlap, badRate, first}) {
@@ -168,7 +200,10 @@ feature("an organization without a gateway finalizes an untaxed invoice as befor
 
 feature("an invoice without a store gets its tax lines by organization policy, posted to the authority's account", {
     when() {
-        helper().call("update#mantle.ledger.config.PartyAcctgPreference", {organizationPartyId: f.org, taxGatewayConfigId: "LOCAL"})
+        helper().call("update#mantle.ledger.config.PartyAcctgPreference", {
+            organizationPartyId: f.org,
+            taxGatewayConfigId: "LOCAL"
+        })
         const invoice = productInvoice("NATIVE_TAX_UT")
         taxedInvoiceId = invoice.invoiceId
         const refused = finalize(invoice)
@@ -254,7 +289,12 @@ feature("a new rate version applies to later invoices while issued lines keep th
 feature("the simulation explains each rate, base and rounding, and a sale elsewhere has none", {
     when() {
         login(f.users.tax)
-        const utah = tax("simulate#SalesTax", {organizationPartyId: f.org, destinationGeoId: "USA_UT", amount: "33.33", shippingAmount: "5"})
+        const utah = tax("simulate#SalesTax", {
+            organizationPartyId: f.org,
+            destinationGeoId: "USA_UT",
+            amount: "33.33",
+            shippingAmount: "5"
+        })
         const california = tax("simulate#SalesTax", {organizationPartyId: f.org, destinationGeoId: "USA_CA", amount: "10"})
         return {utah, california}
     },
@@ -278,15 +318,29 @@ feature("a sales tax statement for a period lists its invoice lines and exports 
             timePeriodId: monthId
         })
         login(f.users.tax)
-        const made = tax("create#SalesTaxStatement", {organizationPartyId: f.org, taxAuthorityId: authorityId, timePeriodId: monthId})
+        const made = tax("create#SalesTaxStatement", {
+            organizationPartyId: f.org,
+            taxAuthorityId: authorityId,
+            timePeriodId: monthId
+        })
         statementId = made.taxStatementId
         const lines = tax("find#SalesTaxLines", {taxStatementId: statementId})
         const exported = tax("export#Statement", {taxStatementId: statementId})
         const statement = one("mantle.other.tax.TaxStatement", {taxStatementId: statementId})
         const deleted = helper().rejected("mantle.other.TaxServices.delete#TaxStatement", {taxStatementId: statementId})
-        return {arUser, made, lines, exported, statement, deleted}
+        const keyed = {
+            organizationPartyId: f.org,
+            taxAuthorityId: authorityId,
+            timePeriodId: monthId,
+            operationKey: "native-tax-st"
+        }
+        const first = tax("create#SalesTaxStatement", keyed)
+        const retry = tax("create#SalesTaxStatement", keyed)
+        return {arUser, made, lines, exported, statement, deleted, first, retry}
     },
-    then({arUser, made, lines, exported, statement, deleted}) {
+    then({arUser, made, lines, exported, statement, deleted, first, retry}) {
+        retry.taxStatementId == first.taxStatementId
+        retry.alreadyApplied == true
         arUser.includes("PERMISSION_DENIED")
         made.lineCount == 4
         lines.lines.some(line => line.invoiceId == taxedInvoiceId && line.customerName.includes("NATIVE_TAX_UT"))
@@ -329,26 +383,20 @@ function paidVendor(id, registered, amount, ssn) {
         quantity: 1,
         amount
     })
-    const paymentId = helper().call("create#mantle.account.payment.Payment", {
-        fromPartyId: f.org,
-        toPartyId: id,
+    helper().call("update#mantle.account.invoice.Invoice", {invoiceId, statusId: "InvoiceReceived"})
+    // without statusId, as its REST callers do: the payment is delivered (F301)
+    const paymentId = helper().call("mantle.account.PaymentServices.create#InvoicePayment", {
+        invoiceId,
         amount,
-        amountUomId: "USD",
-        statusId: "PmntDelivered",
         effectiveDate: ec.user.nowTimestamp
     }).paymentId
-    helper().call("create#mantle.account.payment.PaymentApplication", {
-        paymentId,
-        invoiceId,
-        amountApplied: amount,
-        appliedDate: ec.user.nowTimestamp
-    })
+    return one("mantle.account.payment.Payment", {paymentId})
 }
 
 feature("1099 data is generated per registered vendor from the year's payments, with failures named", {
     when() {
         login("john.doe")
-        paidVendor("NATIVE_TAX_V_OK", true, "700", "123-45-6780")
+        const payment = paidVendor("NATIVE_TAX_V_OK", true, "700", "123-45-6780")
         paidVendor("NATIVE_TAX_V_NOTIN", true, "650", null)
         paidVendor("NATIVE_TAX_V_UNREG", false, "900", "123-45-6781")
         paidVendor("NATIVE_TAX_V_SMALL", true, "100", "123-45-6782")
@@ -362,17 +410,58 @@ feature("1099 data is generated per registered vendor from the year's payments, 
         const again = tax("run#Vendor1099Statements", {organizationPartyId: f.org, timePeriodId: yearId})
         const created = run.created.find(row => row.partyId == "NATIVE_TAX_V_OK")
         const exported = created ? tax("export#Statement", {taxStatementId: created.taxStatementId}) : {text: ""}
-        return {arUser, run, again, exported}
+        return {arUser, run, again, exported, payment}
     },
-    then({arUser, run, again, exported}) {
+    then({arUser, run, again, exported, payment}) {
         arUser.includes("PERMISSION_DENIED")
         run.created.map(row => row.partyId).join() == "NATIVE_TAX_V_OK"
         run.failures.some(row => row.partyId == "NATIVE_TAX_V_NOTIN" && row.reasonCode == "TIN_MISSING")
         run.skipped.some(row => row.partyId == "NATIVE_TAX_V_SMALL")
         run.skipped.some(row => row.partyId == "NATIVE_TAX_V_UNREG" && row.reason.includes("Not registered"))
         !run.created.concat(run.failures).some(row => row.partyId == "NATIVE_TAX_V_UNREG")
-        again.failures.some(row => row.partyId == "NATIVE_TAX_V_OK" && row.reasonCode == "STATEMENT_EXISTS")
+        again.skipped.some(row => row.partyId == "NATIVE_TAX_V_OK" && row.reason.includes("Already"))
+        payment.statusId == "PmntDelivered"
         exported.text.includes("1099m_07")
         exported.text.includes("700.00")
+    }
+})
+
+feature("a discount of the whole sale is spread over the taxed lines, and tax lines are marked as calculated", {
+    when() {
+        const invoice = productInvoice("NATIVE_TAX_UT", [["1", "300"]])
+        helper().call("mantle.account.InvoiceServices.store#InvoiceDraftItem", {
+            invoiceId: invoice.invoiceId,
+            itemTypeEnumId: "ItemDiscount",
+            quantity: "1",
+            amount: "-50",
+            description: "Order discount"
+        })
+        const refused = finalize(one("mantle.account.invoice.Invoice", {invoiceId: invoice.invoiceId}))
+        return {refused, lines: taxLines(invoice.invoiceId)}
+    },
+    then({refused, lines}) {
+        refused == ""
+        lines.length == 1
+        toDecimal(lines[0].taxableAmount).eq(toDecimal("250"))
+        lines[0].taxCalculated == "Y"
+    }
+})
+
+feature("an authority with nexus in the destination and no rate in effect refuses the sale", {
+    when() {
+        login(f.users.financeadmin)
+        tax("store#Authority", {
+            organizationPartyId: f.org,
+            description: "Spec Utah county tax",
+            taxAuthorityTypeEnumId: "TatCounty",
+            taxAuthGeoId: "USA_UT",
+            isNexus: "Y",
+            changeReason: "Spec county nexus"
+        })
+        return {refused: finalize(productInvoice("NATIVE_TAX_UT"))}
+    },
+    then({refused}) {
+        refused.includes("TAX_RATE_MISSING")
+        refused.includes("Spec Utah county tax")
     }
 })

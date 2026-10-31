@@ -256,10 +256,13 @@ first release has local sales tax and the US 1099 data.
   whether shipping is taxed. `store#Rate` (`ACCOUNTING_ADMIN`) starts a rate, a new version of one (ending the one it
   replaces) or its end, and refuses an overlap of the same authority, type and scope. `store#Authority`
   (`ACCOUNTING_ADMIN`) writes the authority with the organization's tax account (`TaxAuthorityGlAccount`) and nexus and
-  registration (`TaxAuthorityParty.isNexus`, `partyTaxId`).
+  registration (`TaxAuthorityParty.isNexus`, `partyTaxId`); a change of these ends the row in effect and starts a new
+  one. An authority, and a rate for every organization, are shared: only a system administrator changes them
+  (`AUTHORITY_SHARED`, `RATE_SHARED`). The organization's gateway is a preference (`store#Preferences`).
 - **Calculation.** `calculate#SalesTaxLocal`, the `LOCAL` gateway, taxes an item for each authority whose geo is one of
-  the destination's, where the organization (or one it rolls up to) has nexus and a sales tax rate, at the most
-  specific rate in effect on the tax date (category, then store, then organization). A product line is taxable unless
+  the destination's (else the origin's), where the organization (or one it rolls up to) has nexus, at the most specific
+  rate in effect on the tax date (category, then store, then organization). A discount of the whole sale is spread over
+  the taxed lines in proportion to their bases. A product line is taxable unless
   it or its product says not; another line only when `taxableFlag` is Y; shipping when the rate says so. A customer
   exempt in the authority (`TaxAuthorityParty.isExempt`) gets an explicit zero with its reason. It refuses a taxed sale
   without a destination (`TAX_ADDRESS_MISSING`), an authority with nexus and no rate in effect (`TAX_RATE_MISSING`)
@@ -270,7 +273,7 @@ first release has local sales tax and the US 1099 data.
 - **Invoices.** `calculate#InvoiceSalesTax` writes a draft sales invoice's `ItemSalesTax` lines under the taxed items
   through its store's gateway, else the organization's (`PartyAcctgPreference.taxGatewayConfigId`), each with its
   authority, rate version (`InvoiceItem.taxAuthorityRateId`), base (`taxableAmount`), rate (`taxPercentage`) and
-  rounding (`taxRoundingAmount`); the same results leave the lines as they are. It skips an invoice billed from orders,
+  rounding (`taxRoundingAmount`), marked `taxCalculated`; the same results leave the lines as they are. It skips an invoice billed from orders,
   whose tax came with the order. `change#InvoiceState` runs it before a sales invoice is finalized or approved, so a
   tax refusal refuses the change, and removes the calculated lines when an invoice goes back to draft. A tax line
   posts to the organization's account for its authority (`get#InvoiceItemGlAccount` with `taxAuthorityId`), else the

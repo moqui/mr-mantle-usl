@@ -1,7 +1,7 @@
 // Local sales tax (AC-08): the local gateway's calculation over TaxAuthorityRate (calculate#SalesTaxLocal), an invoice's
 // tax lines through the store's or the organization's gateway (calculate#InvoiceSalesTax), and the simulation that
 // explains a calculation (simulate#SalesTax). An authority taxes a sale when the organization has nexus there
-// (TaxAuthorityParty.isNexus), it has a sales tax rate for the organization, and its geo is one of the destination's.
+// (TaxAuthorityParty.isNexus) and its geo is one of the destination's; it must then have a sales tax rate in effect.
 // A failure is a refusal with a reason code; an exemption or no nexus is an explicit zero, never a fallback.
 const lib = ec.resource.script("component://mr-mantle/service/mantle/ledger/EntityLib.js")
 const policy = ec.resource.script("component://mr-mantle/service/mantle/ledger/AccountingPolicy.js")
@@ -26,25 +26,25 @@ function taxableKind(item, productTypes) {
     const product = item.productId ? one("mantle.product.Product", {productId: item.productId}) : null
     return product?.taxable === "N" ? null : "line"
 }
-// The geos of a destination: the given ones, else the postal address's country, state, county, city and postal code.
-function destinationGeos(p) {
-    if (p.destinationGeoIds?.length) return Array.from(p.destinationGeoIds).filter(Boolean)
-    if (!p.destinationAddressContactMechId) return []
-    const address = one("mantle.party.contact.PostalAddress", {contactMechId: p.destinationAddressContactMechId})
+// The geos of a destination: the given ones, else the postal address's country, state, county, city and postal code; a
+// sale with no destination address (an order part picked up) is taxed where it leaves, its origin address.
+function addressGeos(contactMechId) {
+    const address = contactMechId ? one("mantle.party.contact.PostalAddress", {contactMechId}) : null
     if (!address) return []
     return ["countryGeoId", "stateProvinceGeoId", "countyGeoId", "cityGeoId", "postalCodeGeoId"]
         .map(field => address[field])
         .filter(Boolean)
 }
-// The sales tax rates of the authorities where the organization (or one it rolls up to) has nexus on the date.
-function nexusRates(organizations, date) {
-    const nexus = Array.from(find(AUTHORITY_PARTY).condition("partyId", "in", organizations).condition("isNexus", "Y").list())
-        .filter(row => active(row, date))
-        .map(row => row.taxAuthorityId)
-    if (!nexus.length) return []
-    return Array.from(find(RATE).condition("taxAuthorityId", "in", nexus).condition("rateTypeEnumId", "TarSalesTax").list()).filter(
-        row => !row.organizationPartyId || organizations.includes(row.organizationPartyId)
-    )
+function destinationGeos(p) {
+    if (p.destinationGeoIds?.length) return Array.from(p.destinationGeoIds).filter(Boolean)
+    const geos = addressGeos(p.destinationAddressContactMechId)
+    return geos.length ? geos : addressGeos(p.originAddressContactMechId)
+}
+// The authorities where the organization (or one it rolls up to) has nexus on the date.
+function nexusAuthorityIds(organizations, date) {
+    if (!organizations.length) return []
+    const rows = Array.from(find(AUTHORITY_PARTY).condition("partyId", "in", organizations).condition("isNexus", "Y").list())
+    return [...new Set(rows.filter(row => active(row, date)).map(row => row.taxAuthorityId))]
 }
 function categoriesOf(productId, date) {
     if (!productId) return []
@@ -53,76 +53,119 @@ function categoriesOf(productId, date) {
         .map(row => row.productCategoryId)
 }
 // The rate of an authority for an item: the most specific in effect (category, then store, then organization). Two
-// equally specific rows are ambiguous; none in effect for an authority that has rates is a missing rate.
-function rateFor(authorityRates, item, p, date, categories) {
-    const effective = authorityRates.filter(row => active(row, date))
-    if (!effective.length) return {missing: true}
+// equally specific rows are ambiguous; none in effect is refused (rateFor is only asked of an authority with nexus).
+function rateFor(authority, effective, item, p, date, categories) {
+    if (!effective.length)
+        denied(
+            "TAX_RATE_MISSING",
+            "No sales tax rate of " +
+                (authority.description || authority.taxAuthorityId) +
+                " is in effect on " +
+                lib.dateText(date)
+        )
     const matching = effective.filter(
         row =>
             (!row.productStoreId || row.productStoreId === p.productStoreId) &&
             (!row.productCategoryId || categories.includes(row.productCategoryId))
     )
-    if (!matching.length) return {rate: null}
+    if (!matching.length) return null
     const score = row => (row.productCategoryId ? 4 : 0) + (row.productStoreId ? 2 : 0) + (row.organizationPartyId ? 1 : 0)
     const best = Math.max(...matching.map(score))
     const top = matching.filter(row => score(row) === best)
     if (top.length > 1)
-        denied("TAX_RATE_AMBIGUOUS", "More than one rate of the same scope applies; end one of them (" + top[0].taxAuthorityId + ")")
-    return {rate: top[0]}
+        denied(
+            "TAX_RATE_AMBIGUOUS",
+            "More than one rate of the same scope applies; end one of them (" + top[0].taxAuthorityId + ")"
+        )
+    return top[0]
+}
+// An item's base: its total less its own discounts (discountTotal is negative, as calculate#OrderSalesTax gives it).
+function base(item) {
+    const total =
+        item.itemTotal != null
+            ? toDecimal(item.itemTotal)
+            : toDecimal(item.quantity ?? 1).multiply(toDecimal(item.unitAmount ?? 0))
+    return total.add(toDecimal(item.discountTotal ?? 0))
+}
+// The discounts of the whole sale (ItemDiscount items with no parent item) spread over the taxable lines, shipping aside,
+// in proportion to their bases; the last line takes what rounding leaves. Each item gets its taxable base.
+function spreadDiscounts(items, discounts, currency) {
+    const round = value => (currency ? ec.l10n.roundCurrency(value, currency) : value.setScale(2, "HALF_UP"))
+    for (const item of items) item.taxable = base(item)
+    const lines = items.filter(item => item.kind === "line" && item.taxable.compare(0) > 0)
+    const total = lines.reduce((sum, item) => sum.add(item.taxable), toDecimal(0))
+    const discount = discounts.reduce((sum, item) => sum.add(base(item)), toDecimal(0))
+    if (discount.isZero() || total.isZero()) return
+    let left = discount.compare(total.multiply(toDecimal(-1))) < 0 ? total.multiply(toDecimal(-1)) : discount
+    lines.forEach((item, index) => {
+        const share = index === lines.length - 1 ? left : round(discount.multiply(item.taxable).divide(total))
+        item.taxable = item.taxable.add(share)
+        left = left.subtract(share)
+    })
 }
 
-// calculate#SalesTaxLocal: a result for each taxable item and applicable authority, with the rate version, base, exact
-// and rounded tax, rounding, and an exemption or reason when it is zero. An organization with no sales tax nexus gets no
-// results; a taxed sale without a destination address, or an authority with no rate in effect, is refused.
+// calculate#SalesTaxLocal: a result for each taxable item and each authority with nexus whose geo is the destination's,
+// with the rate version, base, exact and rounded tax, rounding, and an exemption or reason when it is zero. An
+// organization with no nexus gets no results; a taxed sale without a destination, or an authority with nexus there and
+// no rate in effect, is refused.
 function local(p) {
     const date = p.taxDate || ec.user.nowTimestamp
     const organizations = p.organizationPartyId ? policy.organizationChain(p.organizationPartyId, date) : []
-    const rates = nexusRates(organizations, date)
-    if (!rates.length) return {taxResults: []}
+    const nexus = nexusAuthorityIds(organizations, date)
+    if (!nexus.length) return {taxResults: []}
     const productTypes = productItemTypes()
-    const items = Array.from(p.items || [])
-        .map(item => Object.assign({}, item, {kind: taxableKind(item, productTypes)}))
-        .filter(item => item.kind)
+    const all = Array.from(p.items || []).map(item => Object.assign({}, item, {kind: taxableKind(item, productTypes)}))
+    const items = all.filter(item => item.kind)
     if (!items.length) return {taxResults: []}
     const geos = destinationGeos(p)
     if (!geos.length) denied("TAX_ADDRESS_MISSING", "The customer needs a postal address to calculate its sales tax")
-    const authorityIds = [...new Set(rates.map(row => row.taxAuthorityId))]
     const authorities = Array.from(
-        find("mantle.other.tax.TaxAuthority").condition("taxAuthorityId", "in", authorityIds).condition("taxAuthGeoId", "in", geos).list()
+        find("mantle.other.tax.TaxAuthority")
+            .condition("taxAuthorityId", "in", nexus)
+            .condition("taxAuthGeoId", "in", geos)
+            .list()
     )
     if (!authorities.length) return {taxResults: []}
     const currency = p.currencyUomId
     const round = value => (currency ? ec.l10n.roundCurrency(value, currency) : value.setScale(2, "HALF_UP"))
-    const purchase = items.reduce((sum, item) => sum.add(base(item)), toDecimal(0))
+    spreadDiscounts(
+        items,
+        all.filter(item => item.itemTypeEnumId === "ItemDiscount" && !item.parentItemId),
+        currency
+    )
+    const purchase = items.reduce((sum, item) => sum.add(item.taxable), toDecimal(0))
+    const rates = Array.from(
+        find(RATE)
+            .condition(
+                "taxAuthorityId",
+                "in",
+                authorities.map(row => row.taxAuthorityId)
+            )
+            .condition("rateTypeEnumId", "TarSalesTax")
+            .list()
+    ).filter(row => (!row.organizationPartyId || organizations.includes(row.organizationPartyId)) && active(row, date))
     const results = []
     for (const authority of authorities) {
         const exemption = p.customerPartyId
-            ? rows(AUTHORITY_PARTY, {partyId: p.customerPartyId, taxAuthorityId: authority.taxAuthorityId, isExempt: "Y"}).find(row =>
-                  active(row, date)
+            ? rows(AUTHORITY_PARTY, {partyId: p.customerPartyId, taxAuthorityId: authority.taxAuthorityId, isExempt: "Y"}).find(
+                  row => active(row, date)
               )
             : null
-        const authorityRates = rates.filter(row => row.taxAuthorityId === authority.taxAuthorityId)
+        const effective = rates.filter(row => row.taxAuthorityId === authority.taxAuthorityId)
         for (const item of items) {
-            const found = rateFor(authorityRates, item, p, date, categoriesOf(item.productId, date))
-            if (found.missing)
-                denied(
-                    "TAX_RATE_MISSING",
-                    "No sales tax rate of " + (authority.description || authority.taxAuthorityId) + " is in effect on " + lib.dateText(date)
-                )
-            const rate = found.rate
-            const reason = !rate
-                ? "No rate for this item"
-                : item.kind === "shipping" && rate.taxShipping !== "Y"
-                  ? "Shipping is not taxed"
-                  : rate.minItemPrice != null && toDecimal(item.unitAmount ?? 0).compare(rate.minItemPrice) < 0
-                    ? "Below the minimum item price"
-                    : rate.minPurchase != null && purchase.compare(rate.minPurchase) < 0
-                      ? "Below the minimum purchase"
-                      : exemption
-                        ? "Exempt" + (exemption.partyTaxId ? " (" + exemption.partyTaxId + ")" : "")
-                        : null
+            const rate = rateFor(authority, effective, item, p, date, categoriesOf(item.productId, date))
             if (!rate) continue
-            const taxable = base(item)
+            const reason =
+                item.kind === "shipping" && rate.taxShipping !== "Y"
+                    ? "Shipping is not taxed"
+                    : rate.minItemPrice != null && toDecimal(item.unitAmount ?? 0).compare(rate.minItemPrice) < 0
+                      ? "Below the minimum item price"
+                      : rate.minPurchase != null && purchase.compare(rate.minPurchase) < 0
+                        ? "Below the minimum purchase"
+                        : exemption
+                          ? "Exempt" + (exemption.partyTaxId ? " (" + exemption.partyTaxId + ")" : "")
+                          : null
+            const taxable = item.taxable
             const percentage = toDecimal(rate.taxPercentage ?? 0)
             const exact = reason ? toDecimal(0) : taxable.multiply(percentage).divide(toDecimal(100))
             const rounded = round(exact)
@@ -144,12 +187,6 @@ function local(p) {
     }
     return {taxResults: results}
 }
-// An item's base: its total less its discounts (discountTotal is negative, as calculate#OrderSalesTax gives it).
-function base(item) {
-    const total =
-        item.itemTotal != null ? toDecimal(item.itemTotal) : toDecimal(item.quantity ?? 1).multiply(toDecimal(item.unitAmount ?? 0))
-    return total.add(toDecimal(item.discountTotal ?? 0))
-}
 
 // The gateway of a sale: its store's when the store has one, else the organization's (PartyAcctgPreference).
 function gateway(organizationPartyId, productStoreId) {
@@ -169,12 +206,11 @@ function customerAddress(partyId, date) {
     return null
 }
 
-// The invoice's calculated tax lines (a tax type with the rate version that made it).
+// The invoice's calculated tax lines, whichever gateway made them (InvoiceItem.taxCalculated).
 function calculatedLines(invoiceId) {
-    return Array.from(
-        find(ITEM, {invoiceId}).condition("itemTypeEnumId", "in", taxTypes).condition("taxAuthorityRateId", "is-not-null", null).list()
-    )
+    return rows(ITEM, {invoiceId, taxCalculated: "Y"})
 }
+const draftStatuses = ["InvoiceInProcess", "InvoiceIncoming", "InvoiceReceived"]
 function lineKey(row) {
     return [
         row.parentItemSeqId,
@@ -197,6 +233,7 @@ function invoice(p) {
     if (!record) denied("INVOICE_UNAVAILABLE", "Invoice " + p.invoiceId + " is not available")
     const existing = calculatedLines(record.invoiceId)
     if (p.clear) {
+        if (!draftStatuses.includes(record.statusId)) denied("INVOICE_NOT_DRAFT", "Tax lines are removed from a draft invoice")
         clearLines(existing)
         return {reasonCode: "CLEARED", taxTotal: toDecimal(0), lineCount: 0, changed: existing.length > 0}
     }
@@ -207,17 +244,22 @@ function invoice(p) {
     if (billed) return skip("ORDER_TAX")
     const config = gateway(record.fromPartyId, record.productStoreId)
     if (!config) return skip("NO_GATEWAY")
-    if (!["InvoiceInProcess", "InvoiceIncoming", "InvoiceReceived"].includes(record.statusId))
-        denied("INVOICE_NOT_DRAFT", "Sales tax is calculated on a draft invoice")
+    if (!draftStatuses.includes(record.statusId)) denied("INVOICE_NOT_DRAFT", "Sales tax is calculated on a draft invoice")
     const date = record.invoiceDate || ec.user.nowTimestamp
     const currency = record.currencyUomId
+    // tax lines are not items; a line's own discounts are in its discountTotal, the sale's discounts are items with no parent
     const items = lines
-        .filter(line => !taxTypes.includes(line.itemTypeEnumId) && line.itemTypeEnumId !== "ItemDiscount")
+        .filter(
+            line => !taxTypes.includes(line.itemTypeEnumId) && !(line.itemTypeEnumId === "ItemDiscount" && line.parentItemSeqId)
+        )
         .map(line => {
             const itemTotal = ec.l10n.roundCurrency(toDecimal(line.quantity ?? 1).multiply(toDecimal(line.amount ?? 0)), currency)
             const discountTotal = lines
                 .filter(child => child.parentItemSeqId === line.invoiceItemSeqId && child.itemTypeEnumId === "ItemDiscount")
-                .reduce((sum, child) => sum.add(toDecimal(child.quantity ?? 1).multiply(toDecimal(child.amount ?? 0))), toDecimal(0))
+                .reduce(
+                    (sum, child) => sum.add(toDecimal(child.quantity ?? 1).multiply(toDecimal(child.amount ?? 0))),
+                    toDecimal(0)
+                )
             return {
                 itemId: line.invoiceItemSeqId,
                 itemTypeEnumId: line.itemTypeEnumId,
@@ -226,7 +268,8 @@ function invoice(p) {
                 itemTotal,
                 discountTotal,
                 productId: line.productId,
-                taxableFlag: line.taxableFlag
+                taxableFlag: line.taxableFlag,
+                parentItemId: line.parentItemSeqId || null
             }
         })
     const out = call(config.calculateServiceName, {
@@ -251,8 +294,10 @@ function invoice(p) {
             taxAuthorityId: result.taxAuthorityId,
             taxAuthorityRateId: result.taxAuthorityRateId || null,
             taxableAmount: result.taxableAmount ?? null,
-            taxPercentage: result.taxPercentage ?? (result.taxRate != null ? toDecimal(result.taxRate).multiply(toDecimal(100)) : null),
+            taxPercentage:
+                result.taxPercentage ?? (result.taxRate != null ? toDecimal(result.taxRate).multiply(toDecimal(100)) : null),
             taxRoundingAmount: result.taxRoundingAmount ?? null,
+            taxCalculated: "Y",
             description: (result.taxName || "Sales") + " tax"
         }))
     const taxTotal = wanted.reduce((sum, line) => sum.add(line.quantity.multiply(line.amount)), toDecimal(0))
@@ -261,7 +306,8 @@ function invoice(p) {
         JSON.stringify(wanted.map(lineKey).sort()) === JSON.stringify(existing.map(lineKey).sort())
     if (same) return {reasonCode: "OK", taxTotal, lineCount: wanted.length, changed: false}
     clearLines(existing)
-    for (const line of wanted) call("mantle.account.InvoiceServices.create#InvoiceItem", Object.assign({invoiceId: record.invoiceId}, line))
+    for (const line of wanted)
+        call("mantle.account.InvoiceServices.create#InvoiceItem", Object.assign({invoiceId: record.invoiceId}, line))
     return {reasonCode: "OK", taxTotal, lineCount: wanted.length, changed: true}
 }
 
@@ -311,7 +357,9 @@ function simulate(p) {
     const authorityIds = [...new Set(results.map(result => result.taxAuthorityId))]
     const names = Object.fromEntries(
         Array.from(
-            authorityIds.length ? find("mantle.other.tax.TaxAuthority").condition("taxAuthorityId", "in", authorityIds).list() : []
+            authorityIds.length
+                ? find("mantle.other.tax.TaxAuthority").condition("taxAuthorityId", "in", authorityIds).list()
+                : []
         ).map(row => [row.taxAuthorityId, row.description || row.taxAuthorityId])
     )
     answer.rows = results.map(result => ({

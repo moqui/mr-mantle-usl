@@ -47,6 +47,8 @@ along with this software (see the LICENSE.md file). If not, see
                 <parameter name="productId"/>
                 <parameter name="taxCode"/>
                 <parameter name="taxableFlag"/>
+                <parameter name="parentItemId"><description>For a discount, the item it discounts; a discount with none
+                    is spread over the taxable items.</description></parameter>
                 <!-- discounts will be another item of type ItemDiscount, so don't do this for now:
                 <parameter name="discounts" type="List"><parameter name="discountEntry" type="Map">
                     <parameter name="discountAmount" type="BigDecimal"/>
@@ -153,6 +155,7 @@ along with this software (see the LICENSE.md file). If not, see
 
                         <set field="unitAmountLessDiscounts" from="itemTotal.add(discountTotal).divide(combinedQuantity).setScale(3, 'HALF_UP')"/>
                         <script>items.push({itemId:orderItem.orderItemSeqId, itemTypeEnumId:orderItem.itemTypeEnumId,
+                                parentItemId:orderItem.parentItemSeqId,
                                 quantity:orderItem.quantity, unitAmount:orderItem.unitAmount, unitAmountLessDiscounts:unitAmountLessDiscounts,
                                 itemTotal:itemTotal, discountTotal:discountTotal,
                                 productId:orderItem.productId, taxCode:product?.taxCode})</script>
@@ -274,9 +277,12 @@ along with this software (see the LICENSE.md file). If not, see
     <service verb="store" noun="Authority" allow-remote="false">
         <description>Create or change a tax authority, and the organization's links to it: its tax account
             (TaxAuthorityGlAccount, where the organization's tax lines of the authority post) and its nexus and registration
-            (TaxAuthorityParty). Refuses a user without finance administration in the organization, a missing name, an
-            unknown geo or authority party, an account not assigned to the organization, and a missing change
-            reason.</description>
+            (TaxAuthorityParty). An authority is shared by every organization, so changing an existing one's name, level,
+            region, party or registration rules needs system administration; its changes are audit-logged. A nexus or
+            registration change ends the organization's current TaxAuthorityParty row and starts a new one (an empty
+            partyTaxId clears the number). Refuses a user without finance administration in the organization, a missing
+            name, an unknown geo or authority party, an account not assigned to the organization, a shared change
+            without system administration (AUTHORITY_SHARED) and a missing change reason.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
             <parameter name="taxAuthorityId"/>
@@ -316,11 +322,19 @@ along with this software (see the LICENSE.md file). If not, see
                 <entity-find-one entity-name="mantle.other.tax.TaxAuthority" value-field="existing" for-update="true"
                         disable-authz="true"/>
             </if>
-            <set field="authorityFields" from="{description:description.trim(),
-                    taxAuthorityTypeEnumId:taxAuthorityTypeEnumId || null,
-                    taxAuthGeoId:taxAuthGeoId || null, taxAuthPartyId:taxAuthPartyId || null,
-                    taxIdFormatPattern:taxIdFormatPattern || null, requireTaxIdForExemption:requireTaxIdForExemption || null}"/>
+            <!-- a field not passed keeps its value -->
+            <set field="authorityFields" from="Object.fromEntries(['taxAuthorityTypeEnumId', 'taxAuthGeoId', 'taxAuthPartyId',
+                    'taxIdFormatPattern', 'requireTaxIdForExemption'].map(field =&gt;
+                        [field, (field in context ? context[field] : existing?.[field]) || null]))"/>
+            <set field="authorityFields.description" from="description.trim()"/>
             <if condition="existing"><then>
+                <set field="headerChanged" from="Object.keys(authorityFields)
+                        .some(field =&gt; String(existing[field] ?? '') !== String(authorityFields[field] ?? ''))"/>
+                <if condition="headerChanged &amp;&amp; !policy.capabilities().systemAdmin">
+                    <return error="true"
+                            message="AUTHORITY_SHARED: The authority is shared; a system administrator changes it"/>
+                </if>
+                <script>policy.audit(Object.keys(authorityFields), changeReason)</script>
                 <service-call name="update#mantle.other.tax.TaxAuthority" disable-authz="true"
                         in-map="Object.assign({taxAuthorityId:taxAuthorityId}, authorityFields)"/>
             </then><else>
@@ -344,24 +358,32 @@ along with this software (see the LICENSE.md file). If not, see
                 <service-call name="delete#mantle.ledger.config.TaxAuthorityGlAccount" disable-authz="true"
                         in-map="{taxAuthorityId:taxAuthorityId, organizationPartyId:organizationPartyId}"/>
             </if>
-            <if condition="isNexus || partyTaxId">
-                <entity-find entity-name="mantle.other.tax.TaxAuthorityParty" list="registrations" disable-authz="true">
+            <if condition="isNexus || 'partyTaxId' in context">
+                <entity-find entity-name="mantle.other.tax.TaxAuthorityParty" list="registrations" for-update="true"
+                        disable-authz="true">
                     <date-filter/>
                     <econdition field-name="partyId" from="organizationPartyId"/>
                     <econdition field-name="taxAuthorityId"/>
                 </entity-find>
                 <set field="registration" from="Array.from(registrations)[0]"/>
                 <set field="registrationFields" from="{isNexus:isNexus || registration?.isNexus || 'N',
-                        partyTaxId:partyTaxId || registration?.partyTaxId || null}"/>
-                <if condition="registration"><then>
-                    <service-call name="update#mantle.other.tax.TaxAuthorityParty" disable-authz="true"
-                            in-map="Object.assign({partyId:organizationPartyId, taxAuthorityId:taxAuthorityId,
-                                fromDate:registration.fromDate}, registrationFields)"/>
-                </then><else>
+                        partyTaxId:('partyTaxId' in context ? partyTaxId : registration?.partyTaxId) || null}"/>
+                <set field="registrationChanged" from="!registration ||
+                        registration.isNexus !== registrationFields.isNexus ||
+                        (registration.partyTaxId || null) !== registrationFields.partyTaxId"/>
+                <if condition="registrationChanged">
+                    <!-- changes by effective date: the row in effect ends now and the new one starts -->
+                    <set field="changedAt" from="ec.user.nowTimestamp"/>
+                    <script>policy.audit(['thruDate'], changeReason)</script>
+                    <if condition="registration">
+                        <service-call name="update#mantle.other.tax.TaxAuthorityParty" disable-authz="true"
+                                in-map="{partyId:organizationPartyId, taxAuthorityId:taxAuthorityId,
+                                    fromDate:registration.fromDate, thruDate:changedAt}"/>
+                    </if>
                     <service-call name="create#mantle.other.tax.TaxAuthorityParty" disable-authz="true"
                             in-map="Object.assign({partyId:organizationPartyId, taxAuthorityId:taxAuthorityId,
-                                fromDate:ec.user.nowTimestamp}, registrationFields)"/>
-                </else></if>
+                                fromDate:changedAt}, registrationFields)"/>
+                </if>
             </if>
         </actions>
     </service>
@@ -372,7 +394,8 @@ along with this software (see the LICENSE.md file). If not, see
             the version it was calculated with. Refuses a user without finance administration in the organization, an
             unknown authority, store or category, a rate outside 0 to 100, an end not after the start, a version that does
             not start after the one it replaces, another rate of the same authority, type and scope over the same dates,
-            and a missing change reason.</description>
+            a change to a rate for every organization without system administration (RATE_SHARED), and a missing change
+            reason.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
             <parameter name="taxAuthorityRateId"/>
@@ -402,6 +425,10 @@ along with this software (see the LICENSE.md file). If not, see
                 <if condition="replaced == null || (replaced.organizationPartyId &amp;&amp;
                         replaced.organizationPartyId != organizationPartyId)">
                     <return error="true" message="RATE_UNAVAILABLE: Tax rate is not available"/></if>
+                <!-- a rate for any organization is shared: only a system administrator replaces or ends it -->
+                <if condition="!replaced.organizationPartyId &amp;&amp; !policy.capabilities().systemAdmin">
+                    <return error="true"
+                            message="RATE_SHARED: The rate is shared; a system administrator changes it"/></if>
                 <if condition="taxPercentage == null">
                     <set field="endDate" from="thruDate || ec.user.nowTimestamp"/>
                     <if condition="policy.ms(endDate) &lt;= policy.ms(replaced.fromDate)">
@@ -510,9 +537,12 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="organizationPartyId"/>
             <parameter name="taxAuthorityId" required="true"/>
             <parameter name="timePeriodId" required="true"/>
+            <parameter name="operationKey">
+                <description>A retry with the same key answers the first statement.</description></parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="taxStatementId"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
             <parameter name="lineCount" type="Integer"/>
             <parameter name="taxAmount" type="BigDecimal"/>
         </out-parameters>
@@ -520,6 +550,7 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="made" from="ec.resource.script('component://mr-mantle/service/mantle/other/TaxStatements.js')
                     .execute('createSalesTax', context)"/>
             <set field="taxStatementId" from="made.taxStatementId"/>
+            <set field="alreadyApplied" from="!!made.alreadyApplied"/>
             <set field="lineCount" from="made.lineCount"/>
             <set field="taxAmount" from="made.taxAmount"/>
         </actions>
@@ -528,9 +559,10 @@ along with this software (see the LICENSE.md file). If not, see
         <description>The 1099-MISC data of a year for each vendor registered with the authority and not exempt
             (TaxAuthorityParty) whom the organization paid at least the threshold in the period: amounts by box from
             the payments of the period applied to the vendor's invoices, through create#Vendor1099MiscStatement. Each
-            vendor is its own step: one without a taxpayer number or payment address, or with a statement for the period
-            already, is named in failures with its reason and the run goes on; paid vendors under the threshold or not
-            registered are in skipped, with the reason. Refuses a user without TAX_STATEMENT_EDIT in the organization and
+            vendor is its own step: one without a taxpayer number or payment address is named in failures with its reason
+            and the run goes on; paid vendors under the threshold, not registered, or with a statement for the period
+            already are in skipped, with the reason. Card and third-party network payments are left out
+            (1099-K). Refuses a user without TAX_STATEMENT_EDIT in the organization and
             a period that is not the organization's.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
