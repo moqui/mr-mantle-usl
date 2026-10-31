@@ -120,14 +120,16 @@ function automatic(tx) {
         ) && !tx.reverseOfAcctgTransId
     )
 }
-// No user, or a public account (no group but ALL_USERS): a customer paying through a public page, a gateway's answer or a
-// job. It works in no organization, so a source document's own posting (never a manual one or a reversal) is the calling
-// service's to authorize, as an anonymous order's payment is.
-function outsideActor() {
-    if (!ec.user.userId) return true
-    return !rows("moqui.security.UserGroupMember", {userId: ec.user.userId}).some(
-        row => row.userGroupId !== "ALL_USERS" && active(row)
-    )
+// The one payment a public Billing page has checked and is completing (Portal.js sets PORTAL_PAYMENT in the execution
+// context's shared map around its gateway calls): a customer's card payment to the organization, which no user of the
+// organization makes. Its own posting, or its application's, skips the user's organization check; nothing else does.
+const PORTAL_PAYMENT = "mantle.portalPaymentId"
+function portalPayment(tx) {
+    const marked = ec.context.sharedMap[PORTAL_PAYMENT]
+    if (!marked || tx.reverseOfAcctgTransId) return false
+    const paymentId = tx.paymentId || (tx.paymentApplicationId && one(A, {paymentApplicationId: tx.paymentApplicationId})?.paymentId)
+    if (paymentId !== marked) return false
+    return one("mantle.account.payment.Payment", {paymentId})?.toPartyId === tx.organizationPartyId
 }
 // The source document fields of a posting; a posting with none, or a reversal, is a manual one.
 const sourceFields = [
@@ -286,9 +288,8 @@ function validate(p, lock = false) {
         )
             fail("CURRENCY_MISMATCH", "Posting requires the organization's base currency until currency conversion is enabled")
         const domain = ec.resource.script("component://mr-mantle/service/mantle/product/ProductAccess.js")
-        const sourcePosting = !tx.reverseOfAcctgTransId && sourceFields.some(field => tx[field])
         const orgs =
-            domain.systemAdmin() || domain.has("ACCOUNTING_ADMIN") || (sourcePosting && outsideActor())
+            domain.systemAdmin() || domain.has("ACCOUNTING_ADMIN") || portalPayment(tx)
                 ? null
                 : lib.call("mantle.party.PartyServices.get#PartyOrganizationInfo").userOrgIds || []
         if (orgs && !orgs.includes(tx.organizationPartyId)) fail("ORGANIZATION", "Posting organization is not available")
@@ -529,5 +530,6 @@ function completed(acctgTransId) {
     applicationDay,
     controlProof,
     cashTypes,
-    applicationTypes
+    applicationTypes,
+    PORTAL_PAYMENT
 })

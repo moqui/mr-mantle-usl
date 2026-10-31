@@ -19,15 +19,16 @@ along with this software (see the LICENSE.md file). If not, see
         xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/entity-definition-3.xsd">
     <entity entity-name="ExternalAccessCapability" package="mantle.party" cache="never">
         <description>What an outside party may do with one record of an organization: the record (recordType and recordId,
-            with the revision it was issued for), the party (a customer or supplier), its scopes (comma separated, such as
+            the party (a customer or supplier), its scopes (comma separated, such as
             InvoicePay or BillUpload), its expiry and revocation, and the digest of its bearer token. The token itself is
             shown once, when it is created, and never stored.</description>
         <field name="capabilityId" type="id" is-pk="true"/>
         <field name="organizationPartyId" type="id"/>
-        <field name="partyId" type="id"><description>The outside party: the invoice's customer, the order's supplier.</description></field>
-        <field name="recordType" type="id"><description>Invoice or Order; the record types ExternalAccess.js knows.</description></field>
+        <field name="partyId" type="id">
+            <description>The outside party: the invoice's customer, the order's supplier.</description></field>
+        <field name="recordType" type="id">
+            <description>Invoice or Order; the record types ExternalAccess.js knows.</description></field>
         <field name="recordId" type="id"/>
-        <field name="recordRevision" type="text-short"/>
         <field name="scopes" type="text-medium"/>
         <field name="tokenDigest" type="text-medium"/>
         <field name="fromDate" type="date-time"/>
@@ -41,5 +42,24 @@ along with this software (see the LICENSE.md file). If not, see
         <relationship type="one" related="mantle.party.Party"/>
         <index name="EXT_ACCESS_TOKEN" unique="true"><index-field name="tokenDigest"/></index>
         <index name="EXT_ACCESS_RECORD"><index-field name="recordType"/><index-field name="recordId"/></index>
+    </entity>
+    <entity entity-name="ExternalAccessContact" package="mantle.party" cache="never">
+        <description>A public account's grant as a contact of an outside party (a customer, a supplier) on one app of one
+            organization's site, made by redeeming an invite#Contact invitation. The Billing and Supplier pages check it;
+            a CRM contact relationship gives no portal access, and the account holds no user group.</description>
+        <field name="contactGrantId" type="id" is-pk="true"/>
+        <field name="partyId" type="id"><description>The account's party.</description></field>
+        <field name="outsidePartyId" type="id"/>
+        <field name="organizationPartyId" type="id"/>
+        <field name="app" type="id"><description>billing or supplier (PublicApps.js).</description></field>
+        <field name="fromDate" type="date-time"/>
+        <field name="thruDate" type="date-time"/>
+        <relationship type="one" related="mantle.party.Party"/>
+        <relationship type="one" title="Outside" related="mantle.party.Party">
+            <key-map field-name="outsidePartyId" related="partyId"/></relationship>
+        <relationship type="one" title="Organization" related="mantle.party.Party">
+            <key-map field-name="organizationPartyId" related="partyId"/></relationship>
+        <index name="EXT_ACCESS_CONTACT"><index-field name="partyId"/><index-field name="organizationPartyId"/>
+            <index-field name="app"/></index>
     </entity>
 </entities>

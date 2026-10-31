@@ -82,13 +82,18 @@ function payGateway(organizationPartyId) {
     }).find(row => row.isEnabled !== "N" && lib.entityLib.active(row))
     return binding ? gatewayId : null
 }
-// The payment attempts of an invoice made through these pages: card payments from its customer through the gateway.
-function attempts(invoice, gatewayId) {
-    return rows(P, {forInvoiceId: invoice.invoiceId, fromPartyId: invoice.toPartyId, paymentInstrumentEnumId: "PiCreditCard"})
-        .filter(row => !gatewayId || row.paymentGatewayConfigId === gatewayId)
-        .sort((a, b) => lib.ms(b.lastUpdatedStamp) - lib.ms(a.lastUpdatedStamp))
+// The payments started from these pages (PortalPaymentAttempt), newest first: never one made in Accounting for the
+// same invoice, which a pay link's holder must not see, refresh or capture.
+const ATT = "mantle.account.payment.PortalPaymentAttempt"
+function attempts(invoiceId) {
+    return rows(ATT, {invoiceId})
+        .sort((a, b) => lib.ms(b.createdDate) - lib.ms(a.createdDate))
+        .map(row => one(P, {paymentId: row.paymentId}))
+        .filter(Boolean)
 }
 const pending = row => ["PmntPromised", "PmntAuthorized"].includes(row.statusId)
+const redirectOf = paymentId =>
+    Array.from(find(R, {paymentId}).orderBy("-transactionDate").limit(10).list()).find(row => row.redirectUrl)?.redirectUrl || null
 function attemptView(payment) {
     const state = ["PmntDelivered", "PmntConfirmed"].includes(payment.statusId)
         ? "paid"
@@ -97,8 +102,7 @@ function attemptView(payment) {
           : pending(payment)
             ? "pending"
             : "failed"
-    const latest = Array.from(find(R, {paymentId: payment.paymentId}).orderBy("-transactionDate").limit(10).list())
-    const redirectUrl = state === "pending" ? latest.find(row => row.redirectUrl)?.redirectUrl || null : null
+    const redirectUrl = state === "pending" ? redirectOf(payment.paymentId) : null
     return {
         attemptId: payment.paymentId,
         state,
@@ -113,11 +117,55 @@ function checkInvoice(p, recordId = p.invoiceId) {
     const organizationPartyId = served(p.siteId, "billing")
     return access.check({token: p.token, scope: "InvoicePay", recordType: "Invoice", recordId, organizationPartyId})
 }
+// The gateway calls for one checked portal payment run with it named to the posting guard (PostingGuard.PORTAL_PAYMENT),
+// which lets that payment's own posting through the user's organization check, as no user of the organization makes it.
+const PORTAL_PAYMENT = ec.resource.script("component://mr-mantle/service/mantle/ledger/PostingGuard.js").PORTAL_PAYMENT
+function asPortalPayment(paymentId, work) {
+    const shared = ec.context.sharedMap,
+        before = shared[PORTAL_PAYMENT]
+    shared[PORTAL_PAYMENT] = paymentId
+    try {
+        return work()
+    } finally {
+        if (before == null) delete shared[PORTAL_PAYMENT]
+        else shared[PORTAL_PAYMENT] = before
+    }
+}
+// Look the gateway up for a pending portal payment, under its lock, and capture an authorization: the outcome is the
+// gateway's, never what the payer's browser carries back. A pending payment with no reference to look up and no page to
+// send the payer to has failed, and is cancelled.
+function refresh(paymentId) {
+    const payment = find(P, {paymentId}).forUpdate(true).one()
+    if (!pending(payment)) return payment
+    if (!payment.paymentRefNum) {
+        if (!redirectOf(paymentId)) call("update#" + P, {paymentId, statusId: "PmntCancelled"})
+        return one(P, {paymentId})
+    }
+    asPortalPayment(paymentId, () => {
+        try {
+            call("mantle.account.PaymentServices.get#SinglePaymentGatewayDetails", {paymentId})
+        } catch (error) {
+            ec.message.clearErrors()
+            ec.logger.warn("Invoice payment " + paymentId + " lookup failed: " + String(error.message).split("\n")[0])
+        }
+        if (one(P, {paymentId}).statusId === "PmntAuthorized")
+            call("mantle.account.PaymentServices.capture#SinglePayment", {paymentId, operationKey: "pay-capture-" + paymentId})
+    })
+    return one(P, {paymentId})
+}
+// The invoice's attempt still pending after asking the gateway, or null.
+function openAttempt(invoiceId) {
+    for (const payment of attempts(invoiceId).filter(pending)) {
+        const after = refresh(payment.paymentId)
+        if (pending(after)) return after
+    }
+    return null
+}
 function getInvoice(p) {
     const checked = checkInvoice(p)
     const invoice = one(I, {invoiceId: checked.recordId})
     const gatewayId = payGateway(checked.organizationPartyId)
-    const open = attempts(invoice, gatewayId).find(pending)
+    const open = openAttempt(invoice.invoiceId)
     const view = invoiceView(invoice.invoiceId)
     return {
         invoice: view,
@@ -125,11 +173,11 @@ function getInvoice(p) {
         capabilities: {canPay: !!gatewayId && toDecimal(view.due).compare(0) > 0, canShare: checked.via === "contact"}
     }
 }
-// The invoices of the parties the signed-in user is a contact of, from the organization the site serves.
+// The invoices of the customers the signed-in user is a Billing contact of, from the organization the site serves.
 function findInvoices(p) {
     const organizationPartyId = served(p.siteId, "billing")
     if (!ec.user.userId) fail("AuthenticationRequired", "Sign in to see your invoices")
-    const parties = access.contactParties()
+    const parties = access.contactParties(organizationPartyId, "billing")
     if (!parties.length) return {invoiceList: []}
     const list = Array.from(
         find(I)
@@ -156,57 +204,34 @@ function findInvoices(p) {
         })
     }
 }
-// A pay link to share: a contact gets a new capability for an invoice of a party they are a contact of. An internal user
-// (send#Invoice) gets one with RECEIVABLE_EDIT in the invoice's organization, for each published Billing site of it.
+// A pay link to share: a Billing contact gets a new capability for an invoice of a customer it is a contact of. An
+// internal user (send#Invoice) gets one with RECEIVABLE_EDIT in the invoice's organization, on its first published
+// Billing site. A new link replaces the invoice's earlier ones.
 function issueInvoiceAccess(p) {
-    let organizationPartyId, siteId
+    let siteId
     if (p.siteId) {
-        const checked = checkInvoice(p)
-        if (checked.via !== "contact") unavailable()
-        organizationPartyId = checked.organizationPartyId
+        if (checkInvoice(p).via !== "contact") unavailable()
         siteId = p.siteId
     } else {
-        organizationPartyId = access.requireIssuer("Invoice", p.invoiceId).organizationPartyId
-        siteId = apps.sitesFor("billing", organizationPartyId)[0]
+        siteId = apps.sitesFor("billing", access.requireIssuer("Invoice", p.invoiceId).organizationPartyId)[0]
         if (!siteId) return {issued: false}
     }
+    access.revokeActive("Invoice", p.invoiceId, "InvoicePay")
     const created = access.create({recordType: "Invoice", recordId: p.invoiceId, scopes: "InvoicePay", validDays: 120})
     const url = apps.pageUrl(siteId, "billing", "/InvoicePay?token=" + encodeURIComponent(created.token))
     return {issued: !!url, capabilityId: created.capabilityId, token: created.token, url, expiresAt: created.thruDate}
 }
-// Look the gateway up for a pending attempt, then capture an authorized one: the outcome is the gateway's, never what the
-// payer's browser carries back.
-function refresh(payment) {
-    if (!pending(payment) || !payment.paymentRefNum) return payment
-    try {
-        call("mantle.account.PaymentServices.get#SinglePaymentGatewayDetails", {paymentId: payment.paymentId})
-    } catch (error) {
-        ec.message.clearErrors()
-        ec.logger.warn("Invoice payment " + payment.paymentId + " lookup failed: " + String(error.message).split("\n")[0])
-    }
-    const after = one(P, {paymentId: payment.paymentId})
-    if (after.statusId === "PmntAuthorized")
-        call("mantle.account.PaymentServices.capture#SinglePayment", {
-            paymentId: after.paymentId,
-            operationKey: "pay-capture-" + after.paymentId
-        })
-    return one(P, {paymentId: payment.paymentId})
-}
-function startInvoicePayment(p) {
-    const checked = checkInvoice(p)
-    const key = operationId(p)
-    if (!(p.confirm === true || p.confirm === "true")) fail("Unprocessable", "Confirm the payment")
-    const gatewayId = payGateway(checked.organizationPartyId)
-    if (!gatewayId) fail("Unavailable", "Payment is not available for this invoice")
-    // one attempt at a time: the invoice is locked, a retry of the request answers its first result, and an attempt
-    // still pending is resumed rather than paid twice
-    let invoice = find(I, {invoiceId: checked.recordId}).forUpdate(true).one()
-    const operation = lib.entityLib.operation({operationKey: key}, "InvoicePayStart", checked.organizationPartyId, {
+// The attempt to pay, in a transaction of its own under the invoice's lock, so the gateway is not called holding it: a
+// retried request answers its attempt, an attempt still pending is resumed, else a promised card payment for what is
+// due and its PortalPaymentAttempt, with the reference the gateway's return will carry (returnKey, shown once).
+function beginPayment(p) {
+    const invoice = find(I, {invoiceId: p.invoiceId}).forUpdate(true).one()
+    const operation = lib.entityLib.operation({operationKey: p.operationId}, "InvoicePayStart", p.organizationPartyId, {
         invoiceId: invoice.invoiceId
     })
     if (operation.old) return Object.assign(lib.previous(operation), {alreadyApplied: true})
-    const open = attempts(invoice, gatewayId).find(pending)
-    if (open) return {attempt: attemptView(refresh(open)), resumed: true}
+    const open = openAttempt(invoice.invoiceId)
+    if (open) return {attemptId: open.paymentId, resumed: true}
     const due = lib.totals(invoice).unpaidTotal
     if (due.compare(0) <= 0) fail("Conflict", "Nothing is due on this invoice")
     const paymentId = call("mantle.account.PaymentServices.create#Payment", {
@@ -214,7 +239,7 @@ function startInvoicePayment(p) {
         toPartyId: invoice.fromPartyId,
         paymentTypeEnumId: "PtInvoicePayment",
         paymentInstrumentEnumId: "PiCreditCard",
-        paymentGatewayConfigId: gatewayId,
+        paymentGatewayConfigId: p.gatewayId,
         forInvoiceId: invoice.invoiceId,
         amount: money(due, invoice.currencyUomId),
         amountUomId: invoice.currencyUomId,
@@ -222,33 +247,122 @@ function startInvoicePayment(p) {
         effectiveDate: ec.user.nowTimestamp,
         comments: "Paid from the invoice's Billing page"
     }).paymentId
-    const returnUrl = apps.pageUrl(p.siteId, "billing", "/InvoicePay/return?attemptId=" + encodeURIComponent(paymentId))
-    const auth = call("mantle.account.PaymentServices.authorize#SinglePayment", {
+    const returnKey = ec.user.randomString(40)
+    call("create#" + ATT, {
         paymentId,
-        operationKey: "pay-auth-" + paymentId,
-        returnUrl
+        invoiceId: invoice.invoiceId,
+        siteId: p.siteId,
+        capabilityId: p.capabilityId,
+        contactPartyId: p.capabilityId ? null : ec.user.userAccount?.partyId,
+        returnKeyDigest: ec.user.singleUseCodeHash(returnKey),
+        createdDate: ec.user.nowTimestamp
     })
-    let payment = one(P, {paymentId})
-    const response = auth.paymentGatewayResponseId && one(R, {paymentGatewayResponseId: auth.paymentGatewayResponseId})
-    // a pending answer keeps its reference, which the gateway's details service looks up
-    if (pending(payment) && response?.referenceNum && !payment.paymentRefNum)
-        call("update#" + P, {paymentId, paymentRefNum: response.referenceNum})
-    if (payment.statusId === "PmntAuthorized")
-        call("mantle.account.PaymentServices.capture#SinglePayment", {paymentId, operationKey: "pay-capture-" + paymentId})
-    payment = one(P, {paymentId})
-    const result = {attempt: attemptView(payment), resumed: false}
-    lib.complete(operation, P, paymentId, result)
-    return result
+    lib.complete(operation, P, paymentId, {attemptId: paymentId, resumed: false})
+    return {attemptId: paymentId, resumed: false, returnKey}
 }
+function startInvoicePayment(p) {
+    const checked = checkInvoice(p)
+    const key = operationId(p)
+    if (!(p.confirm === true || p.confirm === "true")) fail("Unprocessable", "Confirm the payment")
+    const gatewayId = payGateway(checked.organizationPartyId)
+    if (!gatewayId) fail("Unavailable", "Payment is not available for this invoice")
+    const begun = ec.service
+        .sync()
+        .throwOnError(true)
+        .name("mantle.account.PortalServices.begin#InvoicePayment")
+        .parameters({
+            input: {
+                invoiceId: checked.recordId,
+                organizationPartyId: checked.organizationPartyId,
+                siteId: p.siteId,
+                capabilityId: checked.capabilityId,
+                gatewayId,
+                operationId: key
+            }
+        })
+        .requireNewTransaction(true)
+        .call().result
+    const paymentId = begun.attemptId
+    if (!begun.returnKey)
+        return {attempt: attemptView(refresh(paymentId)), resumed: !!begun.resumed, alreadyApplied: !!begun.alreadyApplied}
+    // a new attempt: the gateway, under the payment's lock only
+    find(P, {paymentId}).forUpdate(true).one()
+    const returnUrl = apps.pageUrl(
+        p.siteId,
+        "billing",
+        "/InvoicePay/return?attemptId=" + encodeURIComponent(paymentId) + "&key=" + encodeURIComponent(begun.returnKey)
+    )
+    asPortalPayment(paymentId, () => {
+        const auth = call("mantle.account.PaymentServices.authorize#SinglePayment", {
+            paymentId,
+            operationKey: "pay-auth-" + paymentId,
+            returnUrl
+        })
+        const payment = one(P, {paymentId})
+        const response = auth.paymentGatewayResponseId && one(R, {paymentGatewayResponseId: auth.paymentGatewayResponseId})
+        // a pending answer keeps its reference, which the gateway's details service looks up
+        if (pending(payment) && response?.referenceNum && !payment.paymentRefNum)
+            call("update#" + P, {paymentId, paymentRefNum: response.referenceNum})
+        if (payment.statusId === "PmntAuthorized")
+            call("mantle.account.PaymentServices.capture#SinglePayment", {paymentId, operationKey: "pay-capture-" + paymentId})
+    })
+    // pending with nothing to look up and no page to go to: failed, not left to be resumed
+    const after = one(P, {paymentId})
+    if (pending(after) && !after.paymentRefNum && !redirectOf(paymentId)) call("update#" + P, {paymentId, statusId: "PmntCancelled"})
+    return {attempt: attemptView(one(P, {paymentId})), resumed: false}
+}
+// An attempt's outcome, for its invoice's link or contact, or for the reference its gateway return carries (returnKey),
+// which reads this attempt and its invoice only, on the site it was started from.
 function getPaymentResult(p) {
-    const payment = p.attemptId && one(P, {paymentId: p.attemptId})
-    if (!payment?.forInvoiceId) unavailable()
-    const checked = checkInvoice(p, payment.forInvoiceId)
-    const invoice = one(I, {invoiceId: checked.recordId})
-    if (!attempts(invoice, null).some(row => row.paymentId === payment.paymentId)) unavailable()
-    find(P, {paymentId: payment.paymentId}).forUpdate(true).one()
-    const after = refresh(one(P, {paymentId: payment.paymentId}))
-    return {attempt: attemptView(after), invoice: invoiceView(invoice.invoiceId)}
+    const row = p.attemptId && one(ATT, {paymentId: p.attemptId})
+    if (!row) unavailable()
+    if (p.returnKey) {
+        const organizationPartyId = served(p.siteId, "billing")
+        const invoice = one(I, {invoiceId: row.invoiceId})
+        if (
+            row.siteId !== p.siteId ||
+            row.returnKeyDigest !== ec.user.singleUseCodeHash(String(p.returnKey)) ||
+            invoice?.fromPartyId !== organizationPartyId
+        )
+            unavailable()
+    } else checkInvoice(p, row.invoiceId)
+    return {attempt: attemptView(refresh(row.paymentId)), invoice: invoiceView(row.invoiceId)}
+}
+// The job (resolve_PortalPayments): the portal payments still pending, oldest first, each asked of its gateway in its own
+// transaction; one that fails is named and the rest go on.
+function resolvePending(p) {
+    // the payments still promised or authorized, through their attempts (a payment once settled is not read again)
+    const ids = Array.from(
+        find(P)
+            .condition("statusId", "in", ["PmntPromised", "PmntAuthorized"])
+            .condition("paymentInstrumentEnumId", "PiCreditCard")
+            .condition("forInvoiceId", "is-not-null", null)
+            .orderBy("paymentId")
+            .limit(1000)
+            .list()
+    )
+        .map(row => row.paymentId)
+        .filter(paymentId => !!one(ATT, {paymentId}))
+        .slice(0, Number(p.limit || 200))
+    let resolved = 0,
+        failed = 0
+    for (const paymentId of ids) {
+        try {
+            ec.service
+                .sync()
+                .throwOnError(true)
+                .name("mantle.account.PortalServices.refresh#PortalPayment")
+                .parameters({input: {paymentId}})
+                .requireNewTransaction(true)
+                .call()
+            if (!pending(one(P, {paymentId}))) resolved++
+        } catch (error) {
+            ec.message.clearErrors()
+            failed++
+            ec.logger.error("Portal payment " + paymentId + " was not resolved: " + String(error.message).split("\n")[0])
+        }
+    }
+    return {checked: ids.length, resolved, failed}
 }
 
 // ---- Supplier: a purchase order's bill ----
@@ -306,6 +420,25 @@ function getSubmission(p) {
     return {order: orderView(checked.recordId), submissionList: list, submission}
 }
 // Stage the file under PASS's media root and scan it, as Forum stages an attachment; refuse it unless it is clean.
+// A bill file's type from its leading bytes; null for anything but a PDF, PNG or JPEG.
+const signatures = [
+    {type: "application/pdf", extension: "pdf", bytes: [0x25, 0x50, 0x44, 0x46, 0x2d]},
+    {type: "image/png", extension: "png", bytes: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]},
+    {type: "image/jpeg", extension: "jpg", bytes: [0xff, 0xd8, 0xff]}
+]
+function sniff(location) {
+    const stream = ec.resource.getLocationReference(location).openStream()
+    let head
+    try {
+        head = Array.from(stream.readAllBytes().slice(0, 8)).map(b => b & 0xff)
+    } finally {
+        stream.close()
+    }
+    return signatures.find(sig => sig.bytes.every((b, i) => head[i] === b)) || null
+}
+// Stage the file under PASS's media root and scan it, as Forum stages an attachment. Its leading bytes must be the type
+// it says it is, and it is kept under a name whose extension is that type's; anything else, or a file that is not
+// clean, is refused.
 function stage(file) {
     const maxBytes = 10485760
     if (!file || Number(file.size) < 1 || Number(file.size) > maxBytes) fail("Unprocessable", "Attach the bill, at most 10 MB")
@@ -316,6 +449,13 @@ function stage(file) {
     if (!scanner || !root) fail("Unavailable", "Bill files cannot be received now")
     const location = String(root).replace(/\/$/, "") + "/bills/" + ec.user.randomString(32)
     file.write(location)
+    const refuse = (message, why) => {
+        ec.resource.getLocationReference(location).delete()
+        if (why) ec.logger.warn("Supplier bill file refused: " + why)
+        fail("Unprocessable", message)
+    }
+    const kind = sniff(location)
+    if (!kind || kind.type !== type) refuse("The file is not the PDF, PNG or JPEG it says it is", "content is not " + type)
     let clean = false
     try {
         clean = ec.service.sync().throwOnError(true).name(scanner).parameters({location, mimeType: type}).call().clean === true
@@ -323,15 +463,12 @@ function stage(file) {
         ec.message.clearErrors()
         ec.logger.error("Supplier bill file at " + location + " could not be scanned; refused")
     }
-    if (!clean) {
-        ec.resource.getLocationReference(location).delete()
-        fail("Unprocessable", "The file could not be accepted; send another copy")
-    }
-    return {
-        location,
-        filename: String(file.name || "bill").replace(/[^a-zA-Z0-9._ -]/g, "_").slice(0, 100),
-        byteSize: Number(file.size)
-    }
+    if (!clean) refuse("The file could not be accepted; send another copy")
+    const base = String(file.name || "bill")
+        .replace(/\.[^.]*$/, "")
+        .replace(/[^a-zA-Z0-9_ -]/g, "_")
+        .slice(0, 90) || "bill"
+    return {location, filename: base + "." + kind.extension, byteSize: Number(file.size)}
 }
 function submitSupplierBill(p) {
     const checked = checkOrder(p)
@@ -353,6 +490,12 @@ function submitSupplierBill(p) {
         } catch (error) {
             fail("Unprocessable", "Enter the bill's amount in " + order.currencyUomId)
         }
+    let invoiceDate = null
+    if (p.invoiceDate != null && String(p.invoiceDate).trim() !== "") {
+        const millis = lib.ms(p.invoiceDate)
+        if (millis == null || !Number.isFinite(millis)) fail("Unprocessable", "Enter the bill date as a date")
+        invoiceDate = new Date(millis)
+    }
     const staged = stage(p.file)
     let imported
     try {
@@ -361,7 +504,7 @@ function submitSupplierBill(p) {
             .execute("portalBill", {
                 ...scope,
                 referenceNumber: reference,
-                invoiceDate: p.invoiceDate ? new Date(lib.ms(p.invoiceDate)) : null,
+                invoiceDate,
                 amount,
                 currencyUomId: order.currencyUomId,
                 orderId: checked.recordId,
@@ -414,6 +557,9 @@ function appReadiness(p) {
 }
 
 const operations = {
+    beginPayment,
+    resolvePending,
+    refreshPayment: p => ({statusId: refresh(p.paymentId).statusId}),
     getInvoice,
     findInvoices,
     issueInvoiceAccess,

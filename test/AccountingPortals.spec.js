@@ -403,3 +403,243 @@ feature("Billing and Supplier mounts take an internal organization from an opera
         unready.find(c => c.name == "billing payment gateway").ready == false
     }
 })
+
+feature("a contact grant holds for its organization's Billing app only; another organization's site, the Supplier app and a CRM contact relationship give nothing", {
+    when() {
+        const c = settlement().call
+        // an invoice of the other organization to the same customer, and a purchase order the customer supplies
+        const otherOrgInvoice = settlement().invoice({...other, customer: f.customer}, "15")
+        const ownInvoice = invoice("16")
+        c("create#mantle.order.OrderHeader", {orderId: "ACCT_PORTAL_PO_CUST", statusId: "OrderApproved", currencyUomId: "USD"})
+        c("create#mantle.order.OrderPart", {orderId: "ACCT_PORTAL_PO_CUST", orderPartSeqId: "01", vendorPartyId: f.customer, customerPartyId: f.org})
+        // a person who is only a CRM contact of the customer
+        c("create#mantle.party.Party", {partyId: "ACCT_PORTAL_CRM", partyTypeEnumId: "PtyPerson"})
+        c("create#moqui.security.UserAccount", {
+            userId: "ACCT_PORTAL_CRM",
+            username: "acct.portal.crm",
+            partyId: "ACCT_PORTAL_CRM",
+            currentPassword: "16ac58bbfa332c1c55bd98b53e60720bfa90d394",
+            passwordHashType: "SHA"
+        })
+        c("create#mantle.party.PartyRelationship", {
+            fromPartyId: "ACCT_PORTAL_CRM",
+            toPartyId: f.customer,
+            relationshipTypeEnumId: "PrtContact",
+            fromDate: 0
+        })
+        login("acct.portal.payer")
+        const own = portal("get#Invoice", {siteId: site, invoiceId: ownInvoice})
+        const otherOrg = portal("get#Invoice", {siteId: otherSite, invoiceId: otherOrgInvoice})
+        const supplierApp = portal("get#Submission", {siteId: site, orderId: "ACCT_PORTAL_PO_CUST"})
+        login("acct.portal.crm")
+        const crm = portal("get#Invoice", {siteId: site, invoiceId: ownInvoice})
+        const crmList = portal("find#Invoices", {siteId: site})
+        return {own, otherOrg, supplierApp, crm, crmList}
+    },
+    then({own, otherOrg, supplierApp, crm, crmList}) {
+        !!own.invoice
+        otherOrg.errorKind == "NotFound"
+        supplierApp.errorKind == "NotFound"
+        crm.errorKind == "NotFound"
+        crmList.invoiceList.length == 0
+    }
+})
+
+feature("the posting guard lets only the marked portal payment through: another source with no user, or with a public account, is refused", {
+    when() {
+        const c = settlement().call
+        // promised payments of another organization, delivered below by no user and by a public account
+        const promised = () =>
+            c("mantle.account.PaymentServices.create#Payment", {
+                fromPartyId: other.customer,
+                toPartyId: other.org,
+                paymentTypeEnumId: "PtInvoicePayment",
+                paymentInstrumentEnumId: "PiCompanyCheck",
+                amount: "12",
+                amountUomId: "USD",
+                statusId: "PmntPromised",
+                effectiveDate: ec.user.nowTimestamp
+            }).paymentId
+        const ids = [promised(), promised(), promised()]
+        const unmarked = () =>
+            settlement().rejected("update#mantle.account.payment.Payment", {
+                paymentId: ids.shift(),
+                statusId: "PmntDelivered",
+                effectiveDate: ec.user.nowTimestamp
+            })
+        logout()
+        ec.artifactExecution.disableAuthz()
+        const noUser = unmarked()
+        // a marker naming another payment does not help either
+        ec.context.sharedMap["mantle.portalPaymentId"] = "ACCT_PORTAL_NOT_THIS"
+        const otherMarked = unmarked()
+        delete ec.context.sharedMap["mantle.portalPaymentId"]
+        login("acct.portal.payer")
+        ec.artifactExecution.disableAuthz()
+        const publicAccount = unmarked()
+        return {noUser, otherMarked, publicAccount}
+    },
+    then({noUser, otherMarked, publicAccount}) {
+        noUser.includes("Posting organization is not available")
+        otherMarked.includes("Posting organization is not available")
+        publicAccount.includes("Posting organization is not available")
+    }
+})
+
+feature("pending attempts resolve: the invoice page asks the gateway, the job settles a payer who never returns, the return's reference reads without the link, and an attempt with nothing to ask fails", {
+    when() {
+        const pageId = invoice("41"),
+            jobId = invoice("42"),
+            stuckId = invoice("43")
+        login(f.users.ar)
+        const token = id => access("create#AccessCapability", {recordType: "Invoice", recordId: id, scopes: "InvoicePay"}).token
+        const pageToken = token(pageId),
+            jobToken = token(jobId),
+            stuckToken = token(stuckId)
+        login("john.doe")
+        payThrough("ACCT_PORTAL_HOSTED")
+        logout()
+        const pageStart = portal("start#InvoicePayment", {siteId: site, token: pageToken, operationId: "portal-res-0001", confirm: true})
+        const pageView = portal("get#Invoice", {siteId: site, token: pageToken})
+        const jobStart = portal("start#InvoicePayment", {siteId: site, token: jobToken, operationId: "portal-res-0002", confirm: true})
+        const returnKey = decodeURIComponent(/[?&]key=([^&]+)/.exec(jobStart.attempt.redirectUrl)[1])
+        const wrongKey = portal("get#PaymentResult", {siteId: site, attemptId: jobStart.attempt.attemptId, returnKey: "x".repeat(40)})
+        login("john.doe")
+        ec.artifactExecution.disableAuthz()
+        const job = settlement().call("mantle.account.PortalServices.resolve#PortalPayments", {})
+        logout()
+        const byKey = portal("get#PaymentResult", {siteId: site, attemptId: jobStart.attempt.attemptId, returnKey})
+        login("john.doe")
+        payThrough("ACCT_PORTAL_WAIT")
+        logout()
+        const stuckStart = portal("start#InvoicePayment", {siteId: site, token: stuckToken, operationId: "portal-res-0003", confirm: true})
+        login("john.doe")
+        ec.artifactExecution.disableAuthz()
+        // the gateway gave neither a reference to ask about nor a page to go to
+        settlement().call("update#mantle.account.payment.Payment", {paymentId: stuckStart.attempt.attemptId, paymentRefNum: null})
+        for (const row of settlement().lib.rows("mantle.account.method.PaymentGatewayResponse", {paymentId: stuckStart.attempt.attemptId}))
+            settlement().call("update#mantle.account.method.PaymentGatewayResponse", {
+                paymentGatewayResponseId: row.paymentGatewayResponseId,
+                redirectUrl: null
+            })
+        logout()
+        const stuckView = portal("get#Invoice", {siteId: site, token: stuckToken})
+        login("john.doe")
+        ec.artifactExecution.disableAuthz()
+        const status = paymentId => one("mantle.account.payment.Payment", {paymentId}).statusId
+        return {
+            pageStart,
+            pageView,
+            job,
+            wrongKey,
+            byKey,
+            stuckView,
+            jobStatus: status(jobStart.attempt.attemptId),
+            stuckStatus: status(stuckStart.attempt.attemptId)
+        }
+    },
+    then({pageStart, pageView, job, wrongKey, byKey, stuckView, jobStatus, stuckStatus}) {
+        pageStart.attempt.state == "pending"
+        pageView.attempt == null
+        pageView.invoice.statusText == "Paid"
+        job.resolved >= 1
+        jobStatus == "PmntDelivered"
+        wrongKey.errorKind == "NotFound"
+        byKey.attempt.state == "paid"
+        byKey.invoice.statusText == "Paid"
+        stuckStatus == "PmntCancelled"
+        stuckView.attempt == null
+        stuckView.capabilities.canPay == true
+    }
+})
+
+feature("a pay link never shows or captures a card authorization made in Accounting for the same invoice", {
+    when() {
+        const invoiceId = invoice("33")
+        const c = settlement().call
+        const bossPayment = c("mantle.account.PaymentServices.create#Payment", {
+            fromPartyId: f.customer,
+            toPartyId: f.org,
+            paymentTypeEnumId: "PtInvoicePayment",
+            paymentInstrumentEnumId: "PiCreditCard",
+            paymentGatewayConfigId: "ACCT_PORTAL_HOSTED",
+            forInvoiceId: invoiceId,
+            amount: "33",
+            amountUomId: "USD",
+            statusId: "PmntPromised",
+            paymentRefNum: "BOSS-AUTH",
+            effectiveDate: ec.user.nowTimestamp
+        }).paymentId
+        c("update#mantle.account.payment.Payment", {paymentId: bossPayment, statusId: "PmntAuthorized"})
+        login(f.users.ar)
+        const token = access("create#AccessCapability", {recordType: "Invoice", recordId: invoiceId, scopes: "InvoicePay"}).token
+        login("john.doe")
+        payThrough("ACCT_PORTAL_WAIT")
+        logout()
+        const shown = portal("get#Invoice", {siteId: site, token})
+        const bossResult = portal("get#PaymentResult", {siteId: site, token, attemptId: bossPayment})
+        const started = portal("start#InvoicePayment", {siteId: site, token, operationId: "portal-boss-0001", confirm: true})
+        login("john.doe")
+        ec.artifactExecution.disableAuthz()
+        return {bossPayment, shown, bossResult, started, after: one("mantle.account.payment.Payment", {paymentId: bossPayment})}
+    },
+    then({bossPayment, shown, bossResult, started, after}) {
+        shown.attempt == null
+        bossResult.errorKind == "NotFound"
+        started.attempt.attemptId != bossPayment
+        after.statusId == "PmntAuthorized"
+    }
+})
+
+feature("a new pay link ends the invoice's earlier ones, an expiry is capped at a year, and an issuer revokes a link to a cancelled invoice", {
+    when() {
+        const invoiceId = invoice("27")
+        login(f.users.ar)
+        const first = settlement().call("mantle.account.PortalServices.issue#InvoiceAccess", {input: {invoiceId}}).result
+        const second = settlement().call("mantle.account.PortalServices.issue#InvoiceAccess", {input: {invoiceId}}).result
+        const far = access("create#AccessCapability", {
+            recordType: "Invoice",
+            recordId: invoiceId,
+            scopes: "InvoicePay",
+            thruDate: new Date(Date.now() + 5 * 366 * 86400000)
+        })
+        login("john.doe")
+        ec.artifactExecution.disableAuthz()
+        settlement().call("update#mantle.account.invoice.Invoice", {invoiceId, statusId: "InvoiceCancelled"})
+        login(f.users.ar)
+        const revoked = access("revoke#AccessCapability", {capabilityId: far.capabilityId})
+        login("john.doe")
+        ec.artifactExecution.disableAuthz()
+        const row = id => one("mantle.party.ExternalAccessCapability", {capabilityId: id})
+        return {first: row(first.capabilityId), second: row(second.capabilityId), far: row(far.capabilityId), revoked}
+    },
+    then({first, second, far, revoked}) {
+        first.revokedDate != null
+        second.revokedDate == null
+        Number(far.thruDate) <= Date.now() + 367 * 86400000
+        revoked.revoked == true
+    }
+})
+
+feature("token lookups count before the lookup: past the limit even a good token is refused, with no hit or miss told", {
+    when() {
+        const invoiceId = invoice("11")
+        login(f.users.ar)
+        const token = access("create#AccessCapability", {recordType: "Invoice", recordId: invoiceId, scopes: "InvoicePay"}).token
+        logout()
+        let refusedAt = null
+        for (let i = 0; i < 150 && refusedAt == null; i++) {
+            const out = portal("get#Invoice", {siteId: site, token: i % 2 ? token : "y".repeat(48)})
+            if (out.errorKind == "Tarpit") refusedAt = i
+        }
+        const good = portal("get#Invoice", {siteId: site, token})
+        const bad = portal("get#Invoice", {siteId: site, token: "z".repeat(48)})
+        login("john.doe")
+        return {refusedAt, good, bad}
+    },
+    then({refusedAt, good, bad}) {
+        refusedAt != null
+        good.errorKind == "Tarpit"
+        bad.errorKind == "Tarpit"
+    }
+})

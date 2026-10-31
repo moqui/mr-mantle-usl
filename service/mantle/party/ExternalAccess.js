@@ -9,7 +9,7 @@ const C = "mantle.party.ExternalAccessCapability"
 const issuedInvoice = ["InvoiceFinalized", "InvoiceSent", "InvoiceAcked", "InvoicePmtRecvd"]
 const closedOrder = ["OrderOpen", "OrderRequested", "OrderProposed", "OrderRejected", "OrderCancelled"]
 const internal = partyId => !!partyId && !!one("mantle.party.PartyRole", {partyId, roleTypeId: "OrgInternal"})
-// Each record type: what it is for an outside party (organization, party, revision) when it may be reached at all, and
+// Each record type: what it is for an outside party (organization, party) when it may be reached at all, and
 // the permission to issue or revoke its capabilities.
 const records = {
     Invoice: {
@@ -20,7 +20,7 @@ const records = {
             const invoice = one("mantle.account.invoice.Invoice", {invoiceId: recordId})
             if (!invoice || !issuedInvoice.includes(invoice.statusId) || !internal(invoice.fromPartyId)) return null
             if (internal(invoice.toPartyId)) return null
-            return {organizationPartyId: invoice.fromPartyId, partyId: invoice.toPartyId, revision: String(lib.ms(invoice.lastUpdatedStamp))}
+            return {organizationPartyId: invoice.fromPartyId, partyId: invoice.toPartyId}
         }
     },
     Order: {
@@ -37,8 +37,7 @@ const records = {
             return {
                 organizationPartyId: part.customerPartyId,
                 partyId: part.vendorPartyId,
-                orderPartSeqId: part.orderPartSeqId,
-                revision: String(lib.ms(order.lastUpdatedStamp))
+                orderPartSeqId: part.orderPartSeqId
             }
         }
     }
@@ -74,16 +73,17 @@ function create(p) {
         denied("SCOPE_INVALID", "Choose what the link allows")
     const record = recordOf(p.recordType, p.recordId)
     if (!record) denied("RECORD_UNAVAILABLE", "This record cannot be shared outside the organization now")
+    // a link lasts validDays (60 by default) or to thruDate, never more than 366 days
     const days = Math.min(Math.max(Number(p.validDays || 60), 1), 366)
-    const thruDate = p.thruDate ? new Date(lib.ms(p.thruDate)) : new Date(Date.now() + days * 86400000)
-    if (lib.ms(thruDate) <= Date.now()) denied("EXPIRY_INVALID", "Choose an expiry in the future")
+    const latest = Date.now() + 366 * 86400000
+    const thruDate = new Date(p.thruDate ? Math.min(lib.ms(p.thruDate), latest) : Date.now() + days * 86400000)
+    if (!(lib.ms(thruDate) > Date.now())) denied("EXPIRY_INVALID", "Choose an expiry in the future")
     const token = ec.user.randomString(48)
     const out = call("create#" + C, {
         organizationPartyId: record.organizationPartyId,
         partyId: record.partyId,
         recordType: p.recordType,
         recordId: p.recordId,
-        recordRevision: record.revision,
         scopes: scopes.join(","),
         tokenDigest: ec.user.singleUseCodeHash(token),
         fromDate: ec.user.nowTimestamp,
@@ -96,7 +96,8 @@ function create(p) {
     const url = siteId ? apps.pageUrl(siteId, kind.page.app, kind.page.path + encodeURIComponent(token)) : null
     return {capabilityId: out.capabilityId, token, url, thruDate, organizationPartyId: record.organizationPartyId}
 }
-// Where a failed token lookup comes from: a registered PASS deployment forwards its browser's address.
+// Who is looking a token up: a registered PASS deployment forwards its browser's address. This is Account.js's
+// requesterKey, which the framework does not export (reported for the framework).
 function requesterKey() {
     const request = ec.web?.request
     if (!request) return "service"
@@ -107,16 +108,15 @@ function requesterKey() {
         return "client:" + clientId + ":" + forwarded.slice(0, 64)
     return request.remoteAddr || "service"
 }
-// The capability a token names while it is in effect, or null. Misses are limited per requester, as PASS limits sign-in.
+// The capability a token names while it is in effect, or null. Every lookup counts against the requester's limit
+// before the lookup, so a requester over it is refused whether its token is good or not.
+const TOKEN_LOOKUPS = 100
 function tokenCapability(token) {
-    const text = String(token || "")
-    const row = text.length >= 32 && text.length <= 128 ? one(C, {tokenDigest: ec.user.singleUseCodeHash(text)}) : null
-    if (row && !row.revokedDate && lib.entityLib.active(row)) return row
     const allowed = ec.service
         .sync()
         .throwOnError(true)
         .name("org.moqui.public.AccountServices.record#Attempt")
-        .parameters({input: {key: "access-token:" + requesterKey(), limit: 30, windowMillis: 600000}})
+        .parameters({input: {key: "access-token:" + requesterKey(), limit: TOKEN_LOOKUPS, windowMillis: 600000}})
         .requireNewTransaction(true)
         .call().result.allowed
     if (!allowed) {
@@ -124,17 +124,20 @@ function tokenCapability(token) {
         error.moquiErrorKind = "Tarpit"
         throw error
     }
-    return null
+    const text = String(token || "")
+    const row = text.length >= 32 && text.length <= 128 ? one(C, {tokenDigest: ec.user.singleUseCodeHash(text)}) : null
+    return row && !row.revokedDate && lib.entityLib.active(row) ? row : null
 }
-// A signed-in user's party is a contact of the outside party (PrtContact, in effect), as an invitation made it.
-function contactOf(partyId) {
+// A signed-in user's contact grant (ExternalAccessContact, in effect): made by redeeming an invitation for one app of
+// one organization, for one outside party. A CRM contact relationship gives no portal access.
+const G = "mantle.party.ExternalAccessContact"
+function grants(organizationPartyId, app) {
     const userPartyId = ec.user.userAccount?.partyId
-    if (!userPartyId || !partyId) return false
-    return rows("mantle.party.PartyRelationship", {
-        fromPartyId: userPartyId,
-        toPartyId: partyId,
-        relationshipTypeEnumId: "PrtContact"
-    }).some(row => lib.entityLib.active(row))
+    if (!userPartyId || !organizationPartyId || !app) return []
+    return rows(G, {partyId: userPartyId, organizationPartyId, app}).filter(row => lib.entityLib.active(row))
+}
+function contactOf(partyId, organizationPartyId, app) {
+    return !!partyId && grants(organizationPartyId, app).some(row => row.outsidePartyId === partyId)
 }
 // What a page may reach: a token's record within its scope, or a record whose outside party the signed-in user is a
 // contact of. organizationPartyId, when given, is the organization the page serves (its app mount's target).
@@ -155,46 +158,60 @@ function check(p) {
         if (!record || record.organizationPartyId !== row.organizationPartyId || record.partyId !== row.partyId) unavailable()
         return {via: "token", capabilityId: row.capabilityId, recordId: row.recordId, ...record}
     }
+    // a contact needs the organization the page serves, and a grant for this record type's app there
     const record = recordOf(p.recordType, p.recordId)
-    if (!record || (p.organizationPartyId && record.organizationPartyId !== p.organizationPartyId) || !contactOf(record.partyId))
+    if (
+        !record ||
+        !p.organizationPartyId ||
+        record.organizationPartyId !== p.organizationPartyId ||
+        !contactOf(record.partyId, p.organizationPartyId, kind.page.app)
+    )
         unavailable()
     return {via: "contact", capabilityId: null, recordId: p.recordId, ...record}
 }
-// The outside parties a signed-in user is a contact of.
-function contactParties() {
-    const userPartyId = ec.user.userAccount?.partyId
-    if (!userPartyId) return []
-    return rows("mantle.party.PartyRelationship", {fromPartyId: userPartyId, relationshipTypeEnumId: "PrtContact"})
-        .filter(row => lib.entityLib.active(row))
-        .map(row => row.toPartyId)
+// The outside parties a signed-in user is a contact of, for an app of an organization.
+function contactParties(organizationPartyId, app) {
+    return [...new Set(grants(organizationPartyId, app).map(row => row.outsidePartyId))]
+}
+// The issuer's permission for a capability's own organization, so a link to a record since cancelled can be revoked.
+function requireCapabilityIssuer(row) {
+    const kind = records[row.recordType]
+    if (!kind) denied("RECORD_TYPE_INVALID", "External access is not available for this record")
+    lib.organization(row.organizationPartyId, kind.permission)
 }
 function revoke(p) {
     const row = find(C, {capabilityId: p.capabilityId}).forUpdate(true).one()
     if (!row) denied("CAPABILITY_UNAVAILABLE", "This link is not available")
-    requireIssuer(row.recordType, row.recordId)
+    requireCapabilityIssuer(row)
     if (!row.revokedDate)
         call("update#" + C, {capabilityId: row.capabilityId, revokedDate: ec.user.nowTimestamp, revokedByUserId: ec.user.userId})
     return {capabilityId: row.capabilityId, revoked: true}
 }
+// End a record's links in effect for a scope; the caller has checked who may (a new pay link replaces the earlier ones).
+function revokeActive(recordType, recordId, scope) {
+    for (const row of rows(C, {recordType, recordId}))
+        if (!row.revokedDate && lib.entityLib.active(row) && scopeList(row.scopes).includes(scope))
+            call("update#" + C, {capabilityId: row.capabilityId, revokedDate: ec.user.nowTimestamp, revokedByUserId: ec.user.userId})
+}
 // The links of a record, newest first, without their tokens.
 function list(p) {
-    requireIssuer(p.recordType, p.recordId)
+    const found = Array.from(find(C, {recordType: p.recordType, recordId: p.recordId}).orderBy("-fromDate").limit(50).list())
+    if (found.length) requireCapabilityIssuer(found[0])
+    else requireIssuer(p.recordType, p.recordId)
     const now = Date.now()
-    return Array.from(find(C, {recordType: p.recordType, recordId: p.recordId}).orderBy("-fromDate").limit(50).list()).map(
-        row => ({
-            capabilityId: row.capabilityId,
-            scopes: row.scopes,
-            fromDate: row.fromDate,
-            thruDate: row.thruDate,
-            revokedDate: row.revokedDate,
-            active: !row.revokedDate && lib.ms(row.thruDate) > now
-        })
-    )
+    return found.map(row => ({
+        capabilityId: row.capabilityId,
+        scopes: row.scopes,
+        fromDate: row.fromDate,
+        thruDate: row.thruDate,
+        revokedDate: row.revokedDate,
+        active: !row.revokedDate && lib.ms(row.thruDate) > now
+    }))
 }
 // An invitation to an app's pages bound to an outside party (a customer for Billing, a supplier for Supplier): an
 // internal user with the record kind's permission in the organization the app serves. Redeeming it (redeem#Invitation)
-// makes the account's party a contact of that party.
-const appKinds = {billing: {permission: "RECEIVABLE_EDIT", role: "Customer"}, supplier: {permission: "PAYABLE_EDIT", role: "Supplier"}}
+// gives the account's party a contact grant for that app, organization and party.
+const appKinds = {billing: {permission: "RECEIVABLE_EDIT"}, supplier: {permission: "PAYABLE_EDIT"}}
 function invite(p) {
     const app = appKinds[p.app]
     if (!app) denied("APP_INVALID", "Choose the app to invite the contact to")
@@ -227,23 +244,27 @@ function invite(p) {
         invitationUrl: apps.pageUrl(siteId, "account", "/Invitation?token=" + encodeURIComponent(token))
     }
 }
-// On redeem: the account's party becomes a contact of each outside party the invitation names.
+// On redeem: the account's party gets a contact grant for each app, organization and outside party the invitation names.
 function bindContact(partyId, scopes) {
     for (const scope of Array.isArray(scopes) ? scopes : []) {
-        if (!scope?.partyId || !appKinds[scope.app]) continue
-        const existing = rows("mantle.party.PartyRelationship", {
-            fromPartyId: partyId,
-            toPartyId: scope.partyId,
-            relationshipTypeEnumId: "PrtContact"
-        }).some(row => lib.entityLib.active(row))
-        if (!existing)
-            call("create#mantle.party.PartyRelationship", {
-                fromPartyId: partyId,
-                toPartyId: scope.partyId,
-                relationshipTypeEnumId: "PrtContact",
-                toRoleTypeId: appKinds[scope.app].role,
-                fromDate: ec.user.nowTimestamp
-            })
+        if (!scope?.partyId || !scope.organizationPartyId || !appKinds[scope.app]) continue
+        const key = {partyId, outsidePartyId: scope.partyId, organizationPartyId: scope.organizationPartyId, app: scope.app}
+        if (!rows(G, key).some(row => lib.entityLib.active(row)))
+            call("create#" + G, {...key, fromDate: ec.user.nowTimestamp})
     }
 }
-;({records, recordOf, requireIssuer, create, check, tokenCapability, contactOf, contactParties, revoke, list, invite, bindContact})
+;({
+    records,
+    recordOf,
+    requireIssuer,
+    create,
+    check,
+    tokenCapability,
+    contactOf,
+    contactParties,
+    revoke,
+    revokeActive,
+    list,
+    invite,
+    bindContact
+})

@@ -941,7 +941,7 @@
     },
     getPaymentResult: {
         service: 'mantle.account.PortalServices.get#PaymentResult',
-        fields: ['siteId', 'attemptId', 'token'],
+        fields: ['siteId', 'attemptId', 'token', 'returnKey'],
     },
     getSubmission: {
         service: 'mantle.account.PortalServices.get#Submission',

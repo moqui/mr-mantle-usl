@@ -54,7 +54,8 @@ function pageUrl(siteId, app, path) {
     if (!host || !m) return null
     return 'https://' + host.hostname + m.base + path
 }
-/* The published sites whose enabled mount of an app targets a record, first by site id. */
+/* The published sites with a canonical host whose enabled mount of an app targets a record, first by site id: the sites
+ * a link to the record can be built on. */
 function sitesFor(app, targetId) {
     return Array.from(
         ec.entity
@@ -70,6 +71,11 @@ function sitesFor(app, targetId) {
                 ec.entity
                     .find('mantle.public.PublicSite')
                     .condition({ siteId, state: 'published' })
+                    .disableAuthz()
+                    .count() > 0 &&
+                ec.entity
+                    .find('mantle.public.PublicSiteHost')
+                    .condition({ siteId, canonical: 'Y' })
                     .disableAuthz()
                     .count() > 0,
         )

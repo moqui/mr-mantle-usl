@@ -40,6 +40,21 @@ along with this software (see the LICENSE.md file). If not, see
             <index-field name="referenceNumber"/></index>
         <index name="SUPP_BILL_SUB_OP"><index-field name="operationId"/></index>
     </entity>
+    <entity entity-name="PortalPaymentAttempt" package="mantle.account.payment" cache="never">
+        <description>A payment started from a Billing page (start#InvoicePayment): its invoice, the site and the link or
+            contact it came from, and the digest of the reference the gateway's return carries. The pages show, refresh
+            and capture only these payments, never one made in Accounting for the same invoice.</description>
+        <field name="paymentId" type="id" is-pk="true"/>
+        <field name="invoiceId" type="id"/>
+        <field name="siteId" type="id"/>
+        <field name="capabilityId" type="id"/>
+        <field name="contactPartyId" type="id"/>
+        <field name="returnKeyDigest" type="text-medium"/>
+        <field name="createdDate" type="date-time"/>
+        <relationship type="one" related="mantle.account.payment.Payment"/>
+        <relationship type="one" related="mantle.account.invoice.Invoice"/>
+        <index name="PORTAL_PAY_INVOICE"><index-field name="invoiceId"/></index>
+    </entity>
     <extend-entity entity-name="PartyAcctgPreference" package="mantle.ledger.config">
         <field name="invoicePayGatewayConfigId" type="id" enable-audit-log="update">
             <description>The gateway a customer pays an invoice through on the organization's Billing pages; one of its
