@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<!-- Accounting setup and activation (mantle.ledger.SetupServices): the chart template role, the opening line and
+    transaction types, and the migration clearing account type a template maps. -->
+<entity-facade-xml type="seed">
+    <!-- A chart template: an organization with no transactions holding the account links, type defaults and mappings
+        init#PartyAccountingConfiguration copies into a new organization (sourcePartyId). Mantle's installed chart ships
+        one, DefaultSettings. -->
+    <mantle.party.RoleType roleTypeId="OrgAccountingTemplate" description="Accounting chart template"/>
+    <!-- the line of an open invoice or bill imported at cutover, ItemOpeningBalance, is in ItemTypeData.xml -->
+    <!-- the opening trial balance activation posts -->
+    <moqui.basic.Enumeration enumId="AttOpeningBalance" enumTypeId="AcctgTransType" description="Opening balance"/>
+    <!-- the account opening items and balances post against, which nets to zero once accounting is activated -->
+    <moqui.basic.Enumeration enumId="GatMigrationClearing" enumTypeId="GlAccountType" description="Migration clearing"/>
+</entity-facade-xml>

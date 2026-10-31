@@ -1422,6 +1422,10 @@ along with this software (see the LICENSE.md file). If not, see
         glAccountId="911000000" glAccountTypeEnumId="" glResourceTypeEnumId="GlrtMoney" parentGlAccountId="910000000"/>
     <mantle.ledger.account.GlAccount accountName="Transfer Clearing - Liability" description="" glAccountClassEnumId="LIABILITY"
         glAccountId="912000000" glAccountTypeEnumId="" glResourceTypeEnumId="GlrtMoney" parentGlAccountId="910000000"/>
+    <!-- the opening items and balances of accounting setup post against it; it nets to zero once activated -->
+    <mantle.ledger.account.GlAccount accountName="Migration Clearing" description="" glAccountClassEnumId="ASSET"
+        glAccountId="913000000" glAccountTypeEnumId="GatMigrationClearing" glResourceTypeEnumId="GlrtMoney"
+        parentGlAccountId="910000000"/>
 
 
 
@@ -1432,6 +1436,8 @@ along with this software (see the LICENSE.md file). If not, see
     <mantle.party.Party partyId="DefaultSettings" partyTypeEnumId="PtyOrganization"/>
     <mantle.party.Organization organizationName="Default Accounting, etc Settings" partyId="DefaultSettings"/>
     <!-- Don't set as OrgInternal so it doesn't show up with others: <mantle.party.PartyRole partyId="DefaultSettings" roleTypeId="OrgInternal"/> -->
+    <!-- the chart template Accounting setup offers (mantle.ledger.SetupServices.store#SetupRun) -->
+    <mantle.party.PartyRole partyId="DefaultSettings" roleTypeId="OrgAccountingTemplate"/>
 
     <mantle.ledger.transaction.GlJournal glJournalId="DefaultSettingsError" glJournalName="Default Settings Error Journal"
             organizationPartyId="DefaultSettings" glJournalTypeEnumId="GLJRNL_ERROR" isPosted="N"/>
@@ -1653,6 +1659,10 @@ along with this software (see the LICENSE.md file). If not, see
     <mantle.ledger.account.GlAccountOrganization glAccountId="671800000" organizationPartyId="DefaultSettings"/>
     <mantle.ledger.account.GlAccountOrganization glAccountId="672000000" organizationPartyId="DefaultSettings"/>
     <mantle.ledger.account.GlAccountOrganization glAccountId="673500000" organizationPartyId="DefaultSettings"/>
+    <!-- the migration clearing account of accounting setup -->
+    <mantle.ledger.account.GlAccountOrganization glAccountId="913000000" organizationPartyId="DefaultSettings"/>
+    <mantle.ledger.config.GlAccountTypeDefault glAccountId="913000000" glAccountTypeEnumId="GatMigrationClearing"
+            organizationPartyId="DefaultSettings"/>
 
     <mantle.ledger.config.GlAccountTypeDefault glAccountId="121000000" glAccountTypeEnumId="GatAccountsReceivable" organizationPartyId="DefaultSettings"/>
     <mantle.ledger.config.GlAccountTypeDefault glAccountId="121500000" glAccountTypeEnumId="GatInterestIncomeRec" organizationPartyId="DefaultSettings"/>

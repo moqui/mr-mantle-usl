@@ -87,6 +87,8 @@ function importRates(p) {
 }
 const operations = {importRates}
 ;({
+    // the CSV reader, also for accounting setup's trial balance and open items (AccountingActivation.js)
+    csv,
     execute: (op, p) => {
         if (!operations[op]) throw new Error("Unknown currency operation " + op)
         return operations[op](p)

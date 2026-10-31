@@ -135,7 +135,24 @@ along with this software (see the LICENSE.md file). If not, see
                 <set field="record.organizationPartyId" from="organizationPartyId"/>
                 <entity-create value-field="record"/>
             </iterate>
-            <!-- TODO: CreditCardTypeGlAccount, GlAccountTypePartyDefault, ProductCategoryGlAccount, ProductGlAccount, TaxAuthorityGlAccount, VarianceReasonGlAccount -->
+            <!-- copy a template's inventory variance reason and tax authority accounts (an accounting setup chart template,
+                SetupServices.store#SetupRun) -->
+            <entity-find entity-name="mantle.ledger.config.VarianceReasonGlAccount" list="recordList">
+                <econdition field-name="organizationPartyId" from="sourcePartyId"/>
+            </entity-find>
+            <iterate list="recordList" entry="record">
+                <set field="record.organizationPartyId" from="organizationPartyId"/>
+                <entity-create value-field="record"/>
+            </iterate>
+            <entity-find entity-name="mantle.ledger.config.TaxAuthorityGlAccount" list="recordList">
+                <econdition field-name="organizationPartyId" from="sourcePartyId"/>
+            </entity-find>
+            <iterate list="recordList" entry="record">
+                <set field="record.organizationPartyId" from="organizationPartyId"/>
+                <entity-create value-field="record"/>
+            </iterate>
+            <!-- TODO: CreditCardTypeGlAccount (copying it would change the card payment postings of organizations set up
+                before), GlAccountTypePartyDefault, ProductCategoryGlAccount, ProductGlAccount (specific to their records) -->
             <!-- setup mantle.party.time.TimePeriod for FiscalMonth, FiscalQuarter, FiscalYear -->
             <if condition="startYear">
                 <then>
