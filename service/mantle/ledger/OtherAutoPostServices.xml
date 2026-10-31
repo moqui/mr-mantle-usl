@@ -14,14 +14,57 @@ along with this software (see the LICENSE.md file). If not, see
 -->
 <services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
 
-    <service verb="post" noun="WorkEffortCost">
+    <service verb="post" noun="WorkEffortCost" allow-remote="false">
+        <description>Project cost posting, for an organization with projectCostPostingEnabled: the project time of a
+            timesheet (or of time entries, or of a project's work) at each entry's cost rate, debiting project cost
+            (GatProjectLaborCost) and crediting labor clearing (GatLaborClearing), with the project on the transaction.
+            Each entry's postings are kept on its PostingOperation ("wec:" and the entry id); what should be posted (the
+            cost while the timesheet is approved, else nothing) less what was posted is posted on today's book day, so an
+            undone approval or a changed entry posts a reversing delta. Production work and an outside vendor's time are
+            not posted. A posting that fails goes to the error journal with its reason, and the entry waits on it.
+            Called by approve#Timesheet, reopen#Timesheet, store#TimeEntry and delete#TimeEntry, and per result by the
+            project cost period run; it checks no permission of its own.</description>
         <in-parameters>
-            <parameter name="workEffortId" required="true"/>
-            <!-- TODO: other parameter needed? cost component concept has changed -->
+            <parameter name="timesheetId"/>
+            <parameter name="timeEntryIdList" type="List"/>
+            <parameter name="workEffortId"><description>A project: all of its time</description></parameter>
+            <parameter name="accountingDate" type="Date"><description>The book day of the deltas; default today</description>
+            </parameter>
+            <parameter name="deleting" type="Boolean" default="false"><description>The listed entries are being deleted:
+                what was posted for them is reversed (delete#TimeEntry)</description></parameter>
         </in-parameters>
-        <out-parameters><parameter name="acctgTransId"/></out-parameters>
+        <out-parameters>
+            <parameter name="acctgTransId"/>
+            <parameter name="acctgTransIdList" type="List"/>
+            <parameter name="failedTimeEntryIdList" type="List"/>
+        </out-parameters>
         <actions>
-            <!-- TODO: implement this... -->
+            <set field="posted" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/ProjectCosts.js')
+                    .execute('post', context)"/>
+            <set field="acctgTransId" from="posted.acctgTransId"/>
+            <set field="acctgTransIdList" from="posted.acctgTransIdList"/>
+            <set field="failedTimeEntryIdList" from="posted.failedTimeEntryIdList"/>
+        </actions>
+    </service>
+    <service verb="calculate" noun="WorkEffortCostRun" allow-remote="false">
+        <description>The project cost period run's results (PeriodRunKind PrkProjectCost): the organization's approved
+            project time of the period whose posting differs from its cost, each with the delta to post, or why it
+            cannot be computed. Called by PeriodRunServices.preview#Run, which checks the permission.</description>
+        <implements service="mantle.ledger.PeriodRunServices.define#RunCalculation"/>
+        <actions>
+            <set field="results" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/ProjectCosts.js')
+                    .execute('calculateRun', context)"/>
+        </actions>
+    </service>
+    <service verb="post" noun="WorkEffortCostRun" allow-remote="false">
+        <description>Post a previewed project cost run: its ready results' time entries brought to their cost on the
+            run's book day; each result posted or failed with its reason. Called by PeriodRunServices.post#Run.</description>
+        <implements service="mantle.ledger.PeriodRunServices.define#RunPosting"/>
+        <actions>
+            <set field="posted" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/ProjectCosts.js')
+                    .execute('postRun', context)"/>
+            <set field="postedCount" from="posted.postedCount"/>
+            <set field="failedCount" from="posted.failedCount"/>
         </actions>
     </service>
 

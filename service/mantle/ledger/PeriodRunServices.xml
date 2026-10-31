@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<!-- The period-run contract: a kind of period calculation (a PeriodRunKind enumeration naming its calculation service in
+    enumCode and its posting service in optionValue) is previewed into an AccountingPeriodRun with its results, then posted
+    by its kind when the results are those the user reviewed. Depreciation (AssetBookServices) and project cost
+    (OtherAutoPostServices) are kinds; logic in PeriodRuns.js. -->
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="define" noun="RunCalculation" type="interface">
+        <description>A kind's calculation: for an organization, its open period and the run's book day (effectiveDate),
+            optionally limited to some sources, one result per source: sourceEntityName, sourceId, description, amount,
+            debitGlAccountId, creditGlAccountId, or failureCode and failureMessage when that source cannot be computed. It
+            changes nothing.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId" required="true"/>
+            <parameter name="timePeriodId" required="true"/>
+            <parameter name="effectiveDate" type="Date"/>
+            <parameter name="sourceIdList" type="List"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="results" type="List"/>
+        </out-parameters>
+    </service>
+    <service verb="define" noun="RunPosting" type="interface">
+        <description>A kind's posting of a previewed run: each ready result posted (status PrrPosted with its
+            acctgTransId) or failed with its reason (PrrFailed), each on its own, on the run's book day.</description>
+        <in-parameters>
+            <parameter name="periodRunId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="postedCount" type="Integer"/>
+            <parameter name="failedCount" type="Integer"/>
+        </out-parameters>
+    </service>
+
+    <service verb="preview" noun="Run" allow-remote="false">
+        <description>Calculate a period run without posting (ACCOUNTING_GL_POST): its kind's results for the
+            organization's open period, stored with the version of the calculation; an earlier preview of the same kind
+            and period is superseded. A source that fails is a failed result and the others stand; a calculation that
+            fails entirely is a failed run. Refuses an unknown kind, a period of another organization or closed, and a
+            book day outside the period.</description>
+        <in-parameters>
+            <parameter name="runKindEnumId" required="true"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="timePeriodId" required="true"/>
+            <parameter name="effectiveDate" type="Date"/>
+            <parameter name="sourceIdList" type="List"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="periodRunId"/>
+            <parameter name="calculationVersion"/>
+            <parameter name="resultCount" type="Integer"/>
+            <parameter name="failedCount" type="Integer"/>
+            <parameter name="totalAmount" type="BigDecimal"/>
+        </out-parameters>
+        <actions>
+            <set field="previewed" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/PeriodRuns.js')
+                    .execute('preview', context)"/>
+            <set field="periodRunId" from="previewed.periodRunId"/>
+            <set field="calculationVersion" from="previewed.calculationVersion"/>
+            <set field="resultCount" from="previewed.resultCount"/>
+            <set field="failedCount" from="previewed.failedCount"/>
+            <set field="totalAmount" from="previewed.totalAmount"/>
+        </actions>
+    </service>
+    <service verb="get" noun="Run" allow-remote="false">
+        <description>A period run with its kind, period and status names, whether the user may post it, and its results.
+            Refuses a user without Accounting read authority in the run's organization.</description>
+        <in-parameters>
+            <parameter name="periodRunId" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="run" type="Map"/>
+            <parameter name="results" type="List"/>
+        </out-parameters>
+        <actions>
+            <set field="found" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/PeriodRuns.js')
+                    .execute('get', context)"/>
+            <set field="run" from="found.run"/>
+            <set field="results" from="found.results"/>
+        </actions>
+    </service>
+    <service verb="post" noun="Run" allow-remote="false">
+        <description>Post a previewed period run (ACCOUNTING_GL_POST) through its kind's posting service, under the
+            run's lock and in an open period, when its kind calculates the same results again (RUN_CHANGED otherwise) and
+            the caller confirms the version it reviewed. The run becomes posted, posted with failures, or failed. A retry
+            with the same operation key answers the first post.</description>
+        <in-parameters>
+            <parameter name="periodRunId" required="true"/>
+            <parameter name="calculationVersion" required="true"/>
+            <parameter name="operationKey" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="statusId"/>
+            <parameter name="postedCount" type="Integer"/>
+            <parameter name="failedCount" type="Integer"/>
+            <parameter name="alreadyApplied" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="posted" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/PeriodRuns.js')
+                    .execute('post', context)"/>
+            <set field="statusId" from="posted.statusId"/>
+            <set field="postedCount" from="posted.postedCount"/>
+            <set field="failedCount" from="posted.failedCount"/>
+            <set field="alreadyApplied" from="!!posted.alreadyApplied"/>
+        </actions>
+    </service>
+</services>

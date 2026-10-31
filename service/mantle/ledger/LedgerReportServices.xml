@@ -1039,4 +1039,39 @@ along with this software (see the LICENSE.md file). If not, see
             </iterate>
         </actions>
     </service>
+    <service verb="run" noun="InvoiceReconciliation" allow-remote="false">
+        <description>The invoice reconciliation of an organization's fiscal period, for receivables or payables: documents
+            whose open amount differs from their receivable or payable postings, payments whose applied amount differs
+            from theirs, unposted and unbalanced transactions, receivable or payable postings without an invoice and
+            applications of the period to later invoices, each row with its document and ledger amounts; and the aging's
+            open total against the ledger balance at the period's end. Refuses a user without report read in the
+            organization, and a period of another organization.</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="timePeriodId" required="true"/>
+            <parameter name="invoiceType" default-value="receivable"><description>receivable or payable</description></parameter>
+            <parameter name="listLimit" type="Integer" default="500"><description>The most documents or transactions of
+                each kind checked; a check with more is reported incomplete (incompleteChecks)</description></parameter>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="reportRows" type="List"/>
+            <parameter name="summary" type="Map"/>
+            <parameter name="period" type="Map"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="asOf"/>
+            <parameter name="complete" type="Boolean"/>
+            <parameter name="incompleteChecks" type="List"/>
+        </out-parameters>
+        <actions>
+            <set field="report" from="ec.resource.script('component://mr-mantle/service/mantle/ledger/FinanceReports.js')
+                    .execute('invoiceReconciliation', context)"/>
+            <set field="complete" from="report.complete"/>
+            <set field="incompleteChecks" from="report.incompleteChecks"/>
+            <set field="reportRows" from="report.reportRows"/>
+            <set field="summary" from="report.summary"/>
+            <set field="period" from="report.period"/>
+            <set field="organizationPartyId" from="report.organizationPartyId"/>
+            <set field="asOf" from="report.asOf"/>
+        </actions>
+    </service>
 </services>

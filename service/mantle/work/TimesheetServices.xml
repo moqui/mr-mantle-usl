@@ -564,6 +564,10 @@ const days = Array.from(dayList || []).map(String)
             }
             ec.service.sync().name('update#mantle.work.time.Timesheet').parameters({timesheetId: timesheetId, statusId: 'TmshApproved', comments: null}).call()
             if (ec.message.hasError()) return
+            // project cost posting (on with the organization's projectCostPostingEnabled): the week's project time to cost
+            ec.service.sync().name('mantle.ledger.OtherAutoPostServices.post#WorkEffortCost')
+                    .parameters({timesheetId: timesheetId}).disableAuthz().call()
+            if (ec.message.hasError()) return
             ec.service.sync().name('mantle.work.TimesheetServices.notify#Timesheet').parameters({timesheetId: timesheetId, change: 'approved'}).call()
             message = L('Week approved')
         ]]></script></actions>
@@ -618,6 +622,10 @@ const days = Array.from(dayList || []).map(String)
             const text = String(reason || '').trim() || L('Reopened for changes')
             ec.service.sync().name('update#mantle.work.time.Timesheet').parameters({timesheetId: timesheetId, statusId: 'TmshInProcess',
                 comments: text.length > 255 ? text.substring(0, 254) + '…' : text}).call()
+            if (ec.message.hasError()) return
+            // the approval undone: its project cost posting is reversed by a delta dated today
+            ec.service.sync().name('mantle.ledger.OtherAutoPostServices.post#WorkEffortCost')
+                    .parameters({timesheetId: timesheetId}).disableAuthz().call()
             if (ec.message.hasError()) return
             ec.service.sync().name('mantle.work.TimesheetServices.note#TimesheetDecision').parameters({timesheetId: timesheetId, subject: L('Reopened'), body: text}).call()
             ec.service.sync().name('mantle.work.TimesheetServices.notify#Timesheet').parameters({timesheetId: timesheetId, change: 'reopened', reason: text}).call()
