@@ -25,6 +25,8 @@ along with this software (see the LICENSE.md file). If not, see
                 in various fields and set on PaymentMethodFile.fileDate</description></parameter>
             <parameter name="formatServiceName"><description>Extension mechanism, generally empty and determined based
                 on BankAccount.posPayFormatEnumId</description></parameter>
+            <parameter name="paymentIdList" type="List"><description>Only these payments (a payment run's), when
+                given</description></parameter>
         </in-parameters>
         <out-parameters>
             <parameter name="paymentMethodFileId"/>
@@ -46,6 +48,7 @@ along with this software (see the LICENSE.md file). If not, see
 
                 <econdition field-name="paymentInstrumentEnumId"/>
                 <econdition field-name="paymentMethodFileId" from="null"/>
+                <econdition field-name="paymentId" operator="in" from="paymentIdList" ignore-if-empty="true"/>
                 <econdition field-name="effectiveDate" operator="greater-equals" from="fromDate" ignore-if-empty="true"/>
                 <econdition field-name="effectiveDate" operator="less-equals" from="thruDate"/>
                 <order-by field-name="paymentRefNum"/>
