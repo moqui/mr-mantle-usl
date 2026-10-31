@@ -324,12 +324,18 @@ function validateBatch(p) {
               .split(",")
               .filter(Boolean)
     if (!journal && (!selected.length || selected.length > 100)) throw new Error("Select 1–100 journal entries")
+    // by id, so the preview and the batch post take the entries in one order (unordered, Postgres returns them in
+    // row-storage order: F429)
     const transactions = journal
-        ? rows(T, {
-              glJournalId: journal.glJournalId,
-              organizationPartyId: s.organizationPartyId,
-              isPosted: "N"
-          })
+        ? Array.from(
+              find(T, {
+                  glJournalId: journal.glJournalId,
+                  organizationPartyId: s.organizationPartyId,
+                  isPosted: "N"
+              })
+                  .orderBy("acctgTransId")
+                  .list()
+          )
         : selected.map(id =>
               lib.record(
                   {
