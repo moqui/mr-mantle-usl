@@ -456,7 +456,9 @@ feature("one bill cannot bill the same source twice, across its lines or across 
             quantity: 10,
             amount: 5
         })
-        const [first, second] = rows("mantle.account.invoice.InvoiceItem", {invoiceId: twice}).map(row => row.invoiceItemSeqId)
+        const [first, second] = rows("mantle.account.invoice.InvoiceItem", {invoiceId: twice})
+            .map(row => row.invoiceItemSeqId)
+            .sort()
         login(users.matcher)
         const proposal = match("evaluate#InvoiceMatch", {invoiceId: twice, orderId: po.orderId})
         const doubled = refused("mantle.account.InvoiceMatchServices.apply#InvoiceMatch", {
