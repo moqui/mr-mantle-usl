@@ -822,6 +822,55 @@ Accounting's customer and supplier pages are the PASS Billing and Supplier apps 
   map (`PostingGuard.PORTAL_PAYMENT`); that payment's posting, or its application's, to the organization it is paid to
   skips the user's organization check. Nothing else does (F378).
 
+## Setup and activation (P19)
+
+An organization's accounting is activated once, from a setup run (AC-01). `mantle.ledger.SetupServices` checks
+`ACCOUNTING_ADMIN` and the organization (`AccountingPolicy.organization(p, "admin")`); the involved logic is in
+`ledger/AccountingActivation.js`.
+
+- **Chart templates.** A template is an organization with the `OrgAccountingTemplate` role and an accounting preference,
+  holding its account assignments, type defaults and mappings; Mantle's installed chart ships one, DefaultSettings.
+  `init#PartyAccountingConfiguration` copies it (`sourcePartyId`), now also its variance reason and tax authority
+  accounts. The installed chart has a migration clearing account, 913000000, the `GatMigrationClearing` default.
+- **Run.** `mantle.ledger.config.AccountingSetupRun` is the organization's one run (unique by organization): the template,
+  the opening day, the migration clearing account, `runVersion`, the activation's transaction, user and date, and the
+  last open item import (`lastImportJson`). `AccountingSetupBalance` holds its opening trial balance lines (an account's
+  debit or credit, in the base currency).
+- **`store#SetupRun`.** An organization without its own preference is set up from the template
+  (`init#PartyAccountingConfiguration` with the base currency, fiscal year start and costing basis, the posting guard and
+  single-currency documents on); for one with its own, a changed basis goes through `store#Preferences`. It makes the
+  fiscal periods of the opening day (`get#OrganizationFiscalTimePeriods`), and replaces the lines (`balances`, or
+  `balancesCsvText` with account, debit and credit) or saves one (`balanceLine`; empty amounts remove it). Every save
+  raises `runVersion` and needs the version reviewed; an activated run, and a new opening day or migration account once
+  open items are imported, are refused.
+- **Open items.** `import#OpenItems` takes rows, a CSV text or a file (direction, partyId, documentNumber, documentDate,
+  dueDate, openAmount; currencyUomId and description optional) and runs `create#OpenItem` for each in its own transaction:
+  a real invoice (`InvoiceSales`; the organization the from or to party by side) with `openingSetupRunId` (the opening
+  flag), dated at its document date, due at its own due date (no term, so its due schedule is one portion then),
+  booked on the opening day (`accountingDate`), with one `ItemOpeningBalance` line on the migration account
+  (`overrideGlAccountId`); it is finalized or approved through `update#Invoice`, so `InvoiceGlPost` posts it (with the
+  guard, on the opening day) and `InvoiceIssuedDueSchedule` writes its schedule, and a posting that does not complete
+  refuses the row. A refused row is named with its reason code and the rest are kept; the same organization, side, party
+  and number answers the invoice made before (or `OPEN_ITEM_CONFLICT` for another amount or due day); `verifyOnly`
+  checks only. An open bill is imported approved, so it needs `INVOICE_APPROVE` (the status flow's transition); an
+  internal counterparty, a document after the opening day and a currency other than the base currency (single currency
+  until P20) are refused. No tax, approval workflow, budget or email runs for an opening item. The rows run in their
+  own transactions, so a caller that changed the run in its own open transaction must commit first.
+- **`preview#OpeningBalances`** answers the run, the templates, the lines with their totals, the tie-out of each
+  receivable and payable control account (the AR and AP defaults and what the opening items posted to) against what the
+  open items posted there, a page of the open items with each side's count and total, and the last import.
+- **`check#Readiness`** answers a row per check, each `ok`, `warning` or `blocker` with its message and items, one check
+  that fails named and the others going on: preferences, chart, the open periods of the opening day, the posting guard,
+  the migration account, the AR and AP accounts, mappings naming a summary account (impl-accounting F71, F251) and
+  mapped accounts not in the chart (F190, F250, F271), the inventory WIP and transfer accounts and costing basis, single
+  currency (open documents, pending payments and active prices in another currency, D18), the sales tax gateway, a bank
+  account, the paused `send_SalesInvoicePastDueEmails` job, balanced lines and the open items' tie-out.
+  `get#Readiness` also answers `setupStatus` (unconfigured, inSetup, active or configured) for Home.
+- **`activate#Accounting`** locks the organization and the run, answers a retried operation key, answers an activated run
+  with its transaction (posting nothing again), refuses a stale `runVersion` and any readiness blocker, then posts one
+  `AttOpeningBalance` transaction on the opening day through `post#AcctgTrans` (`reviewed`): each line on its account,
+  a control account's line on the migration account, which then nets to zero; the run becomes `AsrActivated`.
+
 ## Libraries
 
 - `ledger/EntityLib.js`: the helpers the finance modules share: entity reads without artifact authorization (each
@@ -867,6 +916,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingBudgets,BudgetServices
 ./moq test mr-mantle --spec AccountingReturns,ReturnToResponseBasicFlow,OrderToCashBasicFlow
 ./moq test mr-mantle --spec AccountingPortals
+./moq test mr-mantle --spec AccountingSetup
 ```
 
 The PDF specs need a Chromium for PDF (`pdf_chromium_path`; see [Run-Deploy](../../../../docs/Run-Deploy.md) and
