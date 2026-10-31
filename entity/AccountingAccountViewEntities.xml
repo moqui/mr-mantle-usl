@@ -273,12 +273,9 @@ along with this software (see the LICENSE.md file). If not, see
 
     <view-entity entity-name="InvoiceAgingSummary" package="mantle.account.invoice">
         <member-entity entity-alias="INV" entity-name="mantle.account.invoice.Invoice"/>
-        <member-relationship entity-alias="FPRL" join-from-alias="INV" relationship="fromRoles" join-optional="true"/>
-        <member-relationship entity-alias="TPRL" join-from-alias="INV" relationship="toRoles" join-optional="true"/>
+        <!-- no party role joins: a party with several roles multiplied every sum (impl-accounting F36) -->
         <alias name="fromPartyId" entity-alias="INV"/>
-        <alias name="fromRoleTypeId" entity-alias="FPRL" field="roleTypeId"/>
         <alias name="toPartyId" entity-alias="INV"/>
-        <alias name="toRoleTypeId" entity-alias="TPRL" field="roleTypeId"/>
         <alias name="statusId" entity-alias="INV"/>
         <alias name="invoiceTypeEnumId" entity-alias="INV"/>
         <alias name="currencyUomId" entity-alias="INV"/>
@@ -291,10 +288,13 @@ along with this software (see the LICENSE.md file). If not, see
         <!-- NOTE: to on Postgres must do DATE math for integer compare to avoid error: operator does not exist: interval < integer -->
         <!-- was (CURRENT_TIMESTAMP - INV.${dateField ?: 'DUE_DATE'}) for each -->
         <!-- NOTE: on db2i, must use TIMESTAMPDIFF with 16 for to calculate the difference as days' -->
+        <!-- Days past due count up on every database (H2's DATEDIFF had the opposite sign) and the last bucket starts the day
+            after the fourth period ends (a 121-day-old invoice fell in no bucket; impl-accounting F36). Buckets are against
+            today: mantle.ledger.LedgerReportServices.run#Aging ages as of a chosen day. -->
         <alias name="currentDue" function="sum">
             <case><when expression="${dbConfName=='postgres' ? '(CURRENT_DATE - DATE(INV.' + (dateField || 'DUE_DATE') + '))' :
                                       dbConfName=='db2i'     ? '(TIMESTAMPDIFF(16, CHAR(CURRENT_TIMESTAMP - INV.' + (dateField || 'DUE_DATE') + ')))' :
-                                      dbConfName=='h2'       ? '(DATEDIFF(DAY, CURRENT_TIMESTAMP, INV.' + (dateField || 'DUE_DATE') + '))' :
+                                      dbConfName=='h2'       ? '(DATEDIFF(DAY, INV.' + (dateField || 'DUE_DATE') + ', CURRENT_TIMESTAMP))' :
                                                                '(CURRENT_TIMESTAMP - INV.' + (dateField || 'DUE_DATE') + ')'} &lt; 0">
                 <complex-alias expression="INV.UNPAID_TOTAL"/>
             </when><else><complex-alias expression="0"/></else></case>
@@ -302,7 +302,7 @@ along with this software (see the LICENSE.md file). If not, see
         <alias name="period1" function="sum">
             <case><when expression="${dbConfName=='postgres' ? '(CURRENT_DATE - DATE(INV.' + (dateField || 'DUE_DATE') + '))' :
                                       dbConfName=='db2i'     ? '(TIMESTAMPDIFF(16, CHAR(CURRENT_TIMESTAMP - INV.' + (dateField || 'DUE_DATE') + ')))' :
-                                      dbConfName=='h2'       ? '(DATEDIFF(DAY, CURRENT_TIMESTAMP, INV.' + (dateField || 'DUE_DATE') + '))' :
+                                      dbConfName=='h2'       ? '(DATEDIFF(DAY, INV.' + (dateField || 'DUE_DATE') + ', CURRENT_TIMESTAMP))' :
                                                                '(CURRENT_TIMESTAMP - INV.' + (dateField || 'DUE_DATE') + ')'} BETWEEN 0 AND ${(periodDays||30)}">
                 <complex-alias expression="INV.UNPAID_TOTAL"/>
             </when><else><complex-alias expression="0"/></else></case>
@@ -310,7 +310,7 @@ along with this software (see the LICENSE.md file). If not, see
         <alias name="period2" function="sum">
             <case><when expression="${dbConfName=='postgres' ? '(CURRENT_DATE - DATE(INV.' + (dateField || 'DUE_DATE') + '))' :
                                       dbConfName=='db2i'     ? '(TIMESTAMPDIFF(16, CHAR(CURRENT_TIMESTAMP - INV.' + (dateField || 'DUE_DATE') + ')))' :
-                                      dbConfName=='h2'       ? '(DATEDIFF(DAY, CURRENT_TIMESTAMP, INV.' + (dateField || 'DUE_DATE') + '))' :
+                                      dbConfName=='h2'       ? '(DATEDIFF(DAY, INV.' + (dateField || 'DUE_DATE') + ', CURRENT_TIMESTAMP))' :
                                                                '(CURRENT_TIMESTAMP - INV.' + (dateField || 'DUE_DATE') + ')'} BETWEEN ${(periodDays||30)+1} AND ${(periodDays||30)*2}">
                 <complex-alias expression="INV.UNPAID_TOTAL"/>
             </when><else><complex-alias expression="0"/></else></case>
@@ -318,7 +318,7 @@ along with this software (see the LICENSE.md file). If not, see
         <alias name="period3" function="sum">
             <case><when expression="${dbConfName=='postgres' ? '(CURRENT_DATE - DATE(INV.' + (dateField || 'DUE_DATE') + '))' :
                                       dbConfName=='db2i'     ? '(TIMESTAMPDIFF(16, CHAR(CURRENT_TIMESTAMP - INV.' + (dateField || 'DUE_DATE') + ')))' :
-                                      dbConfName=='h2'       ? '(DATEDIFF(DAY, CURRENT_TIMESTAMP, INV.' + (dateField || 'DUE_DATE') + '))' :
+                                      dbConfName=='h2'       ? '(DATEDIFF(DAY, INV.' + (dateField || 'DUE_DATE') + ', CURRENT_TIMESTAMP))' :
                                                                '(CURRENT_TIMESTAMP - INV.' + (dateField || 'DUE_DATE') + ')'} BETWEEN ${(periodDays||30)*2+1} AND ${(periodDays||30)*3}">
                 <complex-alias expression="INV.UNPAID_TOTAL"/>
             </when><else><complex-alias expression="0"/></else></case>
@@ -326,7 +326,7 @@ along with this software (see the LICENSE.md file). If not, see
         <alias name="period4" function="sum">
             <case><when expression="${dbConfName=='postgres' ? '(CURRENT_DATE - DATE(INV.' + (dateField || 'DUE_DATE') + '))' :
                                       dbConfName=='db2i'     ? '(TIMESTAMPDIFF(16, CHAR(CURRENT_TIMESTAMP - INV.' + (dateField || 'DUE_DATE') + ')))' :
-                                      dbConfName=='h2'       ? '(DATEDIFF(DAY, CURRENT_TIMESTAMP, INV.' + (dateField || 'DUE_DATE') + '))' :
+                                      dbConfName=='h2'       ? '(DATEDIFF(DAY, INV.' + (dateField || 'DUE_DATE') + ', CURRENT_TIMESTAMP))' :
                                                                '(CURRENT_TIMESTAMP - INV.' + (dateField || 'DUE_DATE') + ')'} BETWEEN ${(periodDays||30)*3+1} AND ${(periodDays||30)*4}">
             <!--<case><when expression="${dbConfName=='postgres' ? '((CURRENT_DATE - DATE(' : (dbConfName=='db2i' ? 'TIMESTAMPDIFF(16, CHAR' : '') + '((CURRENT_TIMESTAMP - '}INV.${dateField ?: 'DUE_DATE'}))) BETWEEN ${(periodDays?:30)*3+1} AND ${(periodDays?:30)*4}">-->
                 <complex-alias expression="INV.UNPAID_TOTAL"/>
@@ -335,8 +335,8 @@ along with this software (see the LICENSE.md file). If not, see
         <alias name="periodRemaining" function="sum">
             <case><when expression="${dbConfName=='postgres' ? '(CURRENT_DATE - DATE(INV.' + (dateField || 'DUE_DATE') + '))' :
                                       dbConfName=='db2i'     ? '(TIMESTAMPDIFF(16, CHAR(CURRENT_TIMESTAMP - INV.' + (dateField || 'DUE_DATE') + ')))' :
-                                      dbConfName=='h2'       ? '(DATEDIFF(DAY, CURRENT_TIMESTAMP, INV.' + (dateField || 'DUE_DATE') + '))' :
-                                                               '(CURRENT_TIMESTAMP - INV.' + (dateField || 'DUE_DATE') + ')'} &gt; ${(periodDays||30)*4+1}">
+                                      dbConfName=='h2'       ? '(DATEDIFF(DAY, INV.' + (dateField || 'DUE_DATE') + ', CURRENT_TIMESTAMP))' :
+                                                               '(CURRENT_TIMESTAMP - INV.' + (dateField || 'DUE_DATE') + ')'} &gt; ${(periodDays||30)*4}">
                 <complex-alias expression="INV.UNPAID_TOTAL"/>
             </when><else><complex-alias expression="0"/></else></case>
         </alias>

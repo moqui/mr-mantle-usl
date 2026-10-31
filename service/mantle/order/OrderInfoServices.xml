@@ -833,8 +833,14 @@ along with this software (see the LICENSE.md file). If not, see
 
     <service verb="check" noun="OrderPreApprove">
         <description>A basic set of checks for possible issues before approving an order. Use an SECA on this service to do
-            additional checks, adding to the approveWarnings List as needed.</description>
-        <in-parameters><parameter name="orderId" required="true"/></in-parameters>
+            additional checks, adding to the approveWarnings List as needed. The credit check of the order's customer adds
+            its warning here (the OrderPreApproveCredit SECA); with approving (autoApprove#Order) a Hold result puts the
+            order on a Credit hold.</description>
+        <in-parameters>
+            <parameter name="orderId" required="true"/>
+            <parameter name="approving" type="Boolean" default="false"><description>True when the order is being approved
+                on these checks, so a check that holds the order may do so.</description></parameter>
+        </in-parameters>
         <out-parameters>
             <parameter name="approveWarnings" type="List"><parameter name="approveWarning"/></parameter>
         </out-parameters>

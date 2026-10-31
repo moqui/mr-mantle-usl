@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+This software is in the public domain under CC0 1.0 Universal plus a
+Grant of Patent License.
+
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide. This software is distributed without any
+warranty.
+
+You should have received a copy of the CC0 Public Domain Dedication
+along with this software (see the LICENSE.md file). If not, see
+<http://creativecommons.org/publicdomain/zero/1.0/>.
+-->
+<!-- Recurring invoices (AC-09; design-accounting §4 RecurringInvoices, D24): invoice-only schedules (rent, retainers,
+    recurring supplier bills) that copy a template invoice's lines into a new draft each period, one draft per period
+    however often it is retried; the generate_RecurringInvoices job runs them. Order-based recurring billing stays on the
+    order and the create_RecurringOrders job. Logic in RecurringInvoices.js. -->
+<services xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:noNamespaceSchemaLocation="http://moqui.org/xsd/service-definition-3.xsd">
+    <service verb="store" noun="Schedule" allow-remote="false">
+        <description>Add a schedule from a template invoice of the organization (its customer, or its supplier for a
+            recurring bill, is the schedule's party), change one, or change its state (statusId: pause, resume, end). A
+            change applies to the periods not yet made; a made period keeps its invoice, and the next period is the
+            changed schedule's first after the last one made. Refuses a cancelled or empty template, an interval other than
+            1 to 60 weeks, months or years, an end before the start and an unknown term. Needs RECEIVABLE_EDIT for a
+            customer schedule, PAYABLE_EDIT for a supplier's, in the organization.</description>
+        <in-parameters>
+            <parameter name="invoiceScheduleId"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="templateInvoiceId"/>
+            <parameter name="description"/>
+            <parameter name="intervalUomId"><description>TF_wk, TF_mon or TF_yr</description></parameter>
+            <parameter name="intervalQuantity" type="Integer"/>
+            <parameter name="startDate" type="Date"/>
+            <parameter name="endDate"/>
+            <parameter name="settlementTermId"/>
+            <parameter name="statusId"><description>IschActive, IschPaused or IschEnded, to change the state
+                alone</description></parameter>
+        </in-parameters>
+        <out-parameters><parameter name="invoiceScheduleId"/></out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/RecurringInvoices.js"/>
+            <set field="stored" from="ec.resource.script(module).execute('store', context)"/>
+            <set field="invoiceScheduleId" from="stored.invoiceScheduleId"/>
+        </actions>
+    </service>
+    <service verb="preview" noun="Period" allow-remote="false">
+        <description>The draft a period of a schedule would make (its next period by default): the day, the due day by its
+            term, the party, the lines and total copied from the template, and the invoice already made for it, or why
+            making it failed. Changes nothing. Refuses a day that is not one of the schedule's. Needs the side's view
+            permission (RECEIVABLE_VIEW or PAYABLE_VIEW), ACCOUNTING_VIEW or ACCOUNTING_ADMIN in the
+            organization.</description>
+        <in-parameters>
+            <parameter name="invoiceScheduleId" required="true"/>
+            <parameter name="occurrenceDate" type="Date"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="occurrenceDate"/>
+            <parameter name="invoiceDate"/>
+            <parameter name="dueDate"/>
+            <parameter name="partyId"/>
+            <parameter name="partyName"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="lines" type="List"/>
+            <parameter name="total" type="BigDecimal"/>
+            <parameter name="invoiceId"/>
+            <parameter name="occurrenceStatusId"/>
+            <parameter name="errorMessage"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/RecurringInvoices.js"/>
+            <set field="previewed" from="ec.resource.script(module).execute('preview', context)"/>
+            <script>ec.context.putAll(previewed)</script>
+        </actions>
+    </service>
+    <service verb="generate" noun="Invoices" allow-remote="false">
+        <description>Make a schedule's period now (its next period by default) as a draft invoice, in its own transaction
+            (generate#Occurrence). A period already made answers its invoice (alreadyGenerated), so a retry makes one draft.
+            A failure is recorded on the period, the billers notified (RecurringInvoiceFailed), and refused with its reason.
+            Needs RECEIVABLE_EDIT for a customer schedule, PAYABLE_EDIT for a supplier's, in the organization. The
+            generate_RecurringInvoices job (run#Schedules) makes the periods due.</description>
+        <in-parameters>
+            <parameter name="invoiceScheduleId" required="true"/>
+            <parameter name="occurrenceDate" type="Date"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceId"/>
+            <parameter name="occurrenceDate"/>
+            <parameter name="alreadyGenerated" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/RecurringInvoices.js"/>
+            <set field="generated" from="ec.resource.script(module).execute('generate', context)"/>
+            <set field="invoiceId" from="generated.invoiceId"/>
+            <set field="occurrenceDate" from="generated.occurrenceDate"/>
+            <set field="alreadyGenerated" from="!!generated.alreadyGenerated"/>
+        </actions>
+    </service>
+    <service verb="generate" noun="Occurrence" allow-remote="false">
+        <description>Make one period's draft: the schedule locked, a period already made answering its invoice, then a new
+            draft invoice from the template's lines (not its calculated tax lines) dated on the period's day, and the
+            schedule's next day. Refuses a day that is not the schedule's, a day after its end and a cancelled or empty
+            template. Checks no permission: generate#Invoices and run#Schedules call it.</description>
+        <in-parameters>
+            <parameter name="invoiceScheduleId" required="true"/>
+            <parameter name="occurrenceDate"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="invoiceId"/>
+            <parameter name="occurrenceDate"/>
+            <parameter name="alreadyGenerated" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/RecurringInvoices.js"/>
+            <set field="generated" from="ec.resource.script(module).execute('occurrence', context)"/>
+            <script>ec.context.putAll(generated)</script>
+        </actions>
+    </service>
+    <service verb="record" noun="OccurrenceFailure" allow-remote="false">
+        <description>Record why a period was not made, on its occurrence (attempts counted), and send RecurringInvoiceFailed
+            to the organization's users who bill that side. A period since made is left as it is.</description>
+        <in-parameters>
+            <parameter name="invoiceScheduleId" required="true"/>
+            <parameter name="occurrenceDate" required="true"/>
+            <parameter name="errorMessage"/>
+        </in-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/RecurringInvoices.js"/>
+            <script>ec.resource.script(module).execute('recordFailure', context)</script>
+        </actions>
+    </service>
+    <service verb="run" noun="Schedules" authenticate="false" allow-remote="false" transaction="ignore">
+        <description>The generate_RecurringInvoices job: each active schedule's periods due through today (at most 12 a
+            schedule), each in its own transaction; a failure is recorded on its period and the others go on.</description>
+        <out-parameters>
+            <parameter name="scheduleCount" type="Integer"/>
+            <parameter name="generatedCount" type="Integer"/>
+            <parameter name="failedCount" type="Integer"/>
+        </out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/RecurringInvoices.js"/>
+            <set field="ran" from="ec.resource.script(module).execute('run', context)"/>
+            <script>ec.context.putAll(ran)</script>
+        </actions>
+    </service>
+</services>

@@ -1212,15 +1212,141 @@ General Order Placement and eCommerce Usage
         </actions>
     </service>
     <service verb="approve" noun="Order">
-        <description>For manual order approval, requires ORDER_APPROVE permission.</description>
+        <description>For manual order approval, requires ORDER_APPROVE permission. An order with an open hold reason is
+            released, not approved (ORDER_HOLD_OPEN). A sales order is checked against its customer's credit policy first
+            (mantle.account.CreditServices.evaluate#OrderCredit): a Hold result puts the order on a Credit hold instead of
+            approving it, keeping its reservations, and answers creditHeld; a Warn result approves it with a warning. An
+            organization with no credit policy approves as before.</description>
         <implements service="mantle.order.OrderServices.change#OrderStatusInterface"/>
         <in-parameters>
             <parameter name="approvedDate" type="Timestamp" default="ec.user.nowTimestamp"/>
         </in-parameters>
+        <out-parameters>
+            <parameter name="creditHeld" type="Boolean"/>
+            <parameter name="creditWarning"/>
+            <parameter name="orderHoldReasonId"/>
+        </out-parameters>
         <actions>
             <if condition="!ec.user.hasPermission('ORDER_APPROVE')">
                 <return error="true" message="Order Approve permission required"/></if>
+            <set field="creditHeld" from="false"/>
+            <entity-find-count entity-name="mantle.order.OrderHoldReason" count-field="openHoldCount" disable-authz="true">
+                <econdition field-name="orderId"/>
+                <econdition field-name="releasedDate" operator="is-null"/>
+            </entity-find-count>
+            <if condition="openHoldCount &gt; 0">
+                <return error="true" message="ORDER_HOLD_OPEN: Order ${orderId} is on hold; release its hold instead"/></if>
+            <service-call name="mantle.account.CreditServices.evaluate#OrderCredit" out-map="creditOut" disable-authz="true"
+                    in-map="{orderId:orderId, orderPartSeqId:orderPartSeqId, placeHold:true}"/>
+            <set field="creditWarning" from="creditOut.warning"/>
+            <if condition="creditOut.held">
+                <set field="creditHeld" from="true"/>
+                <set field="orderHoldReasonId" from="creditOut.orderHoldReasonId"/>
+                <message type="warning">${creditOut.warning}</message>
+                <return/>
+            </if>
+            <if condition="creditOut.warning"><message type="warning">${creditOut.warning}</message></if>
             <service-call name="mantle.order.OrderServices.update#OrderStatus" out-map="context" in-map="Object.assign({}, context, {statusId:'OrderApproved'})"/>
+        </actions>
+    </service>
+    <service verb="hold" noun="Order" allow-remote="false">
+        <description>Put an order (or one part) on hold for a reason (CX-ORDER-HOLD): an OrderHoldReason of the type
+            (OrderHoldType: Credit, Change, Purchase, Manual) with its source record and comment, and the order to OrderHold
+            when it is not already held. Reservations made when it was placed stay. A reason of the same type already open
+            for the part is answered (alreadyHeld). Refuses an order that is not placed, processing, approved or held
+            (ORDER_HOLD_STATE). A Credit reason is placed only by the credit policy (CreditServices.evaluate#OrderCredit);
+            the other types need the permission their type names (enumCode).</description>
+        <in-parameters>
+            <parameter name="orderId" required="true"/>
+            <parameter name="orderPartSeqId"/>
+            <parameter name="holdTypeEnumId" required="true"/>
+            <parameter name="sourceId"/>
+            <parameter name="holdComment"/>
+            <parameter name="returnStatusId" default-value="OrderApproved"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="orderHoldReasonId"/>
+            <parameter name="alreadyHeld" type="Boolean"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="moqui.basic.Enumeration" value-field="holdType" disable-authz="true">
+                <field-map field-name="enumId" from="holdTypeEnumId"/></entity-find-one>
+            <if condition="holdType?.enumTypeId != 'OrderHoldType'">
+                <return error="true" message="HOLD_TYPE_INVALID: Choose a hold type"/></if>
+            <if condition="holdTypeEnumId != 'OhtCredit' &amp;&amp; !ec.user.hasPermission(holdType.enumCode)">
+                <return error="true" message="PERMISSION_DENIED: ${holdType.enumCode} authority is required"/></if>
+            <entity-find-one entity-name="mantle.order.OrderHeader" value-field="orderHeader" for-update="true"
+                    disable-authz="true"/>
+            <if condition="orderHeader == null">
+                <return error="true" message="ORDER_UNAVAILABLE: Order ${orderId} not found"/></if>
+            <if condition="!['OrderPlaced', 'OrderProcessing', 'OrderApproved', 'OrderHold'].includes(orderHeader.statusId)">
+                <return error="true" message="ORDER_HOLD_STATE: Order ${orderId} cannot be held in its status"/></if>
+            <entity-find entity-name="mantle.order.OrderHoldReason" list="openList" disable-authz="true">
+                <econdition field-name="orderId"/>
+                <econdition field-name="holdTypeEnumId"/>
+                <econdition field-name="orderPartSeqId" from="orderPartSeqId || null"/>
+                <econdition field-name="releasedDate" operator="is-null"/>
+            </entity-find>
+            <if condition="openList.length &gt; 0">
+                <set field="orderHoldReasonId" from="openList[0].orderHoldReasonId"/>
+                <set field="alreadyHeld" from="true"/>
+                <return/>
+            </if>
+            <set field="alreadyHeld" from="false"/>
+            <service-call name="create#mantle.order.OrderHoldReason" out-map="created" disable-authz="true"
+                    in-map="{orderId:orderId, orderPartSeqId:orderPartSeqId || null, holdTypeEnumId:holdTypeEnumId,
+                        sourceId:sourceId || null, holdComment:holdComment || null, returnStatusId:returnStatusId,
+                        placedByUserId:ec.user.userId || null, placedDate:ec.user.nowTimestamp}"/>
+            <set field="orderHoldReasonId" from="created.orderHoldReasonId"/>
+            <if condition="orderHeader.statusId != 'OrderHold'">
+                <service-call name="mantle.order.OrderServices.update#OrderStatus" disable-authz="true"
+                        in-map="{orderId:orderId, orderPartSeqId:orderPartSeqId || null, statusId:'OrderHold'}"/>
+            </if>
+        </actions>
+    </service>
+    <service verb="release" noun="OrderHold" allow-remote="false">
+        <description>Release one hold reason with a comment, recording who released it and when. The order returns from
+            OrderHold to the reason's return status (Approved by default) only when no other reason is open, so one app's
+            release never releases another's hold. Needs the permission the reason's type names (enumCode); refuses a
+            released reason (HOLD_ALREADY_RELEASED) and a release without a comment.</description>
+        <in-parameters>
+            <parameter name="orderHoldReasonId" required="true"/>
+            <parameter name="releaseComment" required="true"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="orderId"/>
+            <parameter name="stillHeld" type="Boolean"/>
+            <parameter name="statusId"/>
+        </out-parameters>
+        <actions>
+            <entity-find-one entity-name="mantle.order.OrderHoldReason" value-field="reason" disable-authz="true"/>
+            <if condition="reason == null"><return error="true" message="HOLD_UNAVAILABLE: The hold is not available"/></if>
+            <entity-find-one entity-name="moqui.basic.Enumeration" value-field="holdType" disable-authz="true">
+                <field-map field-name="enumId" from="reason.holdTypeEnumId"/></entity-find-one>
+            <if condition="!ec.user.hasPermission(holdType.enumCode)">
+                <return error="true" message="PERMISSION_DENIED: ${holdType.enumCode} authority is required"/></if>
+            <set field="orderId" from="reason.orderId"/>
+            <entity-find-one entity-name="mantle.order.OrderHeader" value-field="orderHeader" for-update="true"
+                    disable-authz="true"/>
+            <entity-find-one entity-name="mantle.order.OrderHoldReason" value-field="reason" for-update="true"
+                    disable-authz="true"/>
+            <if condition="reason.releasedDate">
+                <return error="true" message="HOLD_ALREADY_RELEASED: The hold is already released"/></if>
+            <service-call name="update#mantle.order.OrderHoldReason" disable-authz="true"
+                    in-map="{orderHoldReasonId:orderHoldReasonId, releasedByUserId:ec.user.userId,
+                        releasedDate:ec.user.nowTimestamp, releaseComment:releaseComment}"/>
+            <entity-find-count entity-name="mantle.order.OrderHoldReason" count-field="openCount" disable-authz="true">
+                <econdition field-name="orderId"/>
+                <econdition field-name="releasedDate" operator="is-null"/>
+            </entity-find-count>
+            <set field="stillHeld" from="openCount &gt; 0"/>
+            <if condition="!stillHeld &amp;&amp; orderHeader.statusId == 'OrderHold'">
+                <service-call name="mantle.order.OrderServices.update#OrderStatus" disable-authz="true"
+                        in-map="{orderId:orderId, statusId:reason.returnStatusId || 'OrderApproved',
+                            approvedDate:ec.user.nowTimestamp}"/>
+            </if>
+            <entity-find-one entity-name="mantle.order.OrderHeader" value-field="orderHeader" disable-authz="true"/>
+            <set field="statusId" from="orderHeader.statusId"/>
         </actions>
     </service>
 
@@ -1281,7 +1407,8 @@ General Order Placement and eCommerce Usage
                 meant for manual approval and requires permission -->
             <if condition="totalAuthorized.compare(orderHeader.grandTotal ?? 0) &gt;= 0">
                 <!-- run approval checks, don't approve if any warnings or if order has been previously approved -->
-                <service-call name="mantle.order.OrderInfoServices.check#OrderPreApprove" in-map="{orderId:orderId}" out-map="checkOut"/>
+                <service-call name="mantle.order.OrderInfoServices.check#OrderPreApprove" out-map="checkOut"
+                        in-map="{orderId:orderId, approving:true}"/>
                 <!-- if has been Approved before don't auto-approve -->
                 <entity-find entity-name="moqui.entity.EntityAuditLog" list="statusHistoryList">
                     <econdition field-name="changedEntityName" value="mantle.order.OrderHeader"/>
