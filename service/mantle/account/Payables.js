@@ -511,7 +511,7 @@ function notify(p) {
     return {notificationMessageId: notification.getNotificationMessageId()}
 }
 // A decision clears its notifications: each recipient's copy of the topic's messages about the bill (about the hold, when
-// one is named) is marked read, so the Approvals lists empty.
+// one is named; or about another record: recordEntityName, recordId) is marked read, so the Approvals lists empty.
 function clearNotices(p) {
     const messages = rows("moqui.security.user.NotificationMessage", {
         topic: p.topic,

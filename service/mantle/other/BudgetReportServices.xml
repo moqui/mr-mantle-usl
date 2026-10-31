@@ -418,4 +418,43 @@ along with this software (see the LICENSE.md file). If not, see
             ]]></script>
         </actions>
     </service>
+    <service verb="run" noun="BudgetVariance" allow-remote="false">
+        <description>Budget variance: for each account of a budget, its amount as of a revision (revisionSeqId, else the
+            last on or before asOfDate, else the last; a draft's current amounts), what is committed (open
+            BudgetCommitment reservations) and the actual (posted debits less credits), over the budget's period or one of
+            its sub periods (timePeriodId), with the remaining amount (budget less actual and committed), the variance
+            (actual and committed less budget) and its percent (none for a zero budget). Refuses an organization the user
+            does not read (ACCOUNTING_VIEW), a budget of another organization and a period not the budget's own
+            (F6).</description>
+        <in-parameters>
+            <parameter name="organizationPartyId"/>
+            <parameter name="budgetId" required="true"/>
+            <parameter name="timePeriodId"/>
+            <parameter name="revisionSeqId"/>
+            <parameter name="asOfDate" type="Timestamp"/>
+            <parameter name="glAccountId"/>
+        </in-parameters>
+        <out-parameters>
+            <parameter name="budget" type="Map"/>
+            <parameter name="organizationPartyId"/>
+            <parameter name="timePeriodId"/>
+            <parameter name="periodName"/>
+            <parameter name="revisionSeqId"/>
+            <parameter name="revisionDateText"/>
+            <parameter name="isDraft" type="Boolean"/>
+            <parameter name="currencyUomId"/>
+            <parameter name="varianceRows" type="List"/>
+            <parameter name="totalApproved" type="BigDecimal"/>
+            <parameter name="totalCommitted" type="BigDecimal"/>
+            <parameter name="totalActual" type="BigDecimal"/>
+            <parameter name="totalRemaining" type="BigDecimal"/>
+            <parameter name="subTimePeriodList" type="List"/>
+            <parameter name="asOf"/>
+        </out-parameters>
+        <actions>
+            <set field="report" from="ec.resource.script('component://mr-mantle/service/mantle/other/Budgets.js')
+                .execute('variance', context)"/>
+            <script>ec.context.putAll(report)</script>
+        </actions>
+    </service>
 </services>
