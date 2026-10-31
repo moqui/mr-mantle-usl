@@ -59,8 +59,10 @@ function commitFiles(message, fileMap) {
     settle()
     return out.commitId
 }
-// a commit on a branch: the branch is the default for the moment
+// a commit on a branch: the branch is the default for the moment, with the git pool idle around each switch (a pool job
+// reading the repository's row while a switch is not yet committed keeps the branch as it was)
 function commitOn(branch, message, fileMap) {
+    settle()
     call("org.moqui.impl.GitServices.update#GitRepository", { repositoryId, branch })
     try { return commitFiles(message, fileMap) } finally { call("org.moqui.impl.GitServices.update#GitRepository", { repositoryId, branch: "main" }) }
 }
