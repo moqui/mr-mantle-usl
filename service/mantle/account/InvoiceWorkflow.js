@@ -233,6 +233,13 @@ function changeState(p) {
         statusId_changeReason: p.changeReason || "Invoice " + action
     })
     if (action === "approve" || action === "finalize") requirePosting(scope)
+    // an approved bill's spending against its budget, after its posting: a purchase order's commitment becomes actual,
+    // and a budget Stop refuses the approval unless an overrider gives budgetOverrideReason
+    if (!scope.receivable && target === "InvoiceApproved")
+        call("mantle.other.BudgetServices.convert#Commitment", {
+            invoiceId: record.invoiceId,
+            overrideReason: p.budgetOverrideReason || null
+        })
     // a sales invoice back in draft is taxed again when it is issued
     if (target === "InvoiceInProcess")
         call("mantle.other.TaxServices.calculate#InvoiceSalesTax", {invoiceId: record.invoiceId, clear: true})

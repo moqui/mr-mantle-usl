@@ -579,6 +579,61 @@ landed costs and repairs cost data. Every read checks Accounting's report read i
 - **Manufacturing's cost close** has its GL account types seeded: `GatLaborApplied`, `GatOverheadApplied`,
   `GatOutsideProcessAccrued` and `GatProductionVariance` (no DefaultSettings default: each organization maps them).
 
+## Budgets (P15)
+
+`mantle.other.BudgetServices` and `BudgetReportServices`, with `other/Budgets.js`; the records are Mantle's `Budget`,
+`BudgetItem`, `BudgetRevision`, `BudgetRevisionImpact`, `BudgetReview` and `BudgetParty`, with `BudgetControlPolicy`,
+`BudgetCommitment` and `BudgetContent` (`entity/BudgetControlEntities.xml`). A budget's organization is its period's
+party (`TimePeriod.partyId`); its other parties are `BudgetParty` rows (`store#BudgetParty`, `BUDGET_EDIT`).
+
+- **States.** Draft, Approved, Closed and Cancelled (`StatusFlowTransition`). `create#Budget` makes a draft and records
+  its creator; it and the item writers need `BUDGET_EDIT` in the budget's organization. `change#BudgetState` approves
+  (`BUDGET_APPROVE`; a self-approval is stamped on the review; not by the creator unless `allowAccountingSelfApproval`;
+  each account's sub periods must add up to its total), closes an approved budget or cancels a draft (`BUDGET_EDIT`,
+  with a reason). The item writers (`store#BudgetItem`, `store#BudgetItemsSubPeriods`, `store#BudgetItemDetail`,
+  `store#BudgetItemDetailsSubPeriods`) refuse a budget that is not a draft (`BUDGET_NOT_DRAFT`). The control and the
+  BOSS lists read an approved budget as of its latest revision, never items written around `revise#Budget`.
+- **Revisions.** Approval is revision `000`: a `BudgetRevision`, a `BudgetReview` and a `BudgetRevisionImpact` holding
+  each item's amount. `revise#Budget` (`BUDGET_EDIT`) changes an approved budget's amounts (lines by item or by account
+  and sub period, or the matrix form `glAccountId` with `amountMain` and `amountPer1`–`12`) as the next revision with its
+  reason; `BudgetItem.amount` is audit-logged with the reason. `get#BudgetAmounts` and `run#BudgetVariance` read the
+  amounts as of a revision (the latest impact of each item at or before it), or of the revision in effect at
+  `asOfDate`. Each approval and revision stores its PDF (`template/other/Budget.print.html.fancy`) as `BudgetContent`;
+  a PDF that cannot be made is logged and the revision stands.
+- **Control.** `BudgetControlPolicy` rows are effective-dated with audit-logged key fields (`store#Policy`,
+  `ACCOUNTING_ADMIN`, the `store#Rate` pattern): the organization, optionally a budget, an account and a stage (request,
+  purchase order, expense), the action (Ignore, Warn, Stop) and a threshold percent. Spending of an account on a day
+  counts against the approved budget's item for the sub period holding the day, else for its whole period. The decision
+  compares the actual (posted debits less credits, without a period close's closing entries) and committed (open
+  reserved commitments by `commitmentDate`) after the spending with the threshold: no policy or Ignore is not
+  controlled, Warn reserves with a warning, Stop refuses (`BUDGET_EXCEEDED`) unless a user holding `BUDGET_OVERRIDE`
+  gives an override reason. `check#Budget` previews it.
+- **Commitments.** `reserve#Commitment` (request or order line), `convert#Commitment` (to the next stage; with
+  `invoiceId`, a bill's posted debit lines) and `release#Commitment`, each idempotent per source line, revision and
+  stage (a different amount or account under the same key is `SOURCE_REVISION_REUSED`; retries are checked again under
+  the budget's lock). A new revision of a source line releases the earlier one's open commitment and holds its amount
+  less what the earlier ones passed on. A converted commitment's open amount is its amount less what later stages hold
+  (not blocked or reversed), and it is Converted when none is left, so committed and actual never count the same
+  spending; a commitment converts only on its own account, and on another it gives up its share (a released child).
+  Reserve and release need `INVOICE_APPROVE`, `BUDGET_EDIT` or `ACCOUNTING_ADMIN` in the organization, convert also
+  `PAYABLE_EDIT`; release takes only a closed or cancelled source's commitments unless the user holds `BUDGET_OVERRIDE`
+  or `ACCOUNTING_ADMIN`. A refused Stop is kept as a `BcBlocked` commitment, in its own transaction
+  (`record#BlockedCommitment`, ordered by the budget item's lock; the commitment's relationships carry no foreign keys
+  for this), and the `BudgetOverride` notification goes once to the organization's users holding `BUDGET_OVERRIDE`; the
+  line's notice is marked read when it passes.
+- **Bills.** `change#InvoiceState`'s approval of a bill (so `approve#Payable` too) calls `convert#Commitment` with the
+  bill after its posting: each debit line of the posting in effect converts its purchase order line's open commitment
+  (`OrderItemBilling`; each commitment's open amount used once across the bill's lines) and becomes an actual
+  commitment, keyed by the bill's `approvedSourceVersion`; an account's lines are decided together, with the budgets
+  locked in order, and `budgetOverrideReason` passes a Stop. When the approval is undone (Approved to Received) or the
+  bill cancelled, the revert SECAs call `reverse#InvoiceActuals`: its actuals are Reversed and the order commitments
+  open again. `get#InvoiceFinanceDetail`'s `budgetRows` are the invoice's commitments (F75).
+- **Variance.** `run#BudgetVariance` (`ACCOUNTING_VIEW`) checks the organization and that the period is the budget's own
+  or one of its sub periods (F6), and answers each account's budget as of the revision, committed, actual, remaining,
+  variance and its percent (none for a zero budget). `run#BudgetExpenseReport` and `run#BudgetExpenseDetailReport` stay
+  as they were for their callers.
+- **Spec.** `AccountingBudgets`.
+
 ## Returns and order changes (P17)
 
 **Flags.** Two audit-logged `PartyAcctgPreference` fields (`entity/ReturnSettlementEntities.xml`), off by default and set
@@ -729,6 +784,7 @@ authorization, capture and refund, `alwaysDecline#PaymentRelease`, `alwaysDeclin
 ./moq test mr-mantle --spec AccountingPeriodClose,AccountingProjectCost
 ./moq test mr-mantle --spec AccountingTax,TaxStatementServices
 ./moq test mr-mantle --spec AccountingValuation,ProductStandardCosts
+./moq test mr-mantle --spec AccountingBudgets,BudgetServices
 ./moq test mr-mantle --spec AccountingReturns,ReturnToResponseBasicFlow,OrderToCashBasicFlow
 ./moq test mr-mantle --spec AccountingPortals
 ```
