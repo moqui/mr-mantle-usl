@@ -280,4 +280,20 @@ along with this software (see the LICENSE.md file). If not, see
             <DbFormFieldOption sequenceNum="1" keyValue="X"/><DbFormFieldAttribute attributeName="allow-empty" value="true"/>
         </moqui.screen.form.DbFormField>
     </moqui.screen.form.DbForm>
+
+    <!-- A local sales tax return's summary: mantle.other.TaxServices.create#SalesTaxStatement fills it from the
+        invoice tax lines (find#SalesTaxLines); a return in an authority's own format is not part of the first release. -->
+    <moqui.screen.form.DbForm formId="LocalSalesTaxReturn" purposeEnumId="DbfpTaxStatement"
+            description="Local sales tax return">
+        <moqui.screen.form.DbFormField fieldName="str_period" title="Period" layoutSequenceNum="1"
+                fieldTypeEnumId="DBFFT_text-line"/>
+        <moqui.screen.form.DbFormField fieldName="str_authority" title="Tax authority" layoutSequenceNum="2"
+                fieldTypeEnumId="DBFFT_text-line"/>
+        <moqui.screen.form.DbFormField fieldName="str_taxable" title="Taxable sales" layoutSequenceNum="3"
+                fieldTypeEnumId="DBFFT_text-line"/>
+        <moqui.screen.form.DbFormField fieldName="str_tax" title="Tax collected" layoutSequenceNum="4"
+                fieldTypeEnumId="DBFFT_text-line"/>
+        <moqui.screen.form.DbFormField fieldName="str_lines" title="Invoice tax lines" layoutSequenceNum="5"
+                fieldTypeEnumId="DBFFT_text-line"/>
+    </moqui.screen.form.DbForm>
 </entity-facade-xml>

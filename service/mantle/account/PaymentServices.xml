@@ -577,7 +577,9 @@ along with this software (see the LICENSE.md file). If not, see
             <parameter name="invoiceId" required="true"/>
             <auto-parameters entity-name="mantle.account.payment.Payment" include="nonpk">
                 <exclude field-name="overrideGlAccountId"/><exclude field-name="acctgTransResultEnumId"/>
-                <exclude field-name="reconcileStatusId"/><exclude field-name="paymentMethodFileId"/></auto-parameters>
+                <exclude field-name="reconcileStatusId"/><exclude field-name="paymentMethodFileId"/>
+                <!-- declared below, after paymentStatusId, which its default reads -->
+                <exclude field-name="statusId"/></auto-parameters>
             <parameter name="paymentTypeEnumId"/>
             <parameter name="paymentStatusId" default-value="PmntDelivered"/>
             <parameter name="statusId" default="paymentStatusId"/>

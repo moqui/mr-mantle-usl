@@ -170,6 +170,8 @@ function issue(scope, p, preference, action) {
     creditCap(record)
     if (preference.singleCurrencyDocumentsOnly === "Y" && record.currencyUomId !== preference.baseCurrencyUomId)
         denied("FOREIGN_CURRENCY_DISABLED", "The invoice currency must match the organization's base currency")
+    // A sales invoice gets its tax lines before it is issued; one whose tax cannot be calculated is refused (AC-08).
+    if (scope.receivable) call("mantle.other.TaxServices.calculate#InvoiceSalesTax", {invoiceId: record.invoiceId})
     if (action === "approve" || !scope.receivable) approve(scope, preference)
     else if (
         preference.invoiceApprovalRequired === "Y" &&
@@ -231,6 +233,9 @@ function changeState(p) {
         statusId_changeReason: p.changeReason || "Invoice " + action
     })
     if (action === "approve" || action === "finalize") requirePosting(scope)
+    // a sales invoice back in draft is taxed again when it is issued
+    if (target === "InvoiceInProcess")
+        call("mantle.other.TaxServices.calculate#InvoiceSalesTax", {invoiceId: record.invoiceId, clear: true})
     const saved = one(I, {invoiceId: record.invoiceId})
     const result = {
         invoiceId: record.invoiceId,

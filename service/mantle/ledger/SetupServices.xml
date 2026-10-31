@@ -72,8 +72,8 @@ along with this software (see the LICENSE.md file). If not, see
             making an error journal when it has none of its own; answers as get#Preferences. Refuses a user without
             finance administration, a stale revision, a flag that is not Y or N, reviewed gateway payments without
             settlement controls, a unit that is not a currency, a change of base currency, costing or fiscal year start
-            once entries are posted, an invalid fiscal year start, an error journal of another organization or type and
-            a document template that is not approved.</description>
+            once entries are posted, an invalid fiscal year start, an error journal of another organization or type, a
+            document template that is not approved and an unknown sales tax gateway.</description>
         <in-parameters>
             <parameter name="organizationPartyId"/>
             <parameter name="settings" type="Map"/>
@@ -155,6 +155,12 @@ along with this software (see the LICENSE.md file). If not, see
                 <if condition="errorJournal.glJournalTypeEnumId !== 'GLJRNL_ERROR'">
                     <return error="true" message="Choose an error journal in this organization"/>
                 </if>
+            </if>
+            <if condition="preferenceValues.taxGatewayConfigId">
+                <entity-find-one entity-name="mantle.other.tax.TaxGatewayConfig" value-field="taxGateway" disable-authz="true">
+                    <field-map field-name="taxGatewayConfigId" from="preferenceValues.taxGatewayConfigId"/>
+                </entity-find-one>
+                <if condition="taxGateway == null"><return error="true" message="Choose a sales tax gateway"/></if>
             </if>
             <iterate list="['invoiceDocumentTemplate', 'paymentDocumentTemplate']" entry="templateField">
                 <if condition="preferenceValues[templateField] &amp;&amp; preferenceValues[templateField] !== 'standard'">
