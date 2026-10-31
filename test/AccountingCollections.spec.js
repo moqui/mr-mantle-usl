@@ -358,3 +358,51 @@ feature("a reminder sent by one organization does not keep another's reminder to
         !notices.some(row => row.excludedReason == "RECENT_NOTICE")
     }
 })
+
+feature("a notice left sending is settled by AR as failed or sent with a note; a reader cannot, nor one not sending", {
+    when() {
+        // the instalment's notice, its email's outcome unknown (as after an exception during the email call)
+        const fourth = prefix + "_FOURTH"
+        const notice = rows("mantle.account.invoice.DunningNotice", {customerPartyId: fourth})[0]
+        const key = {dunningRunId: notice.dunningRunId, noticeSeqId: notice.noticeSeqId}
+        const resolve = "mantle.account.CollectionServices.resolve#DunningNotice"
+        const sending = () => {
+            login("john.doe")
+            svc("update#mantle.account.invoice.DunningNotice", Object.assign({statusId: "DntSending"}, key))
+            login(f.users.ar)
+        }
+        sending()
+        login(f.users.read)
+        const reader = refused(resolve, Object.assign({statusId: "DntSent", note: "Customer confirmed"}, key))
+        login(f.users.ar)
+        const noNote = refused(resolve, Object.assign({statusId: "DntSent", note: " "}, key))
+        const failed = collections("resolve#DunningNotice", Object.assign({statusId: "DntFailed", note: "Bounced"}, key))
+        const failedNotice = one("mantle.account.invoice.DunningNotice", key)
+        const partial = one("mantle.account.invoice.DunningRun", {dunningRunId: key.dunningRunId}).statusId
+        const notSending = refused(resolve, Object.assign({statusId: "DntSent", note: "Again"}, key))
+        sending()
+        collections("resolve#DunningNotice", Object.assign({statusId: "DntSent", note: "Customer confirmed"}, key))
+        return {
+            reader,
+            noNote,
+            failed,
+            failedNotice,
+            partial,
+            notSending,
+            notice: one("mantle.account.invoice.DunningNotice", key),
+            run: one("mantle.account.invoice.DunningRun", {dunningRunId: key.dunningRunId})
+        }
+    },
+    then({reader, noNote, failed, failedNotice, partial, notSending, notice, run}) {
+        reader.includes("PERMISSION_DENIED")
+        noNote.includes("NOTE_REQUIRED")
+        failed.statusId == "DntFailed"
+        failedNotice.errorMessage == "Settled: Bounced"
+        partial == "DrnPartial"
+        notSending.includes("NOTICE_NOT_SENDING")
+        notice.statusId == "DntSent"
+        notice.sentDate != null
+        notice.errorMessage == "Settled: Customer confirmed"
+        run.statusId == "DrnSent"
+    }
+})

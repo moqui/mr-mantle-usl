@@ -346,12 +346,15 @@ along with this software (see the LICENSE.md file). If not, see
         </actions>
     </service>
     <service verb="send" noun="Dunning" allow-remote="false">
-        <description>Send a previewed reminder run: each notice not yet sent in its own transaction (send#DunningNotice),
-            through its level's email template to the customer's billing addresses. A notice that fails (no or an invalid
-            address, a delivery failure) is recorded with its reason and the others are sent; sending the run again sends
-            only the notices not yet sent, so one failed recipient never resends the rest. The same operation key answers
-            the first result. Needs RECEIVABLE_EDIT in the run's organization. The weekly send_SalesInvoicePastDueEmails
-            job stays paused: dunning runs are the only scheduled reminders.</description>
+        <description>Send a previewed reminder run: each notice not yet sent marked sending, then prepared in its own
+            transaction (prepare#DunningNotice), then sent through its level's email template to the customer's billing
+            addresses. A notice that fails before the email (no or an invalid address, an error preparing it) or whose
+            email is not sent is recorded failed with its reason and the others are sent; sending the run again sends
+            only the notices not yet sent, so one failed recipient never resends the rest. A notice with an exception
+            during or after its email call stays sending (SEND_UNKNOWN) and is not sent again: resolve#DunningNotice
+            settles it. The same operation key answers the first result. Needs RECEIVABLE_EDIT in the run's
+            organization. The weekly send_SalesInvoicePastDueEmails job stays paused: dunning runs are the only
+            scheduled reminders.</description>
         <in-parameters>
             <parameter name="dunningRunId" required="true"/>
             <parameter name="operationKey" required="true"/>
@@ -371,23 +374,36 @@ along with this software (see the LICENSE.md file). If not, see
             <set field="alreadyApplied" from="!!sent.alreadyApplied"/>
         </actions>
     </service>
-    <service verb="send" noun="DunningNotice" allow-remote="false">
-        <description>One notice of a run being sent (send#Dunning calls it, each in its own transaction): its invoices read
-            again (a paid one is left out; none left leaves the notice out), then the reminder to its recipients. Records
-            sent, or failed with its reason. Checks no permission: send#Dunning has.</description>
+    <service verb="prepare" noun="DunningNotice" allow-remote="false">
+        <description>One sending notice of a run made ready (send#Dunning calls it, each in its own transaction): its
+            invoices read again (a paid one is left out; none left leaves the notice out), its recipients checked (none
+            or an invalid one leaves it failed) and its email rendered. Sends nothing: prepared has ready, and when
+            ready the email's parameters, overdueAmount and invoiceIds. Checks no permission: send#Dunning has.</description>
         <in-parameters>
             <parameter name="dunningRunId" required="true"/>
             <parameter name="noticeSeqId" required="true"/>
         </in-parameters>
-        <out-parameters>
-            <parameter name="statusId"/>
-            <parameter name="reasonCode"/>
-        </out-parameters>
+        <out-parameters><parameter name="prepared" type="Map"/></out-parameters>
         <actions>
             <set field="module" value="component://mr-mantle/service/mantle/account/Collections.js"/>
-            <set field="sent" from="ec.resource.script(module).execute('sendNotice', context)"/>
-            <set field="statusId" from="sent.statusId"/>
-            <set field="reasonCode" from="sent.reasonCode"/>
+            <set field="prepared" from="ec.resource.script(module).execute('prepareNotice', context)"/>
+        </actions>
+    </service>
+    <service verb="resolve" noun="DunningNotice" allow-remote="false">
+        <description>Settle a notice left sending (its email's outcome unknown, SEND_UNKNOWN) as sent (DntSent) or
+            failed (DntFailed, sent again by the run's next send), with a note of how the outcome was found; the run's
+            state follows. Needs RECEIVABLE_EDIT in the run's organization.</description>
+        <in-parameters>
+            <parameter name="dunningRunId" required="true"/>
+            <parameter name="noticeSeqId" required="true"/>
+            <parameter name="statusId" required="true"/>
+            <parameter name="note" required="true"/>
+        </in-parameters>
+        <out-parameters><parameter name="statusId"/></out-parameters>
+        <actions>
+            <set field="module" value="component://mr-mantle/service/mantle/account/Collections.js"/>
+            <set field="resolved" from="ec.resource.script(module).execute('resolveNotice', context)"/>
+            <set field="statusId" from="resolved.statusId"/>
         </actions>
     </service>
     <service verb="get" noun="DunningRun" allow-remote="false">

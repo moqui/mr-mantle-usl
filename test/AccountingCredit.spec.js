@@ -430,3 +430,49 @@ feature("an order of two parts holds the part over its limit, approves the other
         other.p2 == "OrderHold"
     }
 })
+
+feature("two parts of one customer approved apart: releasing the held part never checks or holds the approved one", {
+    when() {
+        const same = prefix + "_SAME"
+        login("john.doe")
+        svc("create#mantle.party.Party", {partyId: same, partyTypeEnumId: "PtyOrganization"})
+        svc("create#mantle.party.PartyRole", {partyId: same, roleTypeId: "Customer"})
+        const orderId = twoParts(same, same)
+        // part 02 approved while the customer has no policy; then a limit, and part 01 is held over it
+        login(approver)
+        svc("mantle.order.OrderServices.approve#Order", {orderId, orderPartSeqId: "02"})
+        policy(same, {creditLimit: 20, actionEnumId: "CpaHold"})
+        login(approver)
+        const held = svc("mantle.order.OrderServices.approve#Order", {orderId, orderPartSeqId: "01"})
+        const check = svc("mantle.order.OrderInfoServices.check#OrderPreApprove", {orderId})
+        login(credit)
+        const released = svc("mantle.account.CreditServices.release#CreditHold", {
+            orderId,
+            orderPartSeqId: "01",
+            reason: "Part 01 released"
+        })
+        // the whole order approved after the release: only part 01 awaits approval, and its release decision passes it
+        login(approver)
+        const approved = svc("mantle.order.OrderServices.approve#Order", {orderId})
+        return {
+            held,
+            warnings: check.approveWarnings,
+            released,
+            approved,
+            p1: partStatus(orderId, "01"),
+            p2: partStatus(orderId, "02"),
+            reasons: rows("mantle.order.OrderHoldReason", {orderId})
+        }
+    },
+    then({held, warnings, released, approved, p1, p2, reasons}) {
+        held.creditHeld == true
+        held.heldPartSeqIds.join() == "01"
+        warnings.some(row => row.startsWith("ORDER_HOLD_OPEN"))
+        released.statusId == "OrderPlaced"
+        approved.creditHeld == false
+        p1 == "OrderApproved"
+        p2 == "OrderApproved"
+        reasons.length == 1
+        reasons[0].orderPartSeqId == "01"
+    }
+})

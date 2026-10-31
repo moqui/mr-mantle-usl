@@ -409,9 +409,10 @@ Neither checks the organization: their callers do. Nothing uses OrderBeingChange
 - `store#Policy` (`ACCOUNTING_ADMIN` or `CREDIT_HOLD_RELEASE`) and `store#Defaults` (`ACCOUNTING_ADMIN`; the policy's currency is the organization's base
   currency unless given): the row in effect
   ends and the next starts, unless nothing changed; `ended` ends it.
-- `evaluate#OrderCredit` (no permission; `allow-remote` false): the order's sales part against the customer's policy, else
-  the default, part by part. Exposure is the unpaid issued invoices and the open orders not yet invoiced (part totals less
-  OrderItemBilling), less unapplied payments and the payments authorized on those orders, each summed in a query
+- `evaluate#OrderCredit` (no permission; `allow-remote` false): the order's sales parts awaiting approval (Placed or
+  Processing; an approved, held or completed part is never checked) against the customer's policy, else the default, part
+  by part. Exposure is the unpaid issued invoices and the open orders not yet invoiced (part totals less
+  OrderItemBilling), less unapplied payments and the payments authorized on those orders while open, each summed in a query
   (`CreditOpenOrderSum`, `CreditOrderBillingSum`, `CreditPaymentSum`); over the limit, or an invoice portion more days past
   due than allowed (its due schedule less what was applied, `ledger/Aging.js` `pastDue`), gives the policy's action; an
   order in another currency and an overdue check that could not read every unpaid invoice are reasons. A part released by
@@ -419,8 +420,8 @@ Neither checks the organization: their callers do. Nothing uses OrderBeingChange
   `placeHold` a Hold result places a Credit hold and sends `CreditHoldRelease` to the organization's users holding
   `CREDIT_HOLD_RELEASE`. No policy, a purchase order or an order between internal organizations passes.
 - It runs inside `OrderServices.approve#Order` (a Hold result holds the order instead, `creditHeld`; a Warn result
-  approves with `creditWarning`; an order with an open hold reason is refused, `ORDER_HOLD_OPEN`) and as the
-  `OrderPreApproveCredit` SECA (`service/AccountingCredit.secas.xml`) on `check#OrderPreApprove`, adding its warning,
+  approves with `creditWarning`; an order with an open hold reason is refused, `ORDER_HOLD_OPEN`, which
+  `check#OrderPreApprove` also warns of) and as the `OrderPreApproveCredit` SECA (`service/AccountingCredit.secas.xml`) on `check#OrderPreApprove`, adding its warning,
   which stops `autoApprove#Order`; `autoApprove#Order` passes `approving`, so only then is the hold placed.
 - `release#CreditHold` (`CREDIT_HOLD_RELEASE`; a reason; a part for an order held by part): a `CreditHoldDecision` with
   the exposure and limit it was made on and until when it stands (a past expiry refused), then `release#OrderHold`; the
@@ -441,14 +442,17 @@ Neither checks the organization: their callers do. Nothing uses OrderBeingChange
   same customer gets it again, its EmailTemplate, whether disputed invoices are left out).
 - `preview#Dunning` (`RECEIVABLE_EDIT`): a `DunningRun` as of a day with a `DunningNotice` per customer and currency at
   the level of its most overdue invoice that is not disputed (each invoice's past-due portions of its due schedule, as the
-  aging reads them; a notice of the same key, organization, customer, currency, level and invoices, sent within the
-  cadence is left out), and the invoices left out with the reason (`DISPUTED`,
+  aging reads them, as of the run's day; a notice of the same key, organization, customer, currency and level, sent
+  within the cadence is left out), and the invoices left out with the reason (`DISPUTED`,
   `COVERED`, `PROMISED`, `RECENT_NOTICE`); more than 2,000 overdue invoices are named (incomplete).
 - `send#Dunning` (`RECEIVABLE_EDIT`, an operation key): each notice not yet sent marked sending (`DntSending`) in a
-  transaction of its own, then sent in its own transaction (`send#DunningNotice`: its invoices read again, those disputed
-  since left out unless the level includes them, the reminder through the level's template, `MANTLE_DUNNING_EMAIL` by
-  default, from `template/account/DunningNotice.html.fancy`); a failure keeps its reason and sending again sends only
-  those. `get#DunningRun` reads a run. `send_SalesInvoicePastDueEmails` stays paused.
+  transaction of its own, then prepared in its own (`prepare#DunningNotice`: its invoices read again, those disputed
+  since left out unless the level includes them, its recipients checked, the reminder rendered from
+  `template/account/DunningNotice.html.fancy`), then sent through the level's template (`MANTLE_DUNNING_EMAIL` by
+  default). A failure before the email or an email not sent is failed with its reason, and sending again sends only
+  those; an exception during or after the email call leaves the notice sending (`SEND_UNKNOWN`), never sent again on
+  its own. `resolve#DunningNotice` (`RECEIVABLE_EDIT`, a note) settles such a notice as sent or failed.
+  `get#DunningRun` reads a run. `send_SalesInvoicePastDueEmails` stays paused.
 
 **Recurring invoices (AC-09).** `InvoiceSchedule` (a template invoice, interval, first and last day, next day, term,
 state) and `InvoiceScheduleOccurrence` (one period by day: its invoice, or why it failed). `RecurringInvoiceServices`

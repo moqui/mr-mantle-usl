@@ -56,8 +56,9 @@ function exposure(organizationPartyId, customerPartyId, currencyUomId, overdue =
     const unapplied = sum("mantle.account.payment.CreditPaymentSum", payments, "unappliedSum", query =>
         query.condition("statusId", "in", ["PmntDelivered", "PmntConfirmed"]).condition("unappliedTotal", "greater", toDecimal(0))
     )
-    const authorized = sum("mantle.account.payment.CreditPaymentSum", payments, "amountSum", query =>
-        query.condition("statusId", "PmntAuthorized").condition("orderId", "is-not-null", null)
+    // payments authorized on the customer's open orders only
+    const authorized = sum("mantle.account.payment.CreditOrderPaymentSum", payments, "amountSum", query =>
+        query.condition("statusId", "PmntAuthorized").condition("orderStatusId", "in", OPEN_ORDER_STATUSES)
     )
     const round = value => ec.l10n.roundCurrency(value, currencyUomId)
     const uninvoiced = ordered.subtract(billed).compare(0) > 0 ? ordered.subtract(billed) : toDecimal(0)
@@ -146,6 +147,8 @@ function evaluate(p) {
     const salesParts = allParts.filter(
         part =>
             (!p.orderPartSeqId || part.orderPartSeqId === p.orderPartSeqId) &&
+            // only a part awaiting approval: an approved, held or completed part is never checked or held
+            ["OrderPlaced", "OrderProcessing"].includes(part.statusId) &&
             internal(part.vendorPartyId) &&
             part.customerPartyId &&
             !internal(part.customerPartyId)

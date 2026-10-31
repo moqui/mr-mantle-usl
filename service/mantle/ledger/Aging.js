@@ -75,9 +75,10 @@ function openPortions(invoices, asOfEnd = null) {
     }
     return out
 }
-// What of each invoice is past due on a day (portions due before it) and its oldest such due day.
-function pastDue(invoices, day) {
-    const opens = openPortions(invoices)
+// What of each invoice is past due on a day (portions due before it) and its oldest such due day; with asOfEnd (a past
+// day's end) what was open then.
+function pastDue(invoices, day, asOfEnd = null) {
+    const opens = openPortions(invoices, asOfEnd)
     const out = {}
     for (const [invoiceId, value] of Object.entries(opens)) {
         const due = value.portions.filter(portion => portion.dueDay && portion.dueDay < day)

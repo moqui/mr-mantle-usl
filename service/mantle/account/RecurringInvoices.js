@@ -210,7 +210,23 @@ function templateLines(invoiceId) {
     return all.filter(line => !skipped.has(line.invoiceItemSeqId))
 }
 // The fields of a template line a draft copies: all but the template's identity, its stamps and what it was billed from.
-const LINE_SKIP = new Set(["invoiceId", "lastUpdatedStamp", "taxCalculated"])
+// Links to other records (the invoice it came from, an asset, a financial account movement, a payroll adjustment, an
+// opportunity) and a tax line's rate fields are not copied.
+const LINE_SKIP = new Set([
+    "invoiceId",
+    "lastUpdatedStamp",
+    "taxCalculated",
+    "parentInvoiceId",
+    "parentInvoiceItemSeqId",
+    "assetId",
+    "finAccountTransId",
+    "payrollAdjustmentId",
+    "salesOpportunityId",
+    "taxAuthorityRateId",
+    "taxPercentage",
+    "taxableAmount",
+    "taxRoundingAmount"
+])
 
 // Make one period's draft. The schedule is locked first; a period already made answers its invoice. Called in a
 // transaction of its own by generate#Invoices and the job; it checks no permission.

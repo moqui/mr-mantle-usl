@@ -355,7 +355,10 @@ function storeLevel(p) {
 // was applied (LedgerReportServices' aging, Aging.pastDue), with its oldest such due day; an invoice with nothing past
 // due is left out.
 function invoiceRows(invoices, asOf) {
-    const late = ec.resource.script("component://mr-mantle/service/mantle/ledger/Aging.js").pastDue(invoices, asOf)
+    // a past day reads what was open then
+    const late = ec.resource
+        .script("component://mr-mantle/service/mantle/ledger/Aging.js")
+        .pastDue(invoices, asOf, asOf < today() ? endOf(asOf) : null)
     return invoices
         .filter(invoice => late[invoice.invoiceId])
         .map(invoice => {
@@ -467,9 +470,10 @@ function previewDunning(p) {
             continue
         }
         const invoiceIds = included.map(line => line.invoiceId).sort()
-        const noticeKey = lib.hash({organizationPartyId, customerPartyId, currencyUomId, level: level.sequenceNum, invoiceIds})
+        const noticeKey = lib.hash({organizationPartyId, customerPartyId, currencyUomId, level: level.sequenceNum})
         const since = startOf(addDays(asOf, -Number(level.cadenceDays || 1) + 1))
-        // the same reminder (its key: this organization, customer, currency, level and invoices) sent within the cadence
+        // a reminder of this level to the customer (its key: this organization, customer, currency and level) sent within
+        // the cadence
         const recent = find(NOTICE, {noticeKey, statusId: "DntSent"}).condition("sentDate", "greater-equals", since).count()
         if (recent > 0) {
             excludedRow("RECENT_NOTICE", included)
@@ -512,8 +516,10 @@ function runScope(p, permission) {
     lib.organization(run.organizationPartyId, permission)
     return run
 }
-// Send the run's notices not yet sent, each in its own transaction (send#DunningNotice): a failure is recorded on its
-// notice and the others go on; a sent notice is never sent again. The same operation key answers the first result.
+// Send the run's notices not yet sent. Each is marked sending in a transaction of its own, then prepared in its own
+// (prepare#DunningNotice: a failure there, before any email, leaves it failed with its reason); then its email; then the
+// outcome. An exception during or after the email call leaves it sending with SEND_UNKNOWN, never sent again on its own
+// (resolve#DunningNotice settles it). The same operation key answers the first result.
 function sendDunning(p) {
     const first = runScope(p, "RECEIVABLE_EDIT")
     const op = lib.operation(p, "DunningSend", first.organizationPartyId, {dunningRunId: first.dunningRunId})
@@ -525,53 +531,73 @@ function sendDunning(p) {
     )
     const results = []
     for (const notice of waiting) {
-        // marked sending in a transaction of its own before its email, so a retry never sends it twice
+        const key = {dunningRunId: notice.dunningRunId, noticeSeqId: notice.noticeSeqId}
+        const record = values => lib.probe("update#" + NOTICE, Object.assign({}, key, values))
+        const result = (statusId, reasonCode) =>
+            results.push({noticeSeqId: notice.noticeSeqId, customerPartyId: notice.customerPartyId, statusId, reasonCode})
         try {
-            lib.probe("update#" + NOTICE, {
-                dunningRunId: notice.dunningRunId,
-                noticeSeqId: notice.noticeSeqId,
-                statusId: "DntSending"
-            })
+            record({statusId: "DntSending", errorMessage: null})
         } catch (error) {
             ec.logger.error("Dunning notice " + notice.noticeSeqId + " not marked sending: " + error.message)
             continue
         }
+        let prepared
         try {
-            const out = lib.probe("mantle.account.CollectionServices.send#DunningNotice", {
-                dunningRunId: notice.dunningRunId,
-                noticeSeqId: notice.noticeSeqId
-            })
-            results.push({
-                noticeSeqId: notice.noticeSeqId,
-                customerPartyId: notice.customerPartyId,
-                statusId: out.statusId,
-                reasonCode: out.reasonCode || null
-            })
+            prepared = lib.probe("mantle.account.CollectionServices.prepare#DunningNotice", key).prepared || {}
         } catch (error) {
+            record({statusId: "DntFailed", errorMessage: ("SEND_FAILED: " + error.message).slice(0, 255)})
+            result("DntFailed", "SEND_FAILED")
+            continue
+        }
+        if (!prepared.ready) {
+            result(prepared.statusId, prepared.reasonCode || null)
+            continue
+        }
+        try {
+            // a failed send (its errors, not an exception) leaves no email and the notice failed
+            ec.message.pushErrors()
+            let sent
+            try {
+                sent =
+                    ec.service
+                        .sync()
+                        .name("org.moqui.impl.EmailServices.send#EmailTemplate")
+                        .parameters(prepared.email)
+                        .disableAuthz()
+                        .requireNewTransaction(true)
+                        .call() || {}
+            } finally {
+                ec.message.clearErrors()
+                ec.message.popErrors()
+            }
+            const message = sent?.emailMessageId
+                ? one("moqui.basic.email.EmailMessage", {emailMessageId: sent.emailMessageId})
+                : null
+            if (!message || !["ES_SENT", "ES_READY", "ES_SCHEDULED"].includes(message.statusId)) {
+                record({statusId: "DntFailed", errorMessage: "DELIVERY_FAILED: The email could not be sent"})
+                result("DntFailed", "DELIVERY_FAILED")
+                continue
+            }
+            record({
+                statusId: "DntSent",
+                emailMessageId: message.emailMessageId,
+                sentDate: ec.user.nowTimestamp,
+                overdueAmount: prepared.overdueAmount,
+                invoiceIds: prepared.invoiceIds
+            })
+            result("DntSent", null)
+        } catch (error) {
+            // its email may have gone: it stays sending, with the error, and is not sent again on its own
             ec.logger.error("Dunning run " + notice.dunningRunId + " notice " + notice.noticeSeqId + ": " + error.message)
-            // its email may have gone: it stays sending, with the error, to be checked by hand, and is not sent again
-            lib.probe("update#" + NOTICE, {
-                dunningRunId: notice.dunningRunId,
-                noticeSeqId: notice.noticeSeqId,
-                errorMessage: ("SEND_UNKNOWN: " + String(error.message)).slice(0, 255)
-            })
-            results.push({
-                noticeSeqId: notice.noticeSeqId,
-                customerPartyId: notice.customerPartyId,
-                statusId: "DntSending",
-                reasonCode: "SEND_UNKNOWN"
-            })
+            try {
+                record({errorMessage: ("SEND_UNKNOWN: " + error.message).slice(0, 255)})
+            } catch (recordError) {
+                ec.logger.error("Dunning notice " + notice.noticeSeqId + " error not recorded: " + recordError.message)
+            }
+            result("DntSending", "SEND_UNKNOWN")
         }
     }
-    const left = find(NOTICE, {dunningRunId: first.dunningRunId})
-        .condition("statusId", "in", ["DntPending", "DntFailed", "DntSending"])
-        .count()
-    call("update#" + RUN, {
-        dunningRunId: first.dunningRunId,
-        statusId: left ? "DrnPartial" : "DrnSent",
-        sentByUserId: ec.user.userId,
-        sentDate: ec.user.nowTimestamp
-    })
+    updateRunStatus(first.dunningRunId)
     const result = {
         results,
         sentCount: results.filter(row => row.statusId === "DntSent").length,
@@ -580,11 +606,40 @@ function sendDunning(p) {
     lib.complete(op, RUN, first.dunningRunId, result)
     return Object.assign(result, {alreadyApplied: false})
 }
-// One notice: its invoices read again (one now paid or no longer overdue is left out; nothing left leaves the notice
-// out), then the reminder email to its recipients through its level's template.
-function sendNotice(p) {
+function updateRunStatus(dunningRunId) {
+    const left = find(NOTICE, {dunningRunId}).condition("statusId", "in", ["DntPending", "DntFailed", "DntSending"]).count()
+    call("update#" + RUN, {
+        dunningRunId,
+        statusId: left ? "DrnPartial" : "DrnSent",
+        sentByUserId: ec.user.userId,
+        sentDate: ec.user.nowTimestamp
+    })
+}
+// Settle a notice left sending (its email's outcome unknown) as sent or failed, with a note; a failed one is sent again
+// by the next send of the run.
+function resolveNotice(p) {
+    const run = runScope(p, "RECEIVABLE_EDIT")
+    const note = String(p.note || "").trim()
+    if (!note) denied("NOTE_REQUIRED", "Say how the outcome was found")
+    if (!["DntSent", "DntFailed"].includes(p.statusId)) denied("STATUS_INVALID", "Choose sent or failed")
+    const notice = find(NOTICE, {dunningRunId: run.dunningRunId, noticeSeqId: p.noticeSeqId}).forUpdate(true).one()
+    if (!notice || notice.statusId !== "DntSending") denied("NOTICE_NOT_SENDING", "Only a notice left sending is settled")
+    call("update#" + NOTICE, {
+        dunningRunId: run.dunningRunId,
+        noticeSeqId: p.noticeSeqId,
+        statusId: p.statusId,
+        sentDate: p.statusId === "DntSent" ? ec.user.nowTimestamp : null,
+        errorMessage: ("Settled: " + note).slice(0, 255)
+    })
+    updateRunStatus(run.dunningRunId)
+    return {statusId: p.statusId}
+}
+// One notice ready to send: its invoices read again (one now paid, no longer past due, or disputed since unless the level
+// includes disputed invoices is left out; nothing left leaves the notice out), its recipients checked, and its email
+// rendered. Sends nothing.
+function prepareNotice(p) {
     const notice = find(NOTICE, {dunningRunId: p.dunningRunId, noticeSeqId: p.noticeSeqId}).forUpdate(true).one()
-    if (!notice || notice.statusId !== "DntSending") return {statusId: notice?.statusId || null}
+    if (!notice || notice.statusId !== "DntSending") return {statusId: notice?.statusId || null, ready: false}
     const run = one(RUN, {dunningRunId: p.dunningRunId})
     const asOf = dayText(run.asOfDate)
     const update = values =>
@@ -600,11 +655,11 @@ function sendNotice(p) {
     if (!lines.length) {
         const reasonCode = open.some(row => row.disputedDate) ? "DISPUTED" : "PAID"
         update({statusId: "DntExcluded", excludedReason: reasonCode})
-        return {statusId: "DntExcluded", reasonCode}
+        return {statusId: "DntExcluded", reasonCode, ready: false}
     }
     const fail = (reasonCode, message) => {
         update({statusId: "DntFailed", errorMessage: reasonCode + ": " + message})
-        return {statusId: "DntFailed", reasonCode}
+        return {statusId: "DntFailed", reasonCode, ready: false}
     }
     const addresses = idList(notice.toAddresses).map(address => address.toLowerCase())
     if (!addresses.length) return fail("RECIPIENT_REQUIRED", "The customer has no billing email address")
@@ -629,43 +684,22 @@ function sendNotice(p) {
         partyId: run.organizationPartyId,
         emailContactMechPurposeId: "EmailBilling"
     })
-    ec.message.pushErrors()
-    let sent
-    try {
-        sent =
-            ec.service
-                .sync()
-                .name("org.moqui.impl.EmailServices.send#EmailTemplate")
-                .parameters({
-                    emailTemplateId: level?.emailTemplateId || "MANTLE_DUNNING_EMAIL",
-                    toAddresses: addresses.join(","),
-                    bodyParameters: {
-                        subject: "Payment reminder from " + organizationName,
-                        fromAddress: issuer.emailAddress,
-                        fromName: organizationName
-                    },
-                    body,
-                    bodyText: "Past due as of " + asOf + ": " + ec.l10n.formatCurrency(overdueAmount, notice.currencyUomId)
-                })
-                .disableAuthz()
-                .requireNewTransaction(true)
-                .call() || {}
-    } finally {
-        ec.message.clearErrors()
-        ec.message.popErrors()
-    }
-    const message = sent?.emailMessageId ? one("moqui.basic.email.EmailMessage", {emailMessageId: sent.emailMessageId}) : null
-    if (!message || !["ES_SENT", "ES_READY", "ES_SCHEDULED"].includes(message.statusId))
-        return fail("DELIVERY_FAILED", "The email could not be sent")
-    update({
-        statusId: "DntSent",
-        emailMessageId: message.emailMessageId,
-        sentDate: ec.user.nowTimestamp,
+    return {
+        ready: true,
         overdueAmount: ec.l10n.roundCurrency(overdueAmount, notice.currencyUomId),
         invoiceIds: lines.map(line => line.invoiceId).join(","),
-        errorMessage: null
-    })
-    return {statusId: "DntSent"}
+        email: {
+            emailTemplateId: level?.emailTemplateId || "MANTLE_DUNNING_EMAIL",
+            toAddresses: addresses.join(","),
+            bodyParameters: {
+                subject: "Payment reminder from " + organizationName,
+                fromAddress: issuer.emailAddress,
+                fromName: organizationName
+            },
+            body,
+            bodyText: "Past due as of " + asOf + ": " + ec.l10n.formatCurrency(overdueAmount, notice.currencyUomId)
+        }
+    }
 }
 // A run with its notices for a reader: each with the customer's name, level and invoices, and the run's counts.
 function getRun(p) {
@@ -712,7 +746,8 @@ const operations = {
     storeLevel,
     previewDunning,
     sendDunning,
-    sendNotice,
+    prepareNotice,
+    resolveNotice,
     getRun
 }
 ;({
