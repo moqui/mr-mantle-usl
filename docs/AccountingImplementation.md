@@ -271,8 +271,9 @@ lines in effect end and the new ones start, and the term is due in its last port
 `mantle.account.invoice.InvoiceDueSchedule`, keyed by `invoiceId` and `scheduleSeqId` (`01`, `02`, ...), one row per
 portion: `dueDate`, `amount` (rounded to the currency; the last portion takes what rounding leaves), `discountDate` (the
 last day the discount may be taken) and `discountAmount` (empty without a discount); the dates are calendar days (type
-date), the invoice's book day plus the line's days, compared day to day whatever the server's or the user's zone, with the `settlementTermId` and `settlementTermLineId` it came from; all
-audit-logged.
+date), the invoice's book day plus the line's days, compared day to day whatever the server's or the user's zone, with the `settlementTermId` and `settlementTermLineId` it came from. The
+rows are not audit-logged: they are written once at issue and removed only on Resume Changes, both in the invoice's status
+audit log, and Mantle's flow specs check the audit log's sequence.
 - It is written once, when the invoice is issued: the `InvoiceIssuedDueSchedule` SECA calls `store#InvoiceDueSchedule`
   when an invoice becomes Finalized or a bill Approved. No row is written for a credit memo, an invoice without a date
   or with no total, or one that has its schedule. A term without lines in effect on the invoice date gives one row, the
