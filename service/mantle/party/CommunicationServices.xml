@@ -2384,6 +2384,37 @@ along with this software (see the LICENSE.md file). If not, see
                     const finance = ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')
                     try { finance.record({kind:'journals', recordId:value.acctgTransId}); return true } catch (error) { return false }
                 }
+                // an invoice, a payment and an internal organization's bank account (and their files) follow the documents' own
+                // reads, not only the organization filter: the invoice's reader by its side (readInvoice) or its side's editor
+                // (as Projects' billing), the payment's reader by its side (paymentScope), a bank reader (IronStone Accounting
+                // P21, F430)
+                if (entityName === 'mantle.account.invoice.Invoice' || entityName === 'mantle.account.invoice.InvoiceContent') {
+                    const invoices = ec.resource.script('component://mr-mantle/service/mantle/account/InvoiceWorkflowLib.js')
+                    try { invoices.readInvoice({invoiceId:value.invoiceId}); return true } catch (error) { /* an editor? */ }
+                    try { return ec.user.hasPermission(invoices.invoice({invoiceId:value.invoiceId}).permission) }
+                    catch (error) { return false }
+                }
+                if (entityName === 'mantle.account.payment.Payment' || entityName === 'mantle.account.payment.PaymentContent') {
+                    const payments = ec.resource.script('component://mr-mantle/service/mantle/account/PaymentWorkflow.js')
+                    try { payments.paymentScope({paymentId:value.paymentId}); return true } catch (error) { return false }
+                }
+                const METHOD = 'mantle.account.method.PaymentMethod'
+                if (entityName === METHOD || entityName === 'mantle.account.method.PaymentMethodContent') {
+                    const method = entityName === METHOD ? value
+                            : ec.entity.find(METHOD).condition('paymentMethodId', value.paymentMethodId).disableAuthz().one()
+                    if (method == null) return false
+                    const internal = method.ownerPartyId && ec.entity.find('mantle.party.PartyRole')
+                            .condition({partyId:method.ownerPartyId, roleTypeId:'OrgInternal'}).disableAuthz().one()
+                    if (internal) {
+                        const bank = ec.resource.script('component://mr-mantle/service/mantle/account/BankReconciliation.js')
+                        try { bank.execute('bank', {paymentMethodId:method.paymentMethodId, need:'read'}); return true }
+                        catch (error) { return false }
+                    }
+                    // a customer's or supplier's account: a finance reader who may see its owner
+                    const finance = ec.resource.script('component://mr-mantle/service/mantle/ledger/AccountingPolicy.js')
+                    if (!finance.capabilities().read || !method.ownerPartyId) return false
+                    return visible(PARTY, 'partyId', method.ownerPartyId, depth)
+                }
                 // Catalog record mounts/drive links also enforce owner scope without an active-org filter. A catalog
                 // user's internal file/room callback retains this rule even when artifact authorization is disabled.
                 if (['mantle.product.Product', 'mantle.product.category.ProductCategory', 'mantle.product.feature.ProductFeature', 'mantle.product.feature.ProductFeatureGroup'].includes(entityName)

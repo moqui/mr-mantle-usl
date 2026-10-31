@@ -260,6 +260,24 @@ along with this software (see the LICENSE.md file). If not, see
                 keyNames.forEach((name, index) => { key[name] = body[name] != null ? body[name] : idParts[index] })
                 const current = ec.entity.find(document.primaryEntityName).condition(key).one()
                 if (current == null) continue
+                // an invoice and a payment by their own reads, of their side (a receivable reader does not find a bill), as
+                // get#RecordLinkInfo has them; the organization limit above does not know the side (IronStone Accounting P21,
+                // F431). An invoice's side editor (Projects' billing) finds it too.
+                if (hit.documentId === 'MantleInvoice' || hit.documentId === 'MantlePayment') {
+                    const account = 'component://mr-mantle/service/mantle/account/'
+                    let readable = true
+                    if (hit.documentId === 'MantleInvoice') {
+                        const invoices = ec.resource.script(account + 'InvoiceWorkflowLib.js')
+                        try { invoices.readInvoice({invoiceId: current.invoiceId}) } catch (error) {
+                            try { readable = ec.user.hasPermission(invoices.invoice({invoiceId: current.invoiceId}).permission) }
+                            catch (other) { readable = false }
+                        }
+                    } else {
+                        try { ec.resource.script(account + 'PaymentWorkflow.js').paymentScope({paymentId: current.paymentId}) }
+                        catch (error) { readable = false }
+                    }
+                    if (!readable) continue
+                }
                 if (hit.documentId === 'MantleCommunicationEvent' && boundMailboxes.has(current.contactListId)) {
                     const was = ec.artifactExecution.disableAuthz()
                     try {
